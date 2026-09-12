@@ -265,12 +265,34 @@ fn read_platform() -> Option<String> {
     decode_blob_bytes(&out.stdout)
 }
 
+/// Parse the secret value from `secret-tool search` output.
+///
+/// `secret-tool search` emits key-value lines for matching Secret Service
+/// items, including a `secret = <val>` line. On backends like KDE Wallet /
+/// KSecretsService, stored passwords have MIME type `text/plain; charset=utf8`
+/// which causes `secret-tool lookup` to reject them with
+/// "secret does not contain a textual password". `secret-tool search` prints
+/// the secret regardless of MIME type.
+#[cfg(any(test, not(any(windows, target_os = "macos"))))]
+pub(crate) fn parse_secret_tool_search_output(output: &str) -> Option<String> {
+    for line in output.lines() {
+        let trimmed = line.trim();
+        if let Some(secret) = trimmed.strip_prefix("secret = ") {
+            let secret = secret.trim();
+            if !secret.is_empty() && secret.len() <= MAX_BLOB_BYTES {
+                return Some(secret.to_string());
+            }
+        }
+    }
+    None
+}
+
 #[cfg(not(any(windows, target_os = "macos")))]
 fn read_platform() -> Option<String> {
     // `secret-tool` (libsecret) speaks to whichever Secret Service is running.
     // A missing binary or no running daemon both exit non-zero / fail to
     // spawn, and both mean "no session available here".
-    let out = std::process::Command::new("secret-tool")
+    let lookup = std::process::Command::new("secret-tool")
         .args([
             "lookup",
             "service",
@@ -281,11 +303,36 @@ fn read_platform() -> Option<String> {
         .stdin(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .output()
+        .ok();
+    if let Some(out) = lookup
+        && out.status.success()
+        && let Some(decoded) = decode_blob_bytes(&out.stdout)
+    {
+        return Some(decoded);
+    }
+
+    // Fallback: On some Secret Service backends (e.g. KDE Wallet / KSecretsService),
+    // secrets may be stored with MIME types like `text/plain; charset=utf8`.
+    // `secret-tool lookup` strictly requires exact match `text/plain` and rejects it
+    // with "secret does not contain a textual password", but `secret-tool search`
+    // prints the secret attribute regardless of content-type.
+    let search = std::process::Command::new("secret-tool")
+        .args([
+            "search",
+            "service",
+            KEYRING_SERVICE,
+            "username",
+            KEYRING_ACCOUNT,
+        ])
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
         .ok()?;
-    if !out.status.success() {
+    if !search.status.success() {
         return None;
     }
-    decode_blob_bytes(&out.stdout)
+    let stdout = std::str::from_utf8(&search.stdout).ok()?;
+    parse_secret_tool_search_output(stdout)
 }
 
 #[cfg(test)]
@@ -461,6 +508,31 @@ mod tests {
         assert_eq!(decode_blob_bytes(&[0xff, 0xfe, 0xfd]), None);
         assert_eq!(decode_blob_bytes(&[0xc3, 0x28]), None);
         assert_eq!(decode_blob_bytes(&vec![b'a'; MAX_BLOB_BYTES + 1]), None);
+    }
+
+    #[test]
+    fn parse_secret_tool_search_output_extracts_secret() {
+        let sample = "\
+[/org/freedesktop/secrets/collection/kdewallet/1]
+label = Password for 'antigravity' on 'gemini'
+secret = {\"token\":{\"access_token\":\"ya29.test\"}}
+attribute.service = gemini
+attribute.username = antigravity
+";
+        assert_eq!(
+            parse_secret_tool_search_output(sample).as_deref(),
+            Some("{\"token\":{\"access_token\":\"ya29.test\"}}")
+        );
+    }
+
+    #[test]
+    fn parse_secret_tool_search_output_handles_empty_or_missing() {
+        assert_eq!(parse_secret_tool_search_output(""), None);
+        assert_eq!(parse_secret_tool_search_output("secret = \n"), None);
+        assert_eq!(
+            parse_secret_tool_search_output("label = foo\nattribute.x = y\n"),
+            None
+        );
     }
 
     /// Touches the real Credential Manager; asserts only that the read does

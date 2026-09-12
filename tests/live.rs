@@ -735,6 +735,7 @@ async fn antigravity_remote_live() {
             credential: SavedCredential::Keyring,
             endpoints: None,
             local_bases: Some(vec![]),
+            csrf_token: None,
         },
         chrono::Utc::now(),
     )

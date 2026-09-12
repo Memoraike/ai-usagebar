@@ -88,6 +88,9 @@ pub struct RemoteOverride<'a> {
     /// Local base URLs to probe, in place of discovery. `Some(vec![])` means
     /// "no local server", which is what sends the fetch down the remote path.
     pub local_bases: Option<Vec<String>>,
+    /// CSRF token to use for local RPC probes. When `None` and `local_bases` is `None`,
+    /// falls back to `ANTIGRAVITY_CSRF_TOKEN` from the environment.
+    pub csrf_token: Option<&'a str>,
 }
 
 pub async fn fetch_snapshot(
@@ -130,10 +133,13 @@ pub async fn fetch_snapshot_at(
     // account just as cheaply: reading the keyring is local, and only the
     // quota call itself goes to the network — after the fresh-cache check,
     // like the local RPC.
-    let origin = match open_session(client, remote.local_bases.as_deref()).await {
-        Err(e) if is_no_local_server(&e) => Origin::Remote(saved_session(remote.credential)),
-        session => Origin::Local(session),
-    };
+    let origin =
+        match open_session(client, remote.local_bases.as_deref(), remote.csrf_token).await {
+            Err(e) if is_no_local_server(&e) || is_csrf_error(&e) => {
+                Origin::Remote(saved_session(remote.credential))
+            }
+            session => Origin::Local(session),
+        };
     let account = origin.account();
 
     if let Some(bytes) = cache.fresh_payload(cache_ttl)?
@@ -208,12 +214,36 @@ fn is_no_local_server(e: &AppError) -> bool {
     matches!(e, AppError::Credentials(msg) if msg == NO_LOCAL_SERVER)
 }
 
+/// Whether an error is due to a missing or invalid CSRF token.
+///
+/// `agy` CLI enforces CSRF protection via `x-codeium-csrf-token`. When
+/// unprovided or invalid, it rejects RPC probes with HTTP 401:
+/// `{"code":"unauthenticated","message":"missing CSRF token"}`.
+/// This indicates loopback auth failure rather than the user being signed out.
+fn is_csrf_error(e: &AppError) -> bool {
+    matches!(
+        e,
+        AppError::Http { status: 401 | 403, body } if body.to_ascii_lowercase().contains("csrf")
+    )
+}
+
 /// Walk every candidate language server until one identifies itself. A machine
 /// can host more than one — the desktop app, the IDE and an interactive `agy`
 /// session each run their own — and only some of them are signed in.
 ///
 /// `bases` replaces discovery when given; see [`RemoteOverride::local_bases`].
-async fn open_session(client: &reqwest::Client, bases: Option<&[String]>) -> Result<Session> {
+async fn open_session(
+    client: &reqwest::Client,
+    bases: Option<&[String]>,
+    csrf_override: Option<&str>,
+) -> Result<Session> {
+    let default_csrf = if bases.is_some() {
+        csrf_override.map(str::to_string)
+    } else {
+        csrf_override
+            .map(str::to_string)
+            .or_else(|| std::env::var("ANTIGRAVITY_CSRF_TOKEN").ok())
+    };
     let bases = bases.map_or_else(candidate_bases, <[String]>::to_vec);
     if bases.is_empty() {
         return Err(no_local_server());
@@ -221,7 +251,7 @@ async fn open_session(client: &reqwest::Client, bases: Option<&[String]>) -> Res
 
     let mut errors = Vec::new();
     for base in bases {
-        let csrf = fetch_csrf(client, &base).await;
+        let csrf = fetch_csrf(client, &base).await.or_else(|| default_csrf.clone());
         match post_rpc(client, &base, csrf.as_deref(), STATUS_RPC).await {
             Ok(v) => {
                 return Ok(Session {
@@ -253,27 +283,34 @@ async fn open_session(client: &reqwest::Client, bases: Option<&[String]>) -> Res
 /// serving RPC into a visible error about a protocol the user never chose.
 fn select_probe_error(errors: Vec<AppError>) -> AppError {
     let mut actionable = None;
+    let mut csrf = None;
     let mut last = None;
     let mut echo = None;
     for e in errors {
         if actionable.is_none() && is_actionable(&e) {
             actionable = Some(e);
+        } else if csrf.is_none() && is_csrf_error(&e) {
+            csrf = Some(e);
         } else if is_tls_echo(&e) {
             echo = Some(e);
         } else {
             last = Some(e);
         }
     }
-    actionable.or(last).or(echo).unwrap_or_else(|| {
+    actionable.or(csrf).or(last).or(echo).unwrap_or_else(|| {
         AppError::Other("antigravity: no local server answered GetUserStatus".into())
     })
 }
 
 /// An error the user can do something about, as opposed to "that product is not
 /// running". `post_rpc` only ever yields `Http`/`Transport`/`Other`, so the
-/// authentication statuses are the whole set.
+/// authentication statuses are the whole set. CSRF errors are excluded: a missing
+/// or rejected CSRF token is transport-level loopback auth, not user sign-out.
 fn is_actionable(e: &AppError) -> bool {
-    matches!(e, AppError::Http { status, .. } if *status == 401 || *status == 403)
+    matches!(
+        e,
+        AppError::Http { status, .. } if (*status == 401 || *status == 403) && !is_csrf_error(e)
+    )
 }
 
 /// A TLS listener answering the plaintext JSON-RPC probe.
@@ -2088,6 +2125,42 @@ mod tests {
         assert!(matches!(err, AppError::Http { status: 401, .. }), "{err}");
     }
 
+    fn csrf_error() -> AppError {
+        AppError::Http {
+            status: 401,
+            body: r#"{"code":"unauthenticated","message":"missing CSRF token"}"#.into(),
+        }
+    }
+
+    /// A CSRF rejection from the language server indicates loopback auth failure,
+    /// not user sign-out; it must not outrank a true actionable auth failure.
+    #[test]
+    fn a_true_auth_failure_outranks_a_csrf_rejection() {
+        let err = select_probe_error(vec![csrf_error(), http(401)]);
+        assert!(
+            matches!(&err, AppError::Http { status: 401, body } if body.is_empty()),
+            "{err}"
+        );
+
+        let err = select_probe_error(vec![http(403), csrf_error()]);
+        assert!(
+            matches!(&err, AppError::Http { status: 403, body } if body.is_empty()),
+            "{err}"
+        );
+    }
+
+    /// A CSRF error outranks later transport errors and TLS echoes so that the
+    /// CSRF status can trigger remote fallback rather than being masked as noise.
+    #[test]
+    fn a_csrf_error_outranks_transport_noise_and_tls_echo() {
+        let err = select_probe_error(vec![
+            csrf_error(),
+            tls_echo(),
+            AppError::Transport("connection refused".into()),
+        ]);
+        assert!(is_csrf_error(&err), "{err}");
+    }
+
     #[test]
     fn every_discovered_port_is_probed_in_order() {
         assert_eq!(
@@ -2519,6 +2592,7 @@ mod tests {
             credential: SavedCredential::Blob(blob),
             endpoints: Some(eps),
             local_bases: Some(vec![]),
+            csrf_token: None,
         }
     }
 
@@ -2765,6 +2839,7 @@ mod tests {
                 credential: SavedCredential::Absent,
                 endpoints: Some(&eps),
                 local_bases: Some(vec![]),
+                csrf_token: None,
             },
             Duration::ZERO,
         )
@@ -2803,6 +2878,7 @@ mod tests {
                 credential: SavedCredential::Blob(&blob),
                 endpoints: Some(&eps),
                 local_bases: Some(vec![server.url()]),
+                csrf_token: None,
             },
             Duration::ZERO,
         )
@@ -2811,6 +2887,85 @@ mod tests {
 
         quota.assert_async().await;
         assert!(matches!(err, AppError::Http { status: 401, .. }), "{err}");
+    }
+
+    /// When a local server rejects with a CSRF error (like `agy` does when unprovided),
+    /// the fetch falls back to the saved session instead of treating the user as signed out.
+    #[tokio::test]
+    async fn a_csrf_error_on_local_server_falls_back_to_remote() {
+        let mut server = mockito::Server::new_async().await;
+        let eps = endpoints(&server);
+        let status_path = format!("/{STATUS_RPC}");
+        let _status = server
+            .mock("POST", status_path.as_str())
+            .with_status(401)
+            .with_body(r#"{"code":"unauthenticated","message":"missing CSRF token"}"#)
+            .create_async()
+            .await;
+        let quota = quota_mock(&mut server, "KEYRING-AT")
+            .expect(1)
+            .create_async()
+            .await;
+        let blob = keyring_blob(VALID, true);
+        let (_td, cache) = fixture();
+
+        let outcome = run(
+            &cache,
+            RemoteOverride {
+                credential: SavedCredential::Blob(&blob),
+                endpoints: Some(&eps),
+                local_bases: Some(vec![server.url()]),
+                csrf_token: None,
+            },
+            Duration::ZERO,
+        )
+        .await
+        .expect("falls back to remote on CSRF error");
+
+        quota.assert_async().await;
+        assert_eq!(outcome.snapshot.source, AntigravitySource::Remote);
+    }
+
+    /// When a CSRF token is provided (or discovered), local RPCs pass it in the
+    /// `x-codeium-csrf-token` header and succeed.
+    #[tokio::test]
+    async fn a_csrf_token_override_is_passed_in_request_header() {
+        let mut server = mockito::Server::new_async().await;
+        let status_path = format!("/{STATUS_RPC}");
+        let status = server
+            .mock("POST", status_path.as_str())
+            .match_header("x-codeium-csrf-token", "test-token-123")
+            .with_status(200)
+            .with_body(r#"{"userStatus":{"userTier":{"name":"Pro"}}}"#)
+            .create_async()
+            .await;
+        let quota_path = format!("/{QUOTA_RPC}");
+        let quota = server
+            .mock("POST", quota_path.as_str())
+            .match_header("x-codeium-csrf-token", "test-token-123")
+            .with_status(200)
+            .with_body(QUOTA_JSON)
+            .create_async()
+            .await;
+
+        let (_td, cache) = fixture();
+        let outcome = run(
+            &cache,
+            RemoteOverride {
+                credential: SavedCredential::Absent,
+                endpoints: None,
+                local_bases: Some(vec![server.url()]),
+                csrf_token: Some("test-token-123"),
+            },
+            Duration::ZERO,
+        )
+        .await
+        .expect("local server with csrf token");
+
+        status.assert_async().await;
+        quota.assert_async().await;
+        assert_eq!(outcome.snapshot.plan, "Pro");
+        assert_eq!(outcome.snapshot.source, AntigravitySource::Local);
     }
 
     /// The remote path falls back exactly like the local one: the last good
