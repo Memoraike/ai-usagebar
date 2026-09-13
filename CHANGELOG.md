@@ -9,6 +9,11 @@ Each release is also published at
 
 ## [Unreleased]
 
+### Added
+
+- **Codex CLI community integration.** Linked an external `usage` skill for
+  checking remaining quotas, balances, and reset times from Codex CLI.
+
 ## [1.17.0] — 2026-09-12
 
 ### Added
