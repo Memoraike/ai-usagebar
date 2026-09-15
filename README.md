@@ -680,6 +680,10 @@ repositories and are maintained by their authors, not here.
   — bar widget and panel for the Noctalia v5 shell, installable from its
   plugin browser as `felipeartur/ai-usagebar`.
 
+- [usage for Codex CLI](https://github.com/wellorbetter/ai-usagebar-codex-skill)
+  — Codex skill for checking remaining quotas, balances, and reset times with
+  `$usage`, using the usage and vendor JSON reports.
+
 ## Waybar config
 
 ### Single module, scroll-to-cycle (recommended)
