@@ -849,8 +849,8 @@ fn antigravity_sections(
             push_window(&mut v, GROUP_THIRD_PARTY, w, now, 5, false);
         }
     }
-    // Figures read off the Cloud Code API while no product runs can lag what
-    // a running product would show; say where they came from.
+    // Figures read from the Cloud Code API fallback can lag what the local
+    // product would show; say where they came from.
     if s.source == crate::usage::AntigravitySource::Remote {
         v.push(Section::Spacer);
         v.push(Section::Text {
