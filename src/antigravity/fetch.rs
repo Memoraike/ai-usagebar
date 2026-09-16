@@ -153,7 +153,7 @@ pub async fn fetch_snapshot_at(
     let default_endpoints = cloud::Endpoints::default();
     let endpoints = remote.endpoints.unwrap_or(&default_endpoints);
     let live = match origin {
-        Origin::Local(session) => fetch_live(client, session).await,
+        Origin::Local(session) => fetch_live(client, session, now).await,
         Origin::Remote(token) => fetch_remote(client, cache, oauth, endpoints, token, now).await,
     };
 
@@ -357,10 +357,11 @@ fn is_tls_echo(e: &AppError) -> bool {
 async fn fetch_live(
     client: &reqwest::Client,
     session: Result<Session>,
+    now: DateTime<Utc>,
 ) -> Result<AntigravitySnapshot> {
     let session = session?;
     let quota = post_rpc(client, &session.base, session.csrf.as_deref(), QUOTA_RPC).await?;
-    let mut snap = parse_quota_summary(&quota, session.plan)?;
+    let mut snap = parse_quota_summary_at(&quota, session.plan, now)?;
     snap.account = session.account;
     Ok(snap)
 }
@@ -535,7 +536,7 @@ async fn fetch_remote(
     let plan = cloud::fetch_plan(client, endpoints, &access.value)
         .await
         .unwrap_or_else(|| DEFAULT_PLAN.to_string());
-    let mut snap = parse_quota_summary(&quota, plan)?;
+    let mut snap = parse_quota_summary_at(&quota, plan, now)?;
     snap.account = remote_account(&token.fingerprint);
     snap.source = AntigravitySource::Remote;
     Ok(snap)
@@ -664,6 +665,16 @@ fn no_usable_bucket(seen: &[String]) -> AppError {
 }
 
 pub fn parse_quota_summary(v: &serde_json::Value, plan: String) -> Result<AntigravitySnapshot> {
+    parse_quota_summary_at(v, plan, Utc::now())
+}
+
+/// Test seam for [`parse_quota_summary`]: the wall clock decides which windows
+/// have already rolled over, so it is injected rather than read.
+pub fn parse_quota_summary_at(
+    v: &serde_json::Value,
+    plan: String,
+    now: DateTime<Utc>,
+) -> Result<AntigravitySnapshot> {
     let groups = v["response"]["groups"]
         .as_array()
         .or_else(|| v["groups"].as_array())
@@ -716,7 +727,7 @@ pub fn parse_quota_summary(v: &serde_json::Value, plan: String) -> Result<Antigr
                 (false, false) => (&mut tp_5h, "Claude/GPT 5h"),
                 (false, true) => (&mut tp_weekly, "Claude/GPT weekly"),
             };
-            let parsed = usage_window(bucket, is_weekly)?;
+            let parsed = usage_window(bucket, is_weekly, now)?;
             if slot.replace(parsed).is_some() {
                 return Err(AppError::Schema(format!(
                     "antigravity: duplicate {slot_name} bucket"
@@ -748,7 +759,11 @@ pub fn parse_quota_summary(v: &serde_json::Value, plan: String) -> Result<Antigr
 /// `remainingFraction` is required and must be finite: defaulting a missing or
 /// drifted value to 1.0 would report a reassuring "0% used" for a window whose
 /// real state is unknown, and cache it.
-fn usage_window(bucket: &serde_json::Value, is_weekly: bool) -> Result<UsageWindow> {
+fn usage_window(
+    bucket: &serde_json::Value,
+    is_weekly: bool,
+    now: DateTime<Utc>,
+) -> Result<UsageWindow> {
     let remaining = bucket["remainingFraction"]
         .as_f64()
         .filter(|f| f.is_finite() && (0.0..=1.0).contains(f))
@@ -758,15 +773,44 @@ fn usage_window(bucket: &serde_json::Value, is_weekly: bool) -> Result<UsageWind
                 bucket["bucketId"].as_str().unwrap_or("<unnamed>")
             ))
         })?;
+    let window_duration = if is_weekly {
+        chrono::Duration::days(7)
+    } else {
+        chrono::Duration::hours(5)
+    };
+    let resets_at = parse_reset(&bucket["resetTime"], "quota resetTime")?;
+    // A reset that has already passed means the window fully refreshed: the
+    // allowance is whole again and the next deadline is one period on. The
+    // server that has not caught up yet still reports the spent fraction
+    // against the old deadline, and serving that shows a figure for a period
+    // that no longer exists, under a countdown pinned at "now".
+    if let Some(reset) = resets_at.filter(|reset| *reset <= now) {
+        return Ok(UsageWindow {
+            utilization_pct: 0,
+            resets_at: Some(rolled_over(reset, window_duration, now)),
+            window_duration,
+        });
+    }
     Ok(UsageWindow {
         utilization_pct: pct_used(remaining),
-        resets_at: parse_reset(&bucket["resetTime"], "quota resetTime")?,
-        window_duration: if is_weekly {
-            chrono::Duration::days(7)
-        } else {
-            chrono::Duration::hours(5)
-        },
+        resets_at,
+        window_duration,
     })
+}
+
+/// The first reset on the server's own grid that is still ahead of `now`, so a
+/// server down across several periods does not come back with a past deadline.
+fn rolled_over(
+    reset: DateTime<Utc>,
+    window: chrono::Duration,
+    now: DateTime<Utc>,
+) -> DateTime<Utc> {
+    let period = window.num_seconds();
+    if period <= 0 {
+        return reset;
+    }
+    let elapsed = (now - reset).num_seconds().max(0);
+    reset + chrono::Duration::seconds((elapsed / period + 1) * period)
 }
 
 /// The API reports how much is *left*; every other vendor here reports how much
@@ -1488,7 +1532,79 @@ mod tests {
 
     fn parsed() -> AntigravitySnapshot {
         let v: serde_json::Value = serde_json::from_str(QUOTA_JSON).unwrap();
-        parse_quota_summary(&v, "Google AI Pro".into()).unwrap()
+        parse_quota_summary_at(&v, "Google AI Pro".into(), now()).unwrap()
+    }
+
+    /// Two `agy` hubs answered for the same account at the same moment. One had
+    /// already rolled its 5-hour window over and reported `remainingFraction:
+    /// 1` with the next reset; the other had not refreshed yet and still
+    /// carried the spent fraction against a `resetTime` two minutes in the
+    /// past — which we rendered as "1% · Resets in now" while Antigravity's own
+    /// settings page said 100% remaining. A reset that has passed means the
+    /// window fully refreshed, so the stale answer must normalise to the fresh
+    /// one rather than be shown as current.
+    #[test]
+    fn a_window_whose_reset_has_passed_has_rolled_over() {
+        let stale: serde_json::Value = serde_json::from_str(
+            r#"{"response":{"groups":[
+                {"displayName":"Gemini Models","buckets":[
+                    {"bucketId":"gemini-weekly","window":"weekly","remainingFraction":0.95852727,
+                     "resetTime":"2026-09-19T07:20:26Z"},
+                    {"bucketId":"gemini-5h","window":"5h","remainingFraction":0.985185,
+                     "resetTime":"2026-09-12T20:16:19Z"}]},
+                {"displayName":"Claude and GPT models","buckets":[
+                    {"bucketId":"3p-weekly","window":"weekly","remainingFraction":1,
+                     "resetTime":"2026-09-19T20:15:36Z"},
+                    {"bucketId":"3p-5h","window":"5h","remainingFraction":1,
+                     "resetTime":"2026-09-13T01:15:36Z"}]}]}}"#,
+        )
+        .unwrap();
+        let at = DateTime::parse_from_rfc3339("2026-09-12T20:18:35Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let snap = parse_quota_summary_at(&stale, "Google AI Pro".into(), at).unwrap();
+
+        let session = snap.session.as_ref().unwrap();
+        assert_eq!(session.utilization_pct, 0);
+        // Exactly what the hub that had already rolled over reported.
+        assert_eq!(
+            session.resets_at.unwrap().to_rfc3339(),
+            "2026-09-13T01:16:19+00:00"
+        );
+        // A window still running keeps its own figures untouched.
+        assert_eq!(snap.weekly.as_ref().unwrap().utilization_pct, 4);
+        assert_eq!(
+            snap.weekly.as_ref().unwrap().resets_at.unwrap().to_rfc3339(),
+            "2026-09-19T07:20:26+00:00"
+        );
+    }
+
+    /// A server that has been down across several windows must not come back
+    /// with a reset that is still in the past.
+    #[test]
+    fn a_long_lapsed_window_advances_past_every_missed_period() {
+        let stale: serde_json::Value = serde_json::from_str(
+            r#"{"response":{"groups":[{"displayName":"Gemini Models","buckets":[
+                {"bucketId":"gemini-5h","window":"5h","remainingFraction":0.2,
+                 "resetTime":"2026-09-10T00:00:00Z"}]}]}}"#,
+        )
+        .unwrap();
+        let at = DateTime::parse_from_rfc3339("2026-09-12T20:18:35Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let snap = parse_quota_summary_at(&stale, "Pro".into(), at).unwrap();
+        let session = snap.session.as_ref().unwrap();
+        assert_eq!(session.utilization_pct, 0);
+        assert!(session.resets_at.unwrap() > at);
+        // Still on the five-hour grid the server established.
+        assert_eq!(
+            (session.resets_at.unwrap() - DateTime::parse_from_rfc3339("2026-09-10T00:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc))
+            .num_seconds()
+                % (5 * 3600),
+            0
+        );
     }
 
     #[test]
@@ -1557,7 +1673,7 @@ mod tests {
             ]}}"#,
         )
         .unwrap();
-        let snap = parse_quota_summary(&v, "Pro".into()).unwrap();
+        let snap = parse_quota_summary_at(&v, "Pro".into(), now()).unwrap();
         assert_eq!(snap.session.as_ref().unwrap().utilization_pct, 50);
         assert_eq!(snap.weekly.as_ref().unwrap().utilization_pct, 10);
         assert_eq!(snap.third_party_session.unwrap().utilization_pct, 100);
@@ -1574,7 +1690,7 @@ mod tests {
             ]}]}}"#,
         )
         .unwrap();
-        let err = parse_quota_summary(&duplicate, "Pro".into()).unwrap_err();
+        let err = parse_quota_summary_at(&duplicate, "Pro".into(), now()).unwrap_err();
         assert!(err.to_string().contains("duplicate Gemini 5h"), "{err}");
 
         // A future pool or cadence is ignored, not silently treated as the
@@ -1592,7 +1708,7 @@ mod tests {
             ]}}"#,
         )
         .unwrap();
-        let snap = parse_quota_summary(&unrelated, "Pro".into()).unwrap();
+        let snap = parse_quota_summary_at(&unrelated, "Pro".into(), now()).unwrap();
         assert!(snap.third_party_session.is_none());
         assert!(snap.third_party_weekly.is_none());
     }
@@ -1608,7 +1724,7 @@ mod tests {
                   {{"bucketId":"gemini-weekly","window":"weekly","remainingFraction":0.9}}]}}]}}}}"#
             ))
             .unwrap();
-            let err = parse_quota_summary(&v, "Pro".into()).unwrap_err();
+            let err = parse_quota_summary_at(&v, "Pro".into(), now()).unwrap_err();
             assert!(err.to_string().contains("gemini-5h"), "{bad}: {err}");
         }
     }
@@ -1618,7 +1734,7 @@ mod tests {
         for bad in [serde_json::json!("not-a-time"), serde_json::json!(42)] {
             let mut v: serde_json::Value = serde_json::from_str(QUOTA_JSON).unwrap();
             v["response"]["groups"][0]["buckets"][0]["resetTime"] = bad;
-            let err = parse_quota_summary(&v, "Pro".into()).unwrap_err();
+            let err = parse_quota_summary_at(&v, "Pro".into(), now()).unwrap_err();
             assert!(err.to_string().contains("resetTime"), "{err}");
         }
     }
@@ -1667,7 +1783,7 @@ mod tests {
             ],
         });
 
-        let snap = parse_quota_summary(&summary, "Pro".into()).expect("weekly-only is usable");
+        let snap = parse_quota_summary_at(&summary, "Pro".into(), now()).expect("weekly-only is usable");
 
         assert!(snap.session.is_none(), "no 5h bucket arrived");
         assert!(snap.third_party_session.is_none());
@@ -1691,7 +1807,7 @@ mod tests {
             }],
         });
 
-        let snap = parse_quota_summary(&summary, "Pro".into()).expect("5h-only is usable");
+        let snap = parse_quota_summary_at(&summary, "Pro".into(), now()).expect("5h-only is usable");
 
         assert_eq!(snap.session.as_ref().unwrap().utilization_pct, 75);
         assert!(snap.weekly.is_none());
@@ -1710,7 +1826,7 @@ mod tests {
             }],
         });
 
-        let rendered = parse_quota_summary(&summary, "Pro".into())
+        let rendered = parse_quota_summary_at(&summary, "Pro".into(), now())
             .expect_err("an unrecognised cadence alone is not a snapshot")
             .to_string();
 
@@ -1730,7 +1846,7 @@ mod tests {
             "groups": [{"displayName": "Gemini", "buckets": []}],
         });
 
-        let rendered = parse_quota_summary(&summary, "Pro".into())
+        let rendered = parse_quota_summary_at(&summary, "Pro".into(), now())
             .expect_err("no buckets is an error")
             .to_string();
 
@@ -1746,7 +1862,7 @@ mod tests {
             "groups": [{"displayName": "", "buckets": [{"remainingFraction": 0.5}]}],
         });
 
-        let rendered = parse_quota_summary(&summary, "Pro".into())
+        let rendered = parse_quota_summary_at(&summary, "Pro".into(), now())
             .expect_err("an unusable summary is an error")
             .to_string();
 
@@ -1756,7 +1872,7 @@ mod tests {
     #[test]
     fn missing_gemini_buckets_is_an_error_not_a_zero_bar() {
         let v: serde_json::Value = serde_json::from_str(r#"{"response":{"groups":[]}}"#).unwrap();
-        assert!(parse_quota_summary(&v, "Pro".into()).is_err());
+        assert!(parse_quota_summary_at(&v, "Pro".into(), now()).is_err());
     }
 
     #[test]

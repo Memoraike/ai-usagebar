@@ -217,7 +217,7 @@ mod tests {
         assert!(cached.cache_age.is_some());
         assert_eq!(
             outcome.snapshot.chat.unwrap().used_and_entitlement(),
-            Some((750, 1000))
+            Some((750.0, 1000.0))
         );
         assert!(outcome.snapshot.completions.unwrap().unlimited);
     }
@@ -240,10 +240,12 @@ mod tests {
         let snapshot = Snapshot {
             plan: "pro".into(),
             premium: Some(Quota {
-                percent_remaining: 80,
-                entitlement: Some(300),
-                remaining: Some(240),
+                percent_remaining: 80.0,
+                entitlement: Some(300.0),
+                remaining: Some(240.0),
                 unlimited: false,
+                has_quota: true,
+                token_based_billing: false,
             }),
             chat: None,
             completions: None,

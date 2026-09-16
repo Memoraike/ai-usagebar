@@ -351,7 +351,7 @@ impl KimiSnapshot {
 
 /// Discriminated union of vendor-specific snapshots. The widget and TUI match
 /// on this to pick a renderer.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum VendorSnapshot {
     Anthropic(AnthropicSnapshot),
     Openai(OpenAiSnapshot),

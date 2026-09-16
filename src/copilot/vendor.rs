@@ -14,9 +14,13 @@ use crate::vendor::{RenderOpts, VendorId, VendorOutcome};
 use crate::waybar::{Class, WaybarOutput};
 
 use super::fetch::FetchOutcome;
-use super::types::Snapshot;
+use super::types::{Snapshot, count};
 
-pub const DEFAULT_FORMAT: &str = "{copilot_premium_pct}% · {copilot_reset}";
+/// Headline the worst quota the plan actually has rather than a fixed bucket:
+/// `severity` already colours the module from `worst_pct`, and a plan without
+/// premium requests (Copilot Free) otherwise shows a figure for an allowance
+/// that does not exist.
+pub const DEFAULT_FORMAT: &str = "{copilot_pct}% · {copilot_reset}";
 const UNAVAILABLE: &str = "—";
 
 impl From<FetchOutcome> for VendorOutcome {
@@ -43,6 +47,7 @@ pub fn build_placeholders(snap: &Snapshot, now: DateTime<Utc>) -> HashMap<&'stat
             crate::display::sanitize_untrusted_field(&snap.plan),
         ),
         ("copilot_reset", reset),
+        ("copilot_pct", snap.worst_pct().to_string()),
         ("copilot_premium_pct", premium.percent),
         ("copilot_premium_used", premium.used),
         ("copilot_premium_limit", premium.limit),
@@ -62,7 +67,7 @@ struct QuotaValues {
 }
 
 fn quota_values(quota: Option<&super::types::Quota>) -> QuotaValues {
-    let Some(quota) = quota else {
+    let Some(quota) = quota.filter(|quota| quota.in_plan()) else {
         return QuotaValues {
             percent: UNAVAILABLE.into(),
             used: UNAVAILABLE.into(),
@@ -78,7 +83,7 @@ fn quota_values(quota: Option<&super::types::Quota>) -> QuotaValues {
     }
     let (used, limit) = quota
         .used_and_entitlement()
-        .map(|(used, limit)| (used.to_string(), limit.to_string()))
+        .map(|(used, limit)| (count(used), count(limit)))
         .unwrap_or_else(|| (UNAVAILABLE.into(), UNAVAILABLE.into()));
     QuotaValues {
         percent: quota.used_pct().to_string(),
@@ -144,14 +149,10 @@ fn render_tooltip(
     for (label, quota) in snap.quotas() {
         let usage = if quota.unlimited {
             "Unlimited".to_string()
-        } else if let Some((used, entitlement)) = quota.used_and_entitlement() {
-            format!("{}% · {used} of {entitlement} used", quota.used_pct())
+        } else if let Some(used) = quota.used_of_entitlement() {
+            format!("{}% · {used} used", quota.used_pct())
         } else {
-            format!(
-                "{}% · {}% remaining",
-                quota.used_pct(),
-                quota.percent_remaining
-            )
+            format!("{}% · {:.0}% remaining", quota.used_pct(), quota.percent_remaining)
         };
         lines.push(TooltipLine::Body(format!("  {label}  {}", escape(&usage))));
     }
@@ -192,14 +193,27 @@ mod tests {
     use super::*;
     use crate::copilot::types::Quota;
 
+    fn opts() -> RenderOpts {
+        RenderOpts {
+            format: None,
+            tooltip_format: None,
+            icon: None,
+            pace_tolerance: 5,
+            format_pace_color: false,
+            tooltip_pace_pts: false,
+        }
+    }
+
     fn sample() -> Snapshot {
         Snapshot {
             plan: "Pro".into(),
             premium: Some(Quota {
-                percent_remaining: 15,
-                entitlement: Some(300),
-                remaining: Some(45),
+                percent_remaining: 15.0,
+                entitlement: Some(300.0),
+                remaining: Some(45.0),
                 unlimited: false,
+                has_quota: true,
+                token_based_billing: false,
             }),
             chat: None,
             completions: None,
@@ -217,22 +231,63 @@ mod tests {
         assert_eq!(values["weekly_pct"], UNAVAILABLE);
     }
 
+    /// Copilot Free has no premium-request allowance at all. Headlining that
+    /// empty bucket showed a permanent 100% in a module whose colour came from
+    /// `worst_pct`, so the number and the colour disagreed; VS Code shows the
+    /// same account's real quotas instead.
     #[test]
-    fn renderer_uses_the_premium_quota_and_canonical_provider_name() {
+    fn a_plan_without_premium_requests_headlines_its_worst_real_quota() {
+        let snap = Snapshot {
+            plan: "individual".into(),
+            premium: Some(Quota {
+                percent_remaining: 0.0,
+                entitlement: Some(0.0),
+                remaining: Some(0.0),
+                unlimited: false,
+                has_quota: true,
+                token_based_billing: false,
+            }),
+            chat: Some(Quota {
+                percent_remaining: 99.0,
+                entitlement: Some(200.0),
+                remaining: Some(198.0),
+                unlimited: false,
+                has_quota: true,
+                token_based_billing: false,
+            }),
+            completions: Some(Quota {
+                percent_remaining: 64.0,
+                entitlement: Some(2000.0),
+                remaining: Some(1278.0),
+                unlimited: false,
+                has_quota: true,
+                token_based_billing: false,
+            }),
+            reset_at: None,
+        };
+        let values = build_placeholders(&snap, Utc::now());
+        assert_eq!(values["copilot_pct"], "36");
+        assert_eq!(values["copilot_premium_pct"], UNAVAILABLE);
+        assert_eq!(values["copilot_premium_limit"], UNAVAILABLE);
+        assert_eq!(values["copilot_completions_pct"], "36");
+        assert_eq!(severity(&snap), PaceSeverity::Low);
+
+        let outcome = VendorOutcome::fresh(crate::usage::VendorSnapshot::Copilot(snap.clone()));
+        let output = render(&outcome, &snap, &Theme::default(), &opts(), Utc::now());
+        assert!(output.text.contains("36%"));
+        assert!(!output.text.contains("100%"));
+        assert!(!output.tooltip.contains("Premium requests"));
+    }
+
+    #[test]
+    fn renderer_headlines_the_worst_quota_and_canonical_provider_name() {
         let snap = sample();
         let outcome = VendorOutcome::fresh(crate::usage::VendorSnapshot::Copilot(snap.clone()));
         let output = render(
             &outcome,
             &snap,
             &Theme::default(),
-            &RenderOpts {
-                format: None,
-                tooltip_format: None,
-                icon: None,
-                pace_tolerance: 5,
-                format_pace_color: false,
-                tooltip_pace_pts: false,
-            },
+            &opts(),
             Utc::now(),
         );
         assert!(output.text.contains("85%"));
