@@ -21,6 +21,20 @@ Each release is also published at
   every desktop frontend renders, and the severity the module is coloured from.
   An allowance that is genuinely exhausted (`entitlement: 300, remaining: 0`)
   still reads 100%.
+- **Antigravity no longer shows a quota window that has already rolled over.**
+  A local server that has not refreshed yet keeps reporting the fraction it
+  spent against a `resetTime` that has passed — two `agy` hubs answering for the
+  same account at the same moment disagreed, one saying `remainingFraction: 1`
+  with the next reset and the other still carrying the old period. Whichever
+  answered first was shown, so a five-hour window Antigravity's own settings
+  page reported as 100% remaining could render as "1% · Resets in now". A reset
+  that has passed now means what the server itself means by it: the window
+  refreshed, so the figure is zero and the deadline moves one period on — to
+  exactly the timestamp the caught-up hub reports. A server down across several
+  periods advances past all of them rather than returning a past deadline.
+  Windows still running are untouched, and a cached payload past its reset is
+  still refused rather than normalised, since no server is there to confirm what
+  happened in between.
 - **A fractional Copilot credit is no longer rounded away.** Quota figures are
   read from GitHub's unrounded `quota_remaining` and `percent_remaining`
   floats, not the sibling integers that have already dropped the fraction, so a
