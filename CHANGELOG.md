@@ -9,6 +9,41 @@ Each release is also published at
 
 ## [Unreleased]
 
+### Fixed
+
+- **GitHub Copilot no longer reports an allowance the plan does not have as
+  fully spent.** Copilot Free returns `premium_interactions` flagged
+  `has_quota: false` with a zero entitlement, whose `percent_remaining: 0` is
+  the degenerate output of `remaining / entitlement` rather than a consumed
+  quota. Reading it as 100% used painted the whole module critical red, while
+  VS Code does not show the bucket at all. A bucket GitHub says the plan does
+  not include is now left out of the tooltip, the TUI panel, the report metrics
+  every desktop frontend renders, and the severity the module is coloured from.
+  An allowance that is genuinely exhausted (`entitlement: 300, remaining: 0`)
+  still reads 100%.
+- **A fractional Copilot credit is no longer rounded away.** Quota figures are
+  read from GitHub's unrounded `quota_remaining` and `percent_remaining`
+  floats, not the sibling integers that have already dropped the fraction, so a
+  credit balance VS Code shows as "1.7 / 200" no longer reads "2 of 200". Whole
+  counts stay whole. A cache written before this still loads, at its stored
+  precision, until the next refresh.
+
+### Changed
+
+- **Copilot quota labels follow what the account is billed for.** Under
+  token-based billing GitHub's `chat` bucket is the pooled credit balance every
+  premium interaction draws from, not a count of chat messages, so it is now
+  labelled **Credits** and `completions` **Inline suggestions** — matching what
+  VS Code shows for the same account. An account without token-based billing
+  keeps **Chat** and **Completions**.
+- **The Copilot bar headlines the worst quota the plan actually has.** The
+  default format becomes `{copilot_pct}% · {copilot_reset}`, where the new
+  `{copilot_pct}` is the highest usage across the buckets the plan includes —
+  the same figure `severity` already colours the module from, so the number and
+  the colour can no longer disagree. `{copilot_premium_pct}` and the other
+  per-bucket placeholders still work; on a plan without premium requests they
+  now expand to `—` instead of a figure for an allowance that does not exist.
+
 ## [1.16.0] — 2026-09-11
 
 ### Added

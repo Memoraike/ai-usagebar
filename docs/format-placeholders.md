@@ -85,17 +85,26 @@ expiry. Accounts that have never earned one report `0`.
 
 ## GitHub Copilot
 
-`{copilot_plan}`, `{copilot_reset}`, `{copilot_premium_pct}`,
+`{copilot_plan}`, `{copilot_reset}`, `{copilot_pct}`, `{copilot_premium_pct}`,
 `{copilot_premium_used}`, `{copilot_premium_limit}`, `{copilot_chat_pct}`,
 `{copilot_chat_used}`, `{copilot_chat_limit}`, `{copilot_completions_pct}`,
 `{copilot_completions_used}`, `{copilot_completions_limit}`
 
 These represent the `premium_interactions`, `chat`, and `completions` quota
-snapshots that GitHub reports. The default bar format is
-`{copilot_premium_pct}% · {copilot_reset}`. `{session_*}` aliases Premium and
-`{weekly_*}` aliases Chat so one cross-provider format can still render it;
-both use Copilot's account-wide quota reset, not a weekly window. Missing
-quota buckets expand to `—`.
+snapshots that GitHub reports. `{copilot_pct}` is the highest usage among the
+buckets the plan actually includes — the same figure the module is coloured
+from — and is the default bar format: `{copilot_pct}% · {copilot_reset}`.
+`{session_*}` aliases Premium and `{weekly_*}` aliases Chat so one
+cross-provider format can still render it; both use Copilot's account-wide
+quota reset, not a weekly window. Missing quota buckets expand to `—`, as does
+a bucket the plan does not include at all: Copilot Free reports
+`premium_interactions` as `has_quota: false` with a zero entitlement, which is
+no allowance rather than a spent one.
+
+Under token-based billing the `chat` bucket is a pooled credit balance rather
+than a count of chat messages, so it is labelled **Credits** (and `completions`
+**Inline suggestions**) wherever quotas are named. Used figures come from
+GitHub's unrounded floats, so a fractional credit renders as `1.7`.
 
 ## Z.AI
 

@@ -708,9 +708,9 @@ fn copilot_sections(s: &crate::copilot::types::Snapshot, now: DateTime<Utc>) -> 
             "Unlimited".to_string()
         } else {
             quota
-                .used_and_entitlement()
-                .map(|(used, entitlement)| format!("{used} of {entitlement} used"))
-                .unwrap_or_else(|| format!("{}% remaining", quota.percent_remaining))
+                .used_of_entitlement()
+                .map(|used| format!("{used} used"))
+                .unwrap_or_else(|| format!("{:.0}% remaining", quota.percent_remaining))
         };
         sections.push(Section::Spacer);
         sections.push_metric(
@@ -1807,10 +1807,12 @@ mod tests {
         let snapshot = VendorSnapshot::Copilot(crate::copilot::types::Snapshot {
             plan: "Pro".into(),
             premium: Some(crate::copilot::types::Quota {
-                percent_remaining: 25,
-                entitlement: Some(300),
-                remaining: Some(75),
+                percent_remaining: 25.0,
+                entitlement: Some(300.0),
+                remaining: Some(75.0),
                 unlimited: false,
+                has_quota: true,
+                token_based_billing: false,
             }),
             chat: None,
             completions: None,
