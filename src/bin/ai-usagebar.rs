@@ -30,6 +30,9 @@ fn main() {
     if let Some(Command::Account { action }) = &cli.command {
         std::process::exit(ai_usagebar::account::run(action));
     }
+    if let Some(Command::Antigravity { action }) = &cli.command {
+        std::process::exit(ai_usagebar::antigravity::statusline::run(action));
+    }
     if let Some(Command::Settings { action }) = &cli.command {
         std::process::exit(ai_usagebar::tui::settings::run_cli(action));
     }
@@ -70,8 +73,9 @@ fn main() {
         }
     };
     // An administrative report, not the widget: it needs the runtime but must
-    // not go through the always-exit-0 Waybar contract — a script piping this
-    // deserves a real exit code.
+    // not go through the always-exit-0 Waybar contract. A script piping this
+    // deserves a real exit code when the document cannot be produced;
+    // per-entry fetch/auth failures stay inside the document.
     if let Some(Command::Usage { json }) = &cli.command {
         std::process::exit(rt.block_on(ai_usagebar::report::run(*json)));
     }

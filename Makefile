@@ -9,7 +9,7 @@ PLASMOID_ID ?= io.github.akitaonrails.ai-usagebar
 PLASMOID_DIR = $(abspath $(DESTDIR)$(PREFIX))/share/plasma/plasmoids/$(PLASMOID_ID)
 
 .PHONY: build install uninstall install-plasmoid uninstall-plasmoid \
-	test desktop-test plugin-test qml-lint qml-test mjs-probe smoke clippy fmt clean
+	test desktop-test plugin-test mint-test mint-runtime-test qml-lint qml-test mjs-probe smoke clippy fmt clean
 
 build:
 	cargo build --release
@@ -49,17 +49,32 @@ test:
 	cargo test
 	$(MAKE) desktop-test
 	$(MAKE) plugin-test
+	$(MAKE) mint-test
 
 changelog-check:
 	./scripts/check-changelog-immutable.sh
 
 desktop-test:
 	node gnome-extension/marker-logic.test.mjs
+	node gnome-extension/layout.test.mjs
+	node gnome-extension/report-model.test.mjs
 	node kde-plasmoid/plasmoid-logic.test.mjs
 	node windows/popover/popover.test.mjs
 
+# The popover SSR contract tests (popover.test.mjs + native-dashboard.test.mjs) run under
+# vite's ssrLoadModule, so it needs the popover's node_modules — desktop-test
+# deliberately stays bare-node because the Windows CI job has no npm install.
+popover-ssr-test:
+	cd windows/popover && npm ci --no-fund --no-audit && npm test
+
 plugin-test:
 	node omarchy/model.test.mjs
+
+mint-test:
+	PYTHONPATH=linux-mint python3 -m unittest discover -s linux-mint -p 'test_tray_model.py'
+
+mint-runtime-test:
+	PYTHONPATH=linux-mint /usr/bin/python3 -m unittest discover -s linux-mint -p 'test_tray_runtime.py'
 
 # Prefer Qt 6-specific locations. Some distributions put Qt 5 binaries on PATH
 # under the generic names while keeping Qt 6 under /usr/lib/qt6/bin.

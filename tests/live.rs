@@ -35,6 +35,8 @@
 //!   envelope and at least one `TOKENS_LIMIT` entry exists.
 //! - **OpenRouter**: `/credits` returns `{data:{total_credits,total_usage}}`
 //!   and `/key` returns `{data:{usage,is_free_tier}}`.
+//! - **DeepInfra**: `/payment/checklist` supplies prepaid-balance components
+//!   and `/payment/usage?from=current` supplies cent-denominated monthly cost.
 //! - **Kimi**: the public snapshot exposes parsed weekly limit/used/remaining
 //!   counters and a bounded percentage. Its reset and selected 5-hour rolling
 //!   window are optional, so the smoke test validates their public fields only
@@ -72,6 +74,7 @@ use ai_usagebar::anthropic;
 use ai_usagebar::antigravity;
 use ai_usagebar::cache::Cache;
 use ai_usagebar::cursor;
+use ai_usagebar::deepinfra;
 use ai_usagebar::error::AppError;
 use ai_usagebar::kimi;
 use ai_usagebar::kiro;
@@ -289,6 +292,41 @@ async fn openrouter_live() {
         out.snapshot.total_usage,
         out.snapshot.usage_monthly,
         out.snapshot.is_free_tier,
+    );
+}
+
+#[tokio::test]
+#[ignore = "live API; run with --ignored"]
+async fn deepinfra_live() {
+    let api_key = std::env::var("DEEPINFRA_API_KEY")
+        .expect("DEEPINFRA_API_KEY must be set (source ~/.config/zsh/secrets)");
+    let cache = xdg_cache_for("deepinfra");
+    let client = reqwest::Client::builder()
+        .timeout(ai_usagebar::vendor::HTTP_CLIENT_TIMEOUT)
+        .redirect(ai_usagebar::vendor::same_origin_redirect_policy())
+        .build()
+        .unwrap();
+    let endpoints = deepinfra::fetch::Endpoints::default();
+    let out =
+        deepinfra::fetch::fetch_snapshot(&client, &api_key, &cache, &endpoints, Duration::ZERO)
+            .await
+            .expect("deepinfra fetch should succeed against the real API");
+
+    assert!(
+        out.snapshot.balance.is_finite(),
+        "deepinfra balance is not finite"
+    );
+    assert!(
+        out.snapshot.monthly_spend >= 0.0,
+        "deepinfra monthly spend is negative"
+    );
+    assert!(!out.snapshot.period.is_empty(), "deepinfra period is empty");
+    println!(
+        "deepinfra - balance=${:.2}, monthly=${:.2}, limit={:?}, period={}",
+        out.snapshot.balance,
+        out.snapshot.monthly_spend,
+        out.snapshot.monthly_limit,
+        out.snapshot.period,
     );
 }
 
@@ -735,6 +773,7 @@ async fn antigravity_remote_live() {
             credential: SavedCredential::Keyring,
             endpoints: None,
             local_bases: Some(vec![]),
+            ..Default::default()
         },
         chrono::Utc::now(),
     )

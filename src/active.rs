@@ -106,12 +106,14 @@ fn parse_slug(s: &str) -> Option<VendorId> {
         "zai" => Some(VendorId::Zai),
         "openrouter" => Some(VendorId::Openrouter),
         "deepseek" => Some(VendorId::Deepseek),
+        "deepinfra" => Some(VendorId::Deepinfra),
         "kimi" => Some(VendorId::Kimi),
         "kilo" => Some(VendorId::Kilo),
         "novita" => Some(VendorId::Novita),
         "moonshot" => Some(VendorId::Moonshot),
         "grok" => Some(VendorId::Grok),
         "supergrok" => Some(VendorId::Supergrok),
+        "grokbot" => Some(VendorId::Grokbot),
         "antigravity" => Some(VendorId::Antigravity),
         "cursor" => Some(VendorId::Cursor),
         "minimax" => Some(VendorId::Minimax),
@@ -120,6 +122,8 @@ fn parse_slug(s: &str) -> Option<VendorId> {
         "opencode-go" => Some(VendorId::OpenCodeGo),
         "commandcode" => Some(VendorId::CommandCode),
         "ollama" => Some(VendorId::Ollama),
+        "orcarouter" => Some(VendorId::OrcaRouter),
+        "modelstudio" => Some(VendorId::ModelStudio),
         _ => None,
     }
 }

@@ -15,7 +15,7 @@ use super::scope::ScopePaths;
 use super::{acp, direct, resets, scope, types};
 
 const LOCK_TIMEOUT: Duration = Duration::from_secs(15);
-const CACHE_SCHEMA: u8 = 3;
+const CACHE_SCHEMA: u8 = 4;
 
 /// This vendor's [`Outcome`](crate::outcome::Outcome) — the shared shape,
 /// specialised to its snapshot.
@@ -55,6 +55,11 @@ async fn fetch_billing_any(
         },
     }?;
     response.reset_credits = resets::fetch(&scope_paths.auth).await.unwrap_or_default();
+    if response.subscription_tier_display.is_none()
+        && let Ok(Some(display)) = direct::fetch_plan_display(&scope_paths.auth).await
+    {
+        response.subscription_tier_display = Some(display);
+    }
     Ok(response)
 }
 
@@ -130,6 +135,8 @@ struct CachedSnapshot {
     prepaid_balance: Option<f64>,
     #[serde(default)]
     reset_credits: crate::usage::ResetCredits,
+    #[serde(default)]
+    products: Vec<crate::usage::SuperGrokProduct>,
 }
 
 impl CachedEnvelope {
@@ -149,6 +156,7 @@ impl CachedEnvelope {
                 reset_at: snapshot.reset_at,
                 prepaid_balance: snapshot.prepaid_balance,
                 reset_credits: snapshot.reset_credits.clone(),
+                products: snapshot.products.clone(),
             },
         }
     }
@@ -206,6 +214,17 @@ fn parse_cache(bytes: &[u8], account_scope: &str) -> Result<SuperGrokSnapshot> {
             "SuperGrok cached reset credits are inconsistent".into(),
         ));
     }
+    for product in &cached.snapshot.products {
+        if !(0..=100).contains(&product.percent)
+            || product.label.is_empty()
+            || product.label.chars().count() > 128
+            || product.label.chars().any(char::is_control)
+        {
+            return Err(AppError::Schema(
+                "SuperGrok cached product row is invalid".into(),
+            ));
+        }
+    }
 
     Ok(SuperGrokSnapshot {
         plan: cached.snapshot.plan,
@@ -215,6 +234,7 @@ fn parse_cache(bytes: &[u8], account_scope: &str) -> Result<SuperGrokSnapshot> {
         reset_at: cached.snapshot.reset_at,
         prepaid_balance: cached.snapshot.prepaid_balance,
         reset_credits: cached.snapshot.reset_credits,
+        products: cached.snapshot.products,
     })
 }
 
