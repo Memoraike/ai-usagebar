@@ -1712,7 +1712,12 @@ mod tests {
         // A window still running keeps its own figures untouched.
         assert_eq!(snap.weekly.as_ref().unwrap().utilization_pct, 4);
         assert_eq!(
-            snap.weekly.as_ref().unwrap().resets_at.unwrap().to_rfc3339(),
+            snap.weekly
+                .as_ref()
+                .unwrap()
+                .resets_at
+                .unwrap()
+                .to_rfc3339(),
             "2026-09-19T07:20:26+00:00"
         );
     }
@@ -1736,9 +1741,10 @@ mod tests {
         assert!(session.resets_at.unwrap() > at);
         // Still on the five-hour grid the server established.
         assert_eq!(
-            (session.resets_at.unwrap() - DateTime::parse_from_rfc3339("2026-09-10T00:00:00Z")
-                .unwrap()
-                .with_timezone(&Utc))
+            (session.resets_at.unwrap()
+                - DateTime::parse_from_rfc3339("2026-09-10T00:00:00Z")
+                    .unwrap()
+                    .with_timezone(&Utc))
             .num_seconds()
                 % (5 * 3600),
             0
@@ -1921,7 +1927,8 @@ mod tests {
             ],
         });
 
-        let snap = parse_quota_summary_at(&summary, "Pro".into(), now()).expect("weekly-only is usable");
+        let snap =
+            parse_quota_summary_at(&summary, "Pro".into(), now()).expect("weekly-only is usable");
 
         assert!(snap.session.is_none(), "no 5h bucket arrived");
         assert!(snap.third_party_session.is_none());
@@ -1945,7 +1952,8 @@ mod tests {
             }],
         });
 
-        let snap = parse_quota_summary_at(&summary, "Pro".into(), now()).expect("5h-only is usable");
+        let snap =
+            parse_quota_summary_at(&summary, "Pro".into(), now()).expect("5h-only is usable");
 
         assert_eq!(snap.session.as_ref().unwrap().utilization_pct, 75);
         assert!(snap.weekly.is_none());
