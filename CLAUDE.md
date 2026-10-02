@@ -7,8 +7,12 @@ these are invariants we keep almost-forgetting, not a project tour.
 
 When cutting a new version (patch, minor, or major):
 
-1. **Bump both versions** — `Cargo.toml` `version` and the root Omarchy
-   `manifest.json` `version` must match the release tag.
+1. **Bump all version surfaces** — `Cargo.toml` `version`, the root Omarchy
+   `manifest.json` `version`, and `packaging/scoop/ai-usagebar.json`
+   `version` must match the release tag. The Scoop manifest's URL/hash keep
+   the previous release's values in-tree; `publish-scoop` rewrites them
+   from the published sidecar at release time (verify-version only gates
+   `version` — v1.20.0 never shipped because the bump missed this file).
 2. **Update `CHANGELOG.md`**:
    - Add a new `## [X.Y.Z] — YYYY-MM-DD` section above the previous one.
    - Categorize entries by **Added / Changed / Fixed / Security** (Keep-A-Changelog).
@@ -50,7 +54,7 @@ When cutting a new version (patch, minor, or major):
      merge is not evidence here; the comparison is, and now the guard is too.
 3. **Bump `packaging/aur/PKGBUILD`** — `pkgver=X.Y.Z`, `pkgrel=1`, reset `sha256sums` to `'SKIP'`.
 4. **Bump `packaging/aur/PKGBUILD-bin`** — same `pkgver`, `pkgrel=1`, reset both
-   `sha256sums_x86_64` and `sha256sums_aarch64` to `'SKIP'`.
+   `sha256sums_x86_64` and `sha256sums_aarch64` to `('SKIP' 'SKIP')`.
 5. **Regenerate both `.SRCINFO`s NOW, before tagging** — the release
    workflow's `verify-version` job rejects the tag if `packaging/aur/.SRCINFO`
    or `.SRCINFO-bin` still carry the old `pkgver` (learned at v0.17.0, which
@@ -67,12 +71,16 @@ When cutting a new version (patch, minor, or major):
    ```
    make changelog-check                        # released sections + version files intact
    make test                                   # cargo test + the desktop JS gate
+   cargo fmt --all -- --check                  # CI runs this; it is a hard gate
    cargo clippy --all-targets -- -D warnings   # clean
    cargo machete                               # no unused deps
    omarchy plugin validate .                   # plugin manifest + entry points
    ```
-   `make test` rather than `cargo test`: it also runs the GNOME, KDE, and
-   Omarchy frontend contract suites. If `kde-plasmoid/` changed, also bump
+   `make test` rather than `cargo test`: it also runs the GNOME, KDE, Omarchy,
+   and Linux Mint frontend contract suites. `cargo fmt --all -- --check` is on
+   this list because CI's ubuntu job runs it and fails the build on a diff — it was
+   missing here once, and a correctly-working commit landed on `main` red for
+   nothing but a rustfmt line-wrap. If `kde-plasmoid/` changed, also bump
    `KPlugin.Version` in `kde-plasmoid/package/metadata.json`; it is versioned
    independently of `Cargo.toml`, like the GNOME `metadata.json`.
 7. **Commit, tag, push**:
@@ -116,7 +124,18 @@ When cutting a new version (patch, minor, or major):
    `packaging/aur/PKGBUILD*` + regen'd `.SRCINFO*` from the main repo,
    commit, push.
 
-**Anything skipping any of 1–9 is an incomplete release.** Tags are
+10. **Reclaim the build storage.** After the release is verified (not merely
+    tagged), run `cargo clean` — release gates leave tens of GB of
+    incremental artifacts in `target/`, and multi-arch work compounds it.
+    Also remove scratch from the audit/gating workflow: any `git worktree`
+    checkouts under `/tmp` (prune with `git worktree remove --force` +
+    `git worktree prune`) and their `CARGO_TARGET_DIR` side directories
+    (`/tmp/opencode/*-tgt`), which each hold a full dependency build.
+    The next `make test` pays a full rebuild for the reclaimed space —
+    that trade is correct exactly once per release, and leaving the trash
+    in place has exhausted disk storage before.
+
+**Anything skipping any of 1–10 is an incomplete release.** Tags are
 immutable; do **not** force-move a tag once it's pushed. Cut a new
 patch version instead.
 
@@ -268,14 +287,17 @@ vendor's response shape drifts:
   auth file and pass the paths in; never touch the real ones.
 - `src/anthropic/keychain.rs` — macOS-only Keychain fallback when
   `~/.claude/.credentials.json` is absent (Claude Code on macOS stores
-  the OAuth blob in the login Keychain). Reads, deletes and normal-sized writes
-  use `security(1)`: the writer's code identity is what macOS stamps onto the item's
+  the OAuth blob in the login Keychain). Reads, writes and deletes all use
+  `security(1)`: the writer's code identity is what macOS stamps onto the item's
   XARA partition list, so a native write left the item owned by
   `cdhash:<ai-usagebar>` and made every `/usr/bin/security` read — ours and
-  Claude Code's — raise a Keychain dialog (#148). OAuth JSON still never enters
-  process arguments: the command goes to `security -i` on stdin. Only a blob
-  over that reader's line cap falls back to Security.framework. Module-gated with
-  `#[cfg(target_os = "macos")]`; Linux build never compiles it.
+  Claude Code's — raise a Keychain dialog (#148). Normal-sized blobs go to
+  `security -i` on stdin, keeping the JSON out of argv; a blob over that
+  reader's line cap (real once Claude Code keeps `mcpOAuth` plugin state in the
+  item) is passed to `security add-generic-password` as an argument instead —
+  never through Security.framework, which is now a dev-dependency used only by
+  the opt-in Keychain tests. Module-gated with `#[cfg(target_os = "macos")]`;
+  Linux build never compiles it.
 - `src/cache.rs` — atomic per-vendor cache writes + flock, plus the shared
   cross-platform path resolvers (`xdg_cache_dir`, `home_dir`). `home_dir`
   resolves `$HOME` / `%USERPROFILE%` via `directories::BaseDirs` and is reused
@@ -293,7 +315,9 @@ vendor's response shape drifts:
 - `src/tooltip.rs` — shared Pango bordered-box renderer (used by
   every vendor's tooltip)
 - `gnome-extension/marker-logic.js` — pure GNOME formatting helpers and their
-  own Node contract tests.
+  own Node contract tests. `gnome-extension/report-model.js` projects
+  `usage --json` for the provider submenus; the top bar still uses the format
+  string.
 - `kde-plasmoid/` — KDE Plasma 6 plasmoid (KPackage). Vendor selection is
   per applet instance via KConfigXT. Its single `usage --json` request omits
   `--vendor`; selection happens client-side, so it never reads

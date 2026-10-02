@@ -28,6 +28,7 @@ pub(crate) const VENDOR_SECRET_ENV_VARS: &[&str] = &[
     "ZAI_API_KEY",
     "OPENROUTER_API_KEY",
     "DEEPSEEK_API_KEY",
+    "DEEPINFRA_API_KEY",
     "KIMI_API_KEY",
     "KILO_API_KEY",
     "NOVITA_API_KEY",
@@ -39,6 +40,7 @@ pub(crate) const VENDOR_SECRET_ENV_VARS: &[&str] = &[
     "GROK_API_KEY",
     "OPENCODE_GO_API_KEY",
     "COMMANDCODE_API_KEY",
+    "ORCAROUTER_API_KEY",
     "GITHUB_COPILOT_TOKEN",
     "GH_TOKEN",
     "GITHUB_TOKEN",
@@ -160,12 +162,14 @@ pub enum VendorId {
     Zai,
     Openrouter,
     Deepseek,
+    Deepinfra,
     Kimi,
     Kilo,
     Novita,
     Moonshot,
     Grok,
     Supergrok,
+    Grokbot,
     Antigravity,
     Cursor,
     Minimax,
@@ -177,6 +181,8 @@ pub enum VendorId {
     #[serde(rename = "commandcode")]
     CommandCode,
     Ollama,
+    OrcaRouter,
+    ModelStudio,
 }
 
 /// How a provider authenticates. Drives what a frontend offers a provider that
@@ -214,12 +220,14 @@ impl VendorId {
             VendorId::Zai => "zai",
             VendorId::Openrouter => "openrouter",
             VendorId::Deepseek => "deepseek",
+            VendorId::Deepinfra => "deepinfra",
             VendorId::Kimi => "kimi",
             VendorId::Kilo => "kilo",
             VendorId::Novita => "novita",
             VendorId::Moonshot => "moonshot",
             VendorId::Grok => "grok",
             VendorId::Supergrok => "supergrok",
+            VendorId::Grokbot => "grokbot",
             VendorId::Antigravity => "antigravity",
             VendorId::Cursor => "cursor",
             VendorId::Minimax => "minimax",
@@ -228,6 +236,8 @@ impl VendorId {
             VendorId::OpenCodeGo => "opencode-go",
             VendorId::CommandCode => "commandcode",
             VendorId::Ollama => "ollama",
+            VendorId::OrcaRouter => "orcarouter",
+            VendorId::ModelStudio => "modelstudio",
         }
     }
 
@@ -243,12 +253,14 @@ impl VendorId {
             VendorId::Zai => "Z.AI",
             VendorId::Openrouter => "OpenRouter",
             VendorId::Deepseek => "DeepSeek",
+            VendorId::Deepinfra => "DeepInfra",
             VendorId::Kimi => "Kimi",
             VendorId::Kilo => "Kilo",
             VendorId::Novita => "Novita",
             VendorId::Moonshot => "Moonshot",
             VendorId::Grok => "Grok",
             VendorId::Supergrok => "SuperGrok",
+            VendorId::Grokbot => "Grok Bot",
             VendorId::Antigravity => "Antigravity",
             VendorId::Cursor => "Cursor",
             VendorId::Minimax => "MiniMax",
@@ -257,6 +269,8 @@ impl VendorId {
             VendorId::OpenCodeGo => "OpenCode Go",
             VendorId::CommandCode => "Command Code",
             VendorId::Ollama => "Ollama Cloud",
+            VendorId::OrcaRouter => "OrcaRouter",
+            VendorId::ModelStudio => "Model Studio",
         }
     }
 
@@ -272,11 +286,13 @@ impl VendorId {
             VendorId::Zai => VendorId::Zai.short_name(),
             VendorId::Openrouter => "󱙺",
             VendorId::Deepseek => "󰧑",
+            VendorId::Deepinfra => VendorId::Deepinfra.short_name(),
             VendorId::Kimi => VendorId::Kimi.short_name(),
             VendorId::Kilo => "󰭟",
             VendorId::Novita => "󰄔",
             VendorId::Moonshot => VendorId::Moonshot.short_name(),
             VendorId::Grok | VendorId::Supergrok => "󰇷",
+            VendorId::Grokbot => VendorId::Grokbot.short_name(),
             VendorId::Antigravity => VendorId::Antigravity.short_name(),
             VendorId::Cursor => "❯",
             VendorId::Minimax => VendorId::Minimax.short_name(),
@@ -287,6 +303,10 @@ impl VendorId {
             // No distinct Nerd Font mark for Ollama Cloud; the `oll` short
             // name is unique by construction and cannot render as tofu.
             VendorId::Ollama => VendorId::Ollama.short_name(),
+            // Same story for OrcaRouter: the `orc` short name is unique.
+            VendorId::OrcaRouter => VendorId::OrcaRouter.short_name(),
+            // Same story for Model Studio: the `mst` short name is unique.
+            VendorId::ModelStudio => VendorId::ModelStudio.short_name(),
         }
     }
 
@@ -303,12 +323,14 @@ impl VendorId {
             VendorId::Zai => "zai",
             VendorId::Openrouter => "opr",
             VendorId::Deepseek => "dsk",
+            VendorId::Deepinfra => "dif",
             VendorId::Kimi => "kmi",
             VendorId::Kilo => "klo",
             VendorId::Novita => "nvt",
             VendorId::Moonshot => "msh",
             VendorId::Grok => "grk",
             VendorId::Supergrok => "sgk",
+            VendorId::Grokbot => "gbt",
             VendorId::Antigravity => "agy",
             VendorId::Cursor => "cur",
             VendorId::Minimax => "mmx",
@@ -317,6 +339,8 @@ impl VendorId {
             VendorId::OpenCodeGo => "ocg",
             VendorId::CommandCode => "cmc",
             VendorId::Ollama => "oll",
+            VendorId::OrcaRouter => "orc",
+            VendorId::ModelStudio => "mst",
         }
     }
 
@@ -336,12 +360,14 @@ impl VendorId {
             VendorId::Zai => "zai",
             VendorId::Openrouter => "openrouter",
             VendorId::Deepseek => "deepseek",
+            VendorId::Deepinfra => "deepinfra",
             VendorId::Kimi => "kimi",
             VendorId::Kilo => "kilo",
             VendorId::Novita => "novita",
             VendorId::Moonshot => "moonshot",
             VendorId::Grok => "grok",
             VendorId::Supergrok => "supergrok",
+            VendorId::Grokbot => "grokbot",
             VendorId::Antigravity => "antigravity",
             VendorId::Cursor => "cursor",
             VendorId::Minimax => "minimax",
@@ -350,6 +376,8 @@ impl VendorId {
             VendorId::OpenCodeGo => "opencode-go",
             VendorId::CommandCode => "commandcode",
             VendorId::Ollama => "ollama",
+            VendorId::OrcaRouter => "orcarouter",
+            VendorId::ModelStudio => "modelstudio",
         }
     }
 
@@ -369,6 +397,7 @@ impl VendorId {
             | VendorId::Zai
             | VendorId::Openrouter
             | VendorId::Deepseek
+            | VendorId::Deepinfra
             | VendorId::Kimi
             | VendorId::Kilo
             | VendorId::Novita
@@ -376,15 +405,21 @@ impl VendorId {
             | VendorId::Grok
             | VendorId::Minimax
             | VendorId::OpenCodeGo
-            | VendorId::Ollama => AuthKind::ApiKey,
+            | VendorId::Ollama
+            | VendorId::OrcaRouter => AuthKind::ApiKey,
             // No credential of their own: another local product's session is
             // the login. Antigravity has no credential file at all (the binary
             // probes whichever local server answers), Cursor and Kiro read the
-            // IDE's and kiro-cli's own state, and SuperGrok uses the Grok Build
-            // CLI's login.
-            VendorId::Supergrok | VendorId::Antigravity | VendorId::Cursor | VendorId::Kiro => {
-                AuthKind::Local
-            }
+            // IDE's and kiro-cli's own state, SuperGrok uses the Grok Build
+            // CLI's login, Grok Bot reads the desktop app's own
+            // OSCrypt-protected session file, and Model Studio reads the `bl`
+            // CLI's own console-login file.
+            VendorId::Supergrok
+            | VendorId::Antigravity
+            | VendorId::Cursor
+            | VendorId::Kiro
+            | VendorId::Grokbot
+            | VendorId::ModelStudio => AuthKind::Local,
         }
     }
 
@@ -398,6 +433,7 @@ impl VendorId {
             VendorId::Zai => "ZAI_API_KEY",
             VendorId::Openrouter => "OPENROUTER_API_KEY",
             VendorId::Deepseek => "DEEPSEEK_API_KEY",
+            VendorId::Deepinfra => "DEEPINFRA_API_KEY",
             VendorId::Kimi => "KIMI_API_KEY",
             VendorId::Kilo => "KILO_API_KEY",
             VendorId::Novita => "NOVITA_API_KEY",
@@ -406,6 +442,7 @@ impl VendorId {
             VendorId::Minimax => "MINIMAX_API_KEY",
             VendorId::OpenCodeGo => "OPENCODE_GO_API_KEY",
             VendorId::Ollama => "OLLAMA_API_KEY",
+            VendorId::OrcaRouter => "ORCAROUTER_API_KEY",
             // OAuth-first, with an environment override for CI and headless
             // use. Neither name is configurable, so neither has an
             // `api_key_env` field in its config section.
@@ -414,10 +451,12 @@ impl VendorId {
             VendorId::Anthropic
             | VendorId::Openai
             | VendorId::Supergrok
+            | VendorId::Grokbot
             | VendorId::Antigravity
             | VendorId::Cursor
             | VendorId::Kiro
-            | VendorId::NousResearch => "",
+            | VendorId::NousResearch
+            | VendorId::ModelStudio => "",
         }
     }
 
@@ -447,6 +486,11 @@ impl VendorId {
             VendorId::Cursor => "Sign in to the Cursor app, then Refresh.",
             VendorId::Antigravity => "Open Antigravity or run `agy`, then Refresh.",
             VendorId::Grok | VendorId::Supergrok => "Sign in with `grok`, then Refresh.",
+            VendorId::Grokbot => "Install and sign in to the Grok Bot desktop app, then Refresh.",
+            // Local login through the official CLI's own console session.
+            VendorId::ModelStudio => {
+                "Install the official `bl` CLI and run `bl auth login --console`, then Refresh."
+            }
             // Key-only providers: there is nothing to log into, only a key to
             // put in the config. Ollama Cloud's key is minted at
             // ollama.com/settings/keys; the local `ollama` CLI's Ed25519 key
@@ -455,12 +499,14 @@ impl VendorId {
             | VendorId::Zai
             | VendorId::Openrouter
             | VendorId::Deepseek
+            | VendorId::Deepinfra
             | VendorId::Kilo
             | VendorId::Novita
             | VendorId::Moonshot
             | VendorId::Minimax
             | VendorId::OpenCodeGo
-            | VendorId::Ollama => "Add an API key in Settings, then Refresh.",
+            | VendorId::Ollama
+            | VendorId::OrcaRouter => "Add an API key in Settings, then Refresh.",
         }
     }
 
@@ -472,6 +518,8 @@ impl VendorId {
             VendorId::CommandCode => "commandcode",
             VendorId::NousResearch => "ai-usagebar auth nous login",
             VendorId::Kiro => "kiro-cli login",
+            // The `bl` CLI's console login is the whole credential.
+            VendorId::ModelStudio => "bl auth login --console",
             // Kimi takes a key *or* the Kimi Code CLI's own OAuth login, which
             // is what a subscriber already has locally.
             VendorId::Kimi => "kimi",
@@ -479,20 +527,23 @@ impl VendorId {
             | VendorId::Zai
             | VendorId::Openrouter
             | VendorId::Deepseek
+            | VendorId::Deepinfra
             | VendorId::Kilo
             | VendorId::Novita
             | VendorId::Moonshot
             | VendorId::Grok
             | VendorId::Supergrok
+            | VendorId::Grokbot
             | VendorId::Antigravity
             | VendorId::Cursor
             | VendorId::Minimax
             | VendorId::OpenCodeGo
-            | VendorId::Ollama => "",
+            | VendorId::Ollama
+            | VendorId::OrcaRouter => "",
         }
     }
 
-    pub fn all() -> &'static [VendorId] {
+    pub const fn all() -> &'static [VendorId] {
         &[
             VendorId::Anthropic,
             VendorId::AnthropicApi,
@@ -501,12 +552,14 @@ impl VendorId {
             VendorId::Zai,
             VendorId::Openrouter,
             VendorId::Deepseek,
+            VendorId::Deepinfra,
             VendorId::Kimi,
             VendorId::Kilo,
             VendorId::Novita,
             VendorId::Moonshot,
             VendorId::Grok,
             VendorId::Supergrok,
+            VendorId::Grokbot,
             VendorId::Antigravity,
             VendorId::Cursor,
             VendorId::Minimax,
@@ -515,7 +568,17 @@ impl VendorId {
             VendorId::OpenCodeGo,
             VendorId::CommandCode,
             VendorId::Ollama,
+            VendorId::OrcaRouter,
+            VendorId::ModelStudio,
         ]
+    }
+
+    /// Look a vendor up by its config/report slug — the validation every
+    /// by-name writer (the settings surfaces' provider on/off toggles, #244)
+    /// goes through before touching a config section, so a slug that names
+    /// no built-in vendor can never become a `[section]`.
+    pub fn from_slug(slug: &str) -> Option<Self> {
+        Self::all().iter().copied().find(|id| id.slug() == slug)
     }
 }
 
@@ -639,6 +702,7 @@ mod tests {
             "ZAI_API_KEY",
             "OPENROUTER_API_KEY",
             "DEEPSEEK_API_KEY",
+            "DEEPINFRA_API_KEY",
             "KIMI_API_KEY",
             "KILO_API_KEY",
             "NOVITA_API_KEY",
@@ -647,6 +711,7 @@ mod tests {
             "XAI_MANAGEMENT_KEY",
             "ANTHROPIC_ADMIN_KEY",
             "GITHUB_COPILOT_TOKEN",
+            "ORCAROUTER_API_KEY",
         ];
         for name in configured_defaults {
             assert!(VENDOR_SECRET_ENV_VARS.contains(&name), "missing {name}");
@@ -830,5 +895,26 @@ mod tests {
                 serde_json::to_value(id).unwrap().as_str().unwrap()
             );
         }
+    }
+
+    /// `from_slug` is the whitelist by-name config writers validate through,
+    /// so it must accept every real slug (and its own renames) and nothing
+    /// else — not a section name it doesn't own, not an empty string.
+    #[test]
+    fn from_slug_resolves_every_slug_and_rejects_everything_else() {
+        for id in VendorId::all() {
+            assert_eq!(VendorId::from_slug(id.slug()), Some(*id));
+        }
+        assert_eq!(
+            VendorId::from_slug("anthropic_api"),
+            Some(VendorId::AnthropicApi)
+        );
+        assert_eq!(
+            VendorId::from_slug("opencode-go"),
+            Some(VendorId::OpenCodeGo)
+        );
+        assert_eq!(VendorId::from_slug(""), None);
+        assert_eq!(VendorId::from_slug("custom"), None);
+        assert_eq!(VendorId::from_slug("Anthropic"), None);
     }
 }

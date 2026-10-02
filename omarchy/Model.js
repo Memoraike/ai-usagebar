@@ -46,23 +46,37 @@ function normalizeSection(raw) {
       severity = percent >= 90 ? "critical" : percent >= 75 ? "high" : percent >= 50 ? "mid" : "low"
     var windowSecs = Math.floor(Number(raw.window_secs))
     if (!isFinite(windowSecs) || windowSecs <= 0) windowSecs = null
+    // Which number the bar draws. Anything but an explicit "value" — including
+    // a report old enough not to carry the field — leaves it a percentage.
+    var headline = raw.headline === "value" ? "value" : "percent"
     return {
       type: "metric",
       label: cleanText(raw.label, 160),
       percent: percent,
       value: cleanText(raw.value, 240),
       detail: cleanText(raw.detail, 1000),
+      headline: headline,
       severity: severity,
       reset_at: cleanText(raw.reset_at, 80),
-      window_secs: windowSecs
+      window_secs: windowSecs,
+      group: cleanText(raw.group, 80)
     }
   }
   if (type === "text") {
-    return {
+    var text = {
       type: "text",
       label: cleanText(raw.label, 160),
       value: cleanText(raw.value, 1000)
     }
+    // Cursor's On-Demand row. Kept only as safe integers so a report cannot
+    // smuggle a string or a float in where the meter expects cents.
+    var used = minorUnits(raw.used_cents)
+    var limit = minorUnits(raw.limit_cents)
+    var consumed = minorUnits(raw.percent)
+    if (used !== null) text.used_cents = used
+    if (limit !== null && limit > 0) text.limit_cents = limit
+    if (consumed !== null && consumed >= 0) text.percent = consumed
+    return text
   }
   if (type === "block") {
     var body = Array.isArray(raw.body) ? raw.body : []
@@ -305,6 +319,8 @@ function brandFileFor(provider) {
     case "grok":
     case "supergrok":
       return "grok.svg"
+    case "grokbot":
+      return "grokbot.svg"
     case "antigravity":
       return "antigravity.svg"
     case "cursor":
@@ -346,6 +362,8 @@ function barChips(entries, selected, showAll, showValue, showProvider, loading, 
     }
     var brand = brandIconFile(entry)
     chips.push({
+      // The bar turns each chip into a target for its own entry.
+      id: entry.id,
       brand: brand,
       icon: brand !== "" ? providerIcon(entry) : providerShort(entry),
       label: label,
@@ -355,6 +373,27 @@ function barChips(entries, selected, showAll, showValue, showProvider, loading, 
     })
   }
   return chips
+}
+
+// The bar presses a slot's widget by geometry: it maps the point into every
+// registered click target and takes the newest one whose rect contains it,
+// falling back to the slot's button. A chip that registered only its glyph left
+// the button to swallow the rest of the slot, so a press aimed at a chip above,
+// below or beside it toggled whichever entry was already selected. Each chip
+// therefore registers its whole column of the slot, and the gaps between chips
+// split at their midpoint: the first and last chips own half of the gap beside
+// them, a middle chip a whole one. The outer columns also own the button's
+// padding at either end (`edge`), so the columns tile the whole widget and its
+// width stays exactly what the plain spacing and padding produced.
+function chipHitGaps(index, count, gap, edge) {
+  var half = (Number(gap) || 0) / 2
+  var outer = Number(edge) || 0
+  var chips = Number(count) || 0
+  var position = Number(index) || 0
+  return {
+    left: position === 0 ? outer : half,
+    right: position >= chips - 1 ? outer : half
+  }
 }
 
 // Which usage window the top bar shows. "auto" keeps the historical
@@ -438,11 +477,326 @@ function selectMetric(entry, barWindow) {
   return maxPercent(candidates)
 }
 
+function severityRank(severity) {
+  if (severity === "critical") return 3
+  if (severity === "high") return 2
+  if (severity === "mid") return 1
+  return 0
+}
+
+// One Dark defaults — same hexes as src/theme.rs when colors.toml is missing.
+var ONE_DARK_PALETTE = {
+  green: "#98c379",
+  yellow: "#e5c07b",
+  orange: "#d19a66",
+  red: "#e06c75"
+}
+
+// Parse Omarchy theme/colors.toml keys used for RAG (Waybar Theme's source).
+// Named keys win over the older color1–3 aliases, matching theme.rs
+// merged_with_omarchy after #289 (red.or(color1), not last-occurrence-wins).
+// orange falls back to the resolved red when absent.
+function parseThemePalette(raw) {
+  var greenNamed = ""
+  var greenAlias = ""
+  var yellowNamed = ""
+  var yellowAlias = ""
+  var orangeNamed = ""
+  var redNamed = ""
+  var redAlias = ""
+  var lines = String(raw || "").split("\n")
+  for (var i = 0; i < lines.length; i++) {
+    var match = lines[i].match(/^\s*([A-Za-z0-9_-]+)\s*=\s*["']?(#[0-9A-Fa-f]{6})/)
+    if (!match) continue
+    var key = match[1]
+    var hex = match[2]
+    if (key === "green") greenNamed = hex
+    else if (key === "color2") greenAlias = hex
+    else if (key === "yellow") yellowNamed = hex
+    else if (key === "color3") yellowAlias = hex
+    else if (key === "orange") orangeNamed = hex
+    else if (key === "red") redNamed = hex
+    else if (key === "color1") redAlias = hex
+  }
+  var red = redNamed || redAlias
+  var green = greenNamed || greenAlias
+  var yellow = yellowNamed || yellowAlias
+  var orange = orangeNamed || red
+  return {
+    green: green || ONE_DARK_PALETTE.green,
+    yellow: yellow || ONE_DARK_PALETTE.yellow,
+    orange: orange || ONE_DARK_PALETTE.orange,
+    red: red || ONE_DARK_PALETTE.red
+  }
+}
+
+function severityColor(severity, palette) {
+  var p = palette || ONE_DARK_PALETTE
+  if (severity === "critical") return p.red
+  if (severity === "high") return p.orange
+  if (severity === "mid") return p.yellow
+  if (severity === "low") return p.green
+  return p.green
+}
+
+// Older reports print On-Demand as "$0.00 / $5.00" and nothing else. A
+// current report carries used_cents, limit_cents, and percent, which win.
+// This parser stays for a binary that predates those fields.
+function parseMoneyToken(token) {
+  var text = String(token || "").trim()
+  var match = text.match(/^(-)?(\D*?)(\d+(?:\.\d+)?)(\D*)$/)
+  if (!match) return null
+  var amount = Number(match[3])
+  if (!isFinite(amount)) return null
+  if (match[1] === "-") amount = -amount
+  var places = (match[3].split(".")[1] || "").length
+  return { amount: amount, prefix: match[2], suffix: match[4], places: places }
+}
+
+function minorUnits(value) {
+  if (typeof value !== "number" || !isFinite(value) || !Number.isSafeInteger(value)) return null
+  return value
+}
+
+// USD cents, matching fmt_minor(..., 2, "USD"): the sign sits ahead of the
+// symbol, and a zero amount is never "-$0.00".
+function formatUsdCents(cents) {
+  var negative = cents < 0
+  var abs = negative ? -cents : cents
+  var dollars = Math.floor(abs / 100)
+  var frac = abs % 100
+  var body = dollars + "." + (frac < 10 ? "0" : "") + frac
+  if (dollars === 0 && frac === 0) negative = false
+  return (negative ? "-" : "") + "$" + body
+}
+
+function formatMoney(sample, amount) {
+  var negative = amount < 0
+  var abs = Math.abs(amount)
+  var body = sample.places > 0 ? abs.toFixed(sample.places) : String(Math.round(abs))
+  return (negative ? "-" : "") + sample.prefix + body + sample.suffix
+}
+
+function usageSeverity(percent) {
+  if (percent >= 90) return "critical"
+  if (percent >= 75) return "high"
+  if (percent >= 50) return "mid"
+  return "low"
+}
+
+function onDemandView(usedPct, usedText, limitText, leftText) {
+  return {
+    bar: usedPct + "%",
+    usedPct: usedPct,
+    severity: usageSeverity(usedPct),
+    display: leftText,
+    detail: usedText + " of " + limitText + " used (" + usedPct + "%)",
+    tooltip: "On-demand " + usedText + " of " + limitText + " used (" + usedPct + "%)"
+  }
+}
+
+// Same reading as OpenRouter's credit chip: the percentage is how much of
+// the prepaid balance is already used. The dollars still left stay beside
+// the meter in the panel. Cents from the report are the contract; the
+// formatted value is only read when those fields are absent.
+function onDemandFromCents(section) {
+  var used = minorUnits(section.used_cents)
+  var limit = minorUnits(section.limit_cents)
+  if (used === null || limit === null || !(limit > 0)) return null
+  var usedPct = minorUnits(section.percent)
+  if (usedPct === null || usedPct < 0)
+    usedPct = Math.round((Math.max(0, used) / limit) * 100)
+  var spent = Math.max(0, used)
+  var left = Math.max(0, limit - used)
+  return onDemandView(usedPct, formatUsdCents(spent), formatUsdCents(limit), formatUsdCents(left))
+}
+
+function onDemandFromText(value) {
+  var text = String(value || "")
+  var slash = text.indexOf("/")
+  if (slash < 0) return null
+  var used = parseMoneyToken(text.slice(0, slash))
+  var limit = parseMoneyToken(text.slice(slash + 1))
+  if (!used || !limit || !(limit.amount > 0)) return null
+  var factor = Math.pow(10, limit.places)
+  var left = Math.max(0, Math.round((limit.amount - used.amount) * factor) / factor)
+  var usedPct = Math.round((Math.max(0, used.amount) / limit.amount) * 100)
+  var usedText = formatMoney(used, Math.max(0, used.amount))
+  var limitText = formatMoney(limit, limit.amount)
+  var leftText = formatMoney(limit, left)
+  return onDemandView(usedPct, usedText, limitText, leftText)
+}
+
+function onDemandRemaining(section) {
+  if (section && typeof section === "object") {
+    var fromCents = onDemandFromCents(section)
+    if (fromCents) return fromCents
+    return onDemandFromText(section.value)
+  }
+  return onDemandFromText(section)
+}
+
+function cursorOnDemand(entry) {
+  var sections = entry && Array.isArray(entry.sections) ? entry.sections : []
+  for (var i = 0; i < sections.length; i++) {
+    var section = sections[i]
+    if (section && section.type === "text" && section.label === "On-Demand")
+      return onDemandRemaining(section)
+  }
+  return null
+}
+
+function cursorPoolPresence(entry) {
+  var sections = entry && Array.isArray(entry.sections) ? entry.sections : []
+  var models = false
+  var other = false
+  for (var i = 0; i < sections.length; i++) {
+    var section = sections[i]
+    if (!section || section.type !== "metric") continue
+    if (section.label === "Cursor Models") models = true
+    else if (section.label === "Other Models") other = true
+  }
+  return { models: models, other: other, demand: cursorOnDemand(entry) !== null }
+}
+
+// Fixed display order. A missing or unknown flag stays on, and turning the
+// last one off is refused so the bar never goes blank.
+function cursorPoolVisibility(flags) {
+  var models = !(flags && flags.models === false)
+  var other = !(flags && flags.other === false)
+  var demand = !(flags && flags.demand === false)
+  if (!models && !other && !demand) models = true
+  return { models: models, other: other, demand: demand }
+}
+
+function toggleCursorPool(flags, id) {
+  var current = cursorPoolVisibility(flags)
+  var next = { models: current.models, other: current.other, demand: current.demand }
+  if (id === "models") next.models = !next.models
+  else if (id === "other") next.other = !next.other
+  else if (id === "demand") next.demand = !next.demand
+  else return current
+  if (!next.models && !next.other && !next.demand) return current
+  return next
+}
+
+// Flags the chip can actually draw. A switch whose pool is absent (on-demand
+// with no prepaid row) does not count, and when that would leave the bar
+// blank the first pool that does exist stays on. Models win that fallback.
+function cursorBarFlags(entry, flags) {
+  var show = cursorPoolVisibility(flags)
+  var has = cursorPoolPresence(entry)
+  var visible = {
+    models: show.models && has.models,
+    other: show.other && has.other,
+    demand: show.demand && has.demand
+  }
+  if (!visible.models && !visible.other && !visible.demand) {
+    if (has.models) visible.models = true
+    else if (has.other) visible.other = true
+    else if (has.demand) visible.demand = true
+  }
+  return visible
+}
+
+// Cursor's included usage is two model pools, not two time windows, so the
+// 5-hour / weekly / monthly pin does not describe them. Visible pools stay in
+// dashboard order: Cursor Models, then Other Models, then prepaid on-demand
+// as a used percentage, the same way OpenRouter shows a credit balance.
+// Severity follows whichever visible pool is furthest along.
+function cursorDualHeadline(entry, flags) {
+  if (baseProvider(entry && entry.id) !== "cursor") return null
+  var sections = Array.isArray(entry.sections) ? entry.sections : []
+  var auto = null
+  var api = null
+  for (var i = 0; i < sections.length; i++) {
+    var section = sections[i]
+    if (!section || section.type !== "metric") continue
+    if (section.label === "Cursor Models") auto = section
+    else if (section.label === "Other Models") api = section
+  }
+  if (!auto || !api) return null
+  var show = cursorBarFlags(entry, flags)
+  var demand = cursorOnDemand(entry)
+  var parts = []
+  if (show.models) parts.push({
+    text: auto.percent + "%",
+    line: "Cursor Models · " + auto.percent + "%",
+    percent: auto.percent,
+    severity: auto.severity
+  })
+  if (show.other) parts.push({
+    text: api.percent + "%",
+    line: "Cursor Other Models · " + api.percent + "%",
+    percent: api.percent,
+    severity: api.severity
+  })
+  if (show.demand && demand) parts.push({
+    text: demand.bar,
+    line: "Cursor On Demand · " + demand.usedPct + "%",
+    percent: demand.usedPct,
+    severity: demand.severity
+  })
+  if (parts.length === 0) {
+    parts.push({
+      text: auto.percent + "%",
+      line: "Cursor Models · " + auto.percent + "%",
+      percent: auto.percent,
+      severity: auto.severity
+    })
+  }
+  var worse = parts[0]
+  for (var p = 1; p < parts.length; p++) {
+    var part = parts[p]
+    if (part.percent > worse.percent
+        || (part.percent === worse.percent && severityRank(part.severity) > severityRank(worse.severity)))
+      worse = part
+  }
+  var texts = []
+  var lines = []
+  var segments = []
+  var tooltipRows = []
+  for (var n = 0; n < parts.length; n++) {
+    texts.push(parts[n].text)
+    lines.push(parts[n].line)
+    if (n > 0) segments.push({ text: " · ", severity: "" })
+    segments.push({ text: parts[n].text, severity: parts[n].severity })
+    tooltipRows.push({ text: parts[n].line, severity: parts[n].severity })
+  }
+  var text = texts.join(" · ")
+  var tooltip = lines.join("\n")
+  var allCritical = parts.length > 0
+  for (var c = 0; c < parts.length; c++) {
+    if (parts[c].severity !== "critical") {
+      allCritical = false
+      break
+    }
+  }
+  return {
+    text: text,
+    tooltip: tooltip,
+    segments: segments,
+    tooltipRows: tooltipRows,
+    percent: worse.percent,
+    severity: worse.severity,
+    // Icon / button chrome: only when every visible pool is critical, so a
+    // single exhausted pool does not paint the brand mark while siblings are fine.
+    allCritical: allCritical,
+    label: "Cursor Models · Other Models"
+  }
+}
+
 function headline(entry, barWindow) {
   if (!entry) return { text: "", percent: null, severity: "low", label: "" }
+  var dual = cursorDualHeadline(entry)
+  if (dual) return dual
   var best = selectMetric(entry, barWindow)
   if (best) {
-    var bestText = /balance/i.test(best.label) && best.value !== ""
+    // The metric names which of its two numbers goes on the bar; the other one
+    // stays in the detail. Reading that beats guessing from the label, which
+    // put OpenRouter's dollar figure on the bar and hid its consumed percent.
+    // An older report omits the field, and a metric is a percentage by default.
+    var bestText = best.headline === "value" && best.value !== ""
       ? best.value : best.percent + "%"
     return {
       text: bestText,
@@ -463,7 +817,8 @@ function headline(entry, barWindow) {
 function isAlarming(entry) {
   if (!entry) return false
   var summary = headline(entry)
-  return entry.status === "error" || entry.stale === true || summary.severity === "critical"
+  // Cached and failed fetches stay visible without turning the bar red on their own.
+  return summary.severity === "critical"
 }
 
 function formatDuration(milliseconds) {
@@ -527,6 +882,45 @@ function metricDetail(row) {
   return detail.trim()
 }
 
+// The report marks sub-rows with a group (SuperGrok's product slices under
+// "Breakdown"). Render each group as a heading row — an empty-value text row,
+// which DetailRow draws through its section-header path — followed by that
+// group's metrics, so slices read as a breakdown of the meter above them
+// instead of peers of it. Ungrouped sections pass through untouched, and a
+// group heading appears once no matter how many rows carry it.
+function groupedSections(sections) {
+  var rows = Array.isArray(sections) ? sections : []
+  var out = []
+  var seen = {}
+  for (var i = 0; i < rows.length; i++) {
+    var row = rows[i]
+    if (row && row.type === "metric") {
+      var group = String(row.group || "")
+      if (group !== "" && !seen[group]) {
+        seen[group] = true
+        out.push({ type: "text", label: group, value: "" })
+      }
+    }
+    if (row && row.type === "text" && row.label === "On-Demand") {
+      var left = onDemandRemaining(row)
+      if (left) row = {
+        type: "metric",
+        label: row.label,
+        percent: left.usedPct,
+        value: left.display,
+        headline: "percent",
+        detail: left.detail,
+        severity: left.severity,
+        reset_at: "",
+        window_secs: null,
+        group: ""
+      }
+    }
+    out.push(row)
+  }
+  return out
+}
+
 function errorMessage(value) {
   var message = cleanText(value, 500).trim()
   return message === "" ? "The usage command failed without an error message." : message
@@ -558,7 +952,7 @@ function parseSettingsSnapshot(raw) {
     var parsed = JSON.parse(String(raw || ""))
     if (!parsed || Number(parsed.schema_version) !== 1
         || !Array.isArray(parsed.primary_choices) || !Array.isArray(parsed.keys))
-      return { ok: false, error: "The settings command returned an unsupported response.", primary: "", primary_choices: [], keys: [] }
+      return { ok: false, error: "The settings command returned an unsupported response.", primary: "", primary_choices: [], keys: [], vendors: [] }
 
     var choices = []
     for (var i = 0; i < parsed.primary_choices.length && i < 64; i++) {
@@ -585,6 +979,22 @@ function parseSettingsSnapshot(raw) {
       })
     }
 
+    // Provider on/off switches (#244). An older binary sends no vendors list;
+    // the section simply stays hidden rather than failing the whole form.
+    var vendors = []
+    if (Array.isArray(parsed.vendors)) {
+      for (var v = 0; v < parsed.vendors.length && v < 64; v++) {
+        var vendor = parsed.vendors[v]
+        var vendorId = settingsId(vendor && vendor.id)
+        if (vendorId === "") continue
+        vendors.push({
+          id: vendorId,
+          label: cleanText(vendor.label, 120) || vendorId,
+          enabled: vendor.enabled === true
+        })
+      }
+    }
+
     var primary = settingsId(parsed.primary)
     var primaryAvailable = false
     for (var k = 0; k < choices.length; k++) {
@@ -594,13 +1004,17 @@ function parseSettingsSnapshot(raw) {
       }
     }
     if (!primaryAvailable) primary = choices.length > 0 ? choices[0].id : ""
-    return { ok: true, error: "", primary: primary, primary_choices: choices, keys: keys }
+    return { ok: true, error: "", primary: primary, primary_choices: choices, keys: keys, vendors: vendors }
   } catch (error) {
-    return { ok: false, error: "The settings command returned invalid JSON.", primary: "", primary_choices: [], keys: [] }
+    return { ok: false, error: "The settings command returned invalid JSON.", primary: "", primary_choices: [], keys: [], vendors: [] }
   }
 }
 
-function buildSettingsPatch(primary, changes) {
+// Build the stdin patch for `settings apply`. `vendorToggles` (#244) is an
+// optional array of {id, enabled}; it is included in the payload only when a
+// toggle is pending, so a display-only save keeps the older patch shape a
+// pre-#244 binary still accepts.
+function buildSettingsPatch(primary, changes, vendorToggles) {
   var primaryId = settingsId(primary)
   var rawPrimary = String(primary || "").trim()
   if (rawPrimary !== "" && primaryId === "")
@@ -623,10 +1037,24 @@ function buildSettingsPatch(primary, changes) {
       keys[id] = { action: "set", value: value }
     } else return { ok: false, error: "A settings row has an invalid action.", payload: "" }
   }
-  if (primaryId === "" && seen.length === 0)
+  var vendors = {}
+  var toggles = Array.isArray(vendorToggles) ? vendorToggles : []
+  var seenVendors = []
+  for (var t = 0; t < toggles.length; t++) {
+    var toggle = toggles[t] || {}
+    var vendorId = settingsId(toggle.id)
+    if (vendorId === "" || seenVendors.indexOf(vendorId) >= 0)
+      return { ok: false, error: "A provider switch has an invalid provider id.", payload: "" }
+    if (toggle.enabled !== true && toggle.enabled !== false)
+      return { ok: false, error: "A provider switch needs an on or off state.", payload: "" }
+    seenVendors.push(vendorId)
+    vendors[vendorId] = toggle.enabled
+  }
+  if (primaryId === "" && seen.length === 0 && seenVendors.length === 0)
     return { ok: false, error: "There are no settings changes to save.", payload: "" }
   var patch = { schema_version: 1, keys: keys }
   if (primaryId !== "") patch.primary = primaryId
+  if (seenVendors.length > 0) patch.vendors = vendors
   return {
     ok: true,
     error: "",

@@ -104,16 +104,35 @@ pub fn push_window_with_row(
     now: DateTime<Utc>,
     row: WindowRow,
 ) {
+    push_window_with_detail(lines, label, w, theme, now, row, None);
+}
+
+/// [`push_window_with_row`], with an optional vendor-specific detail appended
+/// to the percentage line. Spend-based vendors use this for values such as
+/// "$1.23 of $14.00" while keeping the same label / gauge / reset rhythm as
+/// percentage-based vendors such as OpenAI.
+pub fn push_window_with_detail(
+    lines: &mut Vec<Line>,
+    label: &str,
+    w: &UsageWindow,
+    theme: &Theme,
+    now: DateTime<Utc>,
+    row: WindowRow,
+    detail: Option<&str>,
+) {
     let color = severity_color(severity_for(w.utilization_pct), theme);
     let bar = pango::progress_bar(w.utilization_pct, color, theme, row.marker_pct);
     let fg = &theme.fg;
     let dim = &theme.dim;
     let glyph = row.glyph.map(|g| format!(" {g}")).unwrap_or_default();
+    let detail = detail
+        .map(|detail| format!(" <span foreground='{dim}'>· {}</span>", escape(detail)))
+        .unwrap_or_default();
     lines.push(Line::Body(format!(
         " <span foreground='{fg}'>{label}</span>"
     )));
     lines.push(Line::Body(format!(
-        "   {bar}  <span font_weight='bold' foreground='{color}'>{pct}%{glyph}</span>",
+        "   {bar}  <span font_weight='bold' foreground='{color}'>{pct}%{glyph}</span>{detail}",
         pct = w.utilization_pct
     )));
     lines.push(Line::Body(format!(
@@ -210,6 +229,32 @@ mod tests {
             right_edges.windows(2).all(|w| w[0] == w[1]),
             "ragged box: {right_edges:?}\n{out}"
         );
+    }
+
+    /// The reason `visible_width` measures columns rather than characters: a
+    /// Japanese or Korean row is twice as wide as its character count, so a
+    /// char-counting box stopped short of the right border by one cell per
+    /// ideograph. This is the integration proof behind that change.
+    #[test]
+    fn rows_with_double_width_glyphs_keep_the_border_flush() {
+        let lines = vec![
+            Line::Body("セッション (5h)".into()),
+            Line::Body("사용량".into()),
+            Line::Body("Weekly".into()),
+        ];
+        let out = render_bordered(&lines, &theme());
+        let right_edges: Vec<usize> = out.lines().map(crate::pango::visible_width).collect();
+        assert!(
+            right_edges.windows(2).all(|w| w[0] == w[1]),
+            "ragged box with CJK rows: {right_edges:?}\n{out}"
+        );
+    }
+
+    #[test]
+    fn pad_right_pads_a_double_width_string_by_columns() {
+        // "日本" is 2 chars but 4 columns; padding to 6 needs 2 spaces, not 4.
+        assert!(pad_right("日本", 6).ends_with("  "));
+        assert_eq!(crate::pango::visible_width(&pad_right("日本", 6)), 6);
     }
 
     #[test]
@@ -333,5 +378,24 @@ mod tests {
         // The reset line carries nothing after the countdown now that no
         // vendor appends a fragment to it.
         assert!(!out.contains("Resets in 3h 00m ·"), "{out}");
+    }
+
+    #[test]
+    fn a_detail_is_kept_on_the_meter_line() {
+        let w = window(40, 2);
+        let mut lines = Vec::new();
+        push_window_with_detail(
+            &mut lines,
+            "  Spend",
+            &w,
+            &theme(),
+            at(12),
+            WindowRow::default(),
+            Some("$4.00 of $10.00"),
+        );
+        let out = render_bordered(&lines, &theme());
+        assert!(out.contains("40%"), "{out}");
+        assert!(out.contains("· $4.00 of $10.00"), "{out}");
+        assert!(out.contains("Resets in 2h 00m"), "{out}");
     }
 }

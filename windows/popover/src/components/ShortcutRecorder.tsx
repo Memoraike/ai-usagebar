@@ -1,6 +1,8 @@
 import { useState, type KeyboardEvent } from "react";
 import MdiCloseCircle from "~icons/mdi/close-circle";
+import { m } from "@/paraglide/messages.js";
 import { shortcutFromKeyEvent } from "../model.js";
+import { Hint } from "@/components/Hint";
 
 interface ShortcutRecorderProps {
   error: string;
@@ -32,31 +34,33 @@ export function ShortcutRecorder({ error, value, onChange }: ShortcutRecorderPro
   }
 
   return (
-    <span className="flex shrink-0 items-center gap-[6px]">
-      <button
-        type="button"
-        aria-invalid={error ? true : undefined}
-        aria-label={recording ? "Press keys" : value ? `Global shortcut ${value}` : "Set global shortcut"}
-        className="recorder"
-        data-empty={value ? undefined : "true"}
-        data-recording={recording ? "true" : undefined}
-        title={recording ? "Press the new shortcut, Escape to cancel" : "Click to record a shortcut"}
-        onBlur={() => setRecording(false)}
-        onClick={() => setRecording(true)}
-        onKeyDown={onKeyDown}
-      >
-        {recording ? "Press keys…" : value || "None"}
-      </button>
-      {value && !recording ? (
+    <span className="flex shrink-0 items-center gap-[var(--gap-item)]">
+      <Hint align="end" content={recording ? m.shortcut_recording_hint() : m.click_to_record_a_shortcut()}>
         <button
           type="button"
-          aria-label="Clear shortcut"
-          className="plain-btn grid place-items-center text-label-3"
-          title="Clear shortcut"
-          onClick={() => onChange("")}
+          aria-invalid={error ? true : undefined}
+          aria-label={recording ? m.press_keys() : value ? `${m.global_shortcut()} ${value}` : m.set_global_shortcut()}
+          className="recorder"
+          data-empty={value ? undefined : "true"}
+          data-recording={recording ? "true" : undefined}
+          onBlur={() => setRecording(false)}
+          onClick={() => setRecording(true)}
+          onKeyDown={onKeyDown}
         >
-          <MdiCloseCircle className="size-[14px]" />
+          {recording ? m.press_keys_ellipsis() : value || m.none()}
         </button>
+      </Hint>
+      {value && !recording ? (
+        <Hint align="end" content={m.clear_shortcut()}>
+          <button
+            type="button"
+            aria-label={m.clear_shortcut()}
+            className="plain-btn hover-fill grid place-items-center text-label-3"
+            onClick={() => onChange("")}
+          >
+            <MdiCloseCircle className="size-[var(--icon-row)]" />
+          </button>
+        </Hint>
       ) : null}
     </span>
   );

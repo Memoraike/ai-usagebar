@@ -2,26 +2,83 @@
 // 5-hour (session), weekly, and (optionally) extra-usage bars in the top
 // panel next to the clock/network, with a native, aligned dropdown.
 //
-// It shells out to the `ai-usagebar` binary (always exits 0, emits Waybar
-// JSON `{text, tooltip, class}`) and draws everything with native St
-// widgets. Bar colors and thresholds default to the binary's One Dark
-// theme but are user-configurable.
+// The top bar reads the widget's Waybar JSON; provider submenus read
+// `ai-usagebar usage --json`. Both commands run asynchronously, and the UI
+// uses native St widgets. Bar colors are user-configurable.
 
 import GObject from 'gi://GObject';
 import St from 'gi://St';
 import Clutter from 'gi://Clutter';
 import GLib from 'gi://GLib';
 import Gio from 'gi://Gio';
+import Pango from 'gi://Pango';
 
 import {Extension} from 'resource:///org/gnome/shell/extensions/extension.js';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 import * as PanelMenu from 'resource:///org/gnome/shell/ui/panelMenu.js';
 import * as PopupMenu from 'resource:///org/gnome/shell/ui/popupMenu.js';
 import {barMarkup, colorForPct, disambiguateTags, field, FIELD, FORMAT, hasUsageWindows, integer,
-    isGrouped, markerElapsed, plainTextFromPango, selectPools,
+    isGrouped, MARKER, markerElapsed, plainTextFromPango, selectPools,
     splitFormatOutput} from './marker-logic.js';
+import {commandFailure, errorLine, parseReport, summarize} from './report-model.js';
 
 const ROLE = 'ai-usagebar';
+
+// Newer shells gave St.BoxLayout an `orientation` property and deprecated
+// `vertical`. Shell 46 has only `vertical`, and GJS throws on a property the
+// class does not have, so a hardcoded `orientation` kept the extension from
+// loading there. Every vertical box goes through here; a contract test keeps
+// it that way.
+const HAS_ORIENTATION = !!GObject.Object.find_property.call(St.BoxLayout, 'orientation');
+
+function verticalBox(props) {
+    return new St.BoxLayout(HAS_ORIENTATION
+        ? {orientation: Clutter.Orientation.VERTICAL, ...props}
+        : {vertical: true, ...props});
+}
+
+// Report text (errors, block lines, details) has no length the menu can
+// predict. Unwrapped, one long line sets the whole menu's width, past the edge
+// of the screen; wrapped, it stays inside the menu's bounded width.
+function wrappedLabel(text, styleClass) {
+    const label = new St.Label({text, x_expand: true, style_class: styleClass});
+    label.clutter_text.line_wrap = true;
+    label.clutter_text.line_wrap_mode = Pango.WrapMode.WORD_CHAR;
+    label.clutter_text.ellipsize = Pango.EllipsizeMode.NONE;
+    return label;
+}
+
+// The detail bar fits inside the menu's bounded content width.
+const DETAIL_BAR_W = 280;
+
+// A bar built from St widgets rather than █ cells: a track, a fill in the
+// severity color, and an optional pace marker at the elapsed share of the
+// window.
+function barWidget(percent, width, height, color, elapsed) {
+    const track = new St.Widget({
+        style_class: 'aiub-track',
+        width,
+        height,
+        y_align: Clutter.ActorAlign.CENTER,
+    });
+    if (percent > 0) {
+        track.add_child(new St.Widget({
+            width: Math.max(height, Math.round(width * percent / 100)),
+            height,
+            style: `background-color: ${color}; border-radius: ${height / 2}px;`,
+        }));
+    }
+    if (Number.isFinite(elapsed)) {
+        track.add_child(new St.Widget({
+            x: Math.min(width - 2, Math.max(0, Math.round(width * elapsed / 100) - 1)),
+            y: -3,
+            width: 2,
+            height: height + 6,
+            style: `background-color: ${MARKER}; border-radius: 1px;`,
+        }));
+    }
+    return track;
+}
 
 // Fixed accent colors (tags / dim text). Bar colors are user-configurable.
 const DIM = '#5c6370';
@@ -36,6 +93,13 @@ function esc(s) {
         .replace(/&/g, '&amp;')
         .replace(/</g, '&lt;')
         .replace(/>/g, '&gt;');
+}
+
+// One subprocess slot: at most one run in flight, a request made meanwhile
+// remembered and run once it settles, and a superseded or timed-out run never
+// painted. See AiUsageBarIndicator._run.
+function newJob() {
+    return {busy: false, pending: false, token: 0, timeoutId: 0, cancellable: null, proc: null};
 }
 
 function resolveBinary(settings) {
@@ -53,29 +117,41 @@ function resolveBinary(settings) {
 
 const Indicator = GObject.registerClass(
 class AiUsageBarIndicator extends PanelMenu.Button {
-    _init(settings, openPrefs) {
+    _init(settings, openPrefs, iconDir) {
         super._init(0.0, 'AI Usage Bar', false);
 
         this._settings = settings;
         this._openPrefs = openPrefs;
+        this._iconDir = iconDir;
+        this._marks = new Map();
         this._data = null;          // parsed snapshot for redraws
-        this._busy = false;
-        // A refresh asked for while one was in flight, to run once it settles.
-        this._refreshPending = false;
+        this._report = null;        // parsed `usage --json` for the menu
+        this._panelError = '';      // why the top bar shows ⚠, shown in the menu
+        this._providerItems = new Map();
+        this._destroyed = false;
         this._timer = 0;
-        this._refreshTimeoutId = 0;
-        this._refreshCancellable = null;
-        this._refreshProc = null;
-        this._refreshToken = 0;
-        this._rows = {};
+        // The top bar (`--vendor --format`) and the menu (`usage --json`) are
+        // separate commands on separate schedules; each gets its own slot.
+        this._panelJob = newJob();
+        this._reportJob = newJob();
 
-        // Panel: one markup label holds tags + percentages + bars.
+        // Panel: one markup label holds tags + percentages + bars. The icon
+        // stands in when the settings leave nothing for the label to draw,
+        // so the indicator never collapses into an empty click target.
         this._label = new St.Label({
             text: '5h …',
             y_align: Clutter.ActorAlign.CENTER,
             style_class: 'aiub-label',
         });
-        this.add_child(this._label);
+        this._icon = new St.Icon({
+            style_class: 'system-status-icon',
+            y_align: Clutter.ActorAlign.CENTER,
+            visible: false,
+        });
+        const panelBox = new St.BoxLayout({style_class: 'panel-status-menu-box'});
+        panelBox.add_child(this._icon);
+        panelBox.add_child(this._label);
+        this.add_child(panelBox);
 
         this._buildMenu();
 
@@ -85,6 +161,7 @@ class AiUsageBarIndicator extends PanelMenu.Button {
             'show-weekly', 'show-extra', 'color-low', 'color-mid',
             'color-high', 'color-critical', 'color-empty',
             'panel-pools', 'panel-auto-threshold',
+            'menu-summary-style', 'menu-show-icons', 'menu-compact',
         ];
         this._viewIds = viewKeys.map(k =>
             this._settings.connect(`changed::${k}`, () => this._render()));
@@ -93,94 +170,195 @@ class AiUsageBarIndicator extends PanelMenu.Button {
             () => this._restartTimer());
         this._sourceIds = [
             this._settings.connect('changed::vendor', () => this._refresh()),
-            this._settings.connect('changed::binary-path', () => this._refresh()),
+            this._settings.connect('changed::binary-path', () => {
+                this._refresh();
+                this._refreshReport();
+            }),
         ];
 
         this.menu.connect('open-state-changed', (_m, open) => {
-            if (open)
+            if (open) {
                 this._refresh();
+                this._refreshReport();
+            }
         });
 
         this._refresh();
         this._restartTimer();
     }
 
-    _buildMenu(grouped = false) {
-        this.menu.removeAll();
-        this._rows = {};
-        this._grouped = grouped;
-
-        // Header (plan name).
-        const header = new PopupMenu.PopupBaseMenuItem({reactive: false, can_focus: false});
-        this._planLabel = new St.Label({text: 'AI Usage', x_expand: true, style_class: 'aiub-header'});
-        header.add_child(this._planLabel);
-        this.menu.addMenuItem(header);
-
-        if (grouped) {
-            // Two independent quota pools per window type. Row order changes,
-            // but the data mapping does not: session/weekly still hold the
-            // primary pool, so the panel bar and the show-session/show-weekly
-            // toggles keep working exactly as they do for every other vendor.
-            this._addHeading('Session');
-            this._addRow('session', 'Session');
-            this._addRow('sonnet', 'Sonnet only');
-            this._addHeading('Weekly');
-            this._addRow('weekly', 'Weekly');
-            this._addRow('extra', 'Extra usage');
-        } else {
-            this._addRow('session', 'Session');
-            this._addRow('weekly', 'Weekly');
-            this._addRow('sonnet', 'Sonnet only');
-            this._addRow('extra', 'Extra usage');
-        }
-
-        this.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
-
-        const refreshItem = new PopupMenu.PopupMenuItem('Refresh now');
-        refreshItem.connect('activate', () => this._refresh());
-        this.menu.addMenuItem(refreshItem);
-
-        const tuiItem = new PopupMenu.PopupMenuItem('Open TUI');
-        tuiItem.connect('activate', () => this._openTui());
-        this.menu.addMenuItem(tuiItem);
-
-        const prefsItem = new PopupMenu.PopupMenuItem('Settings');
-        prefsItem.connect('activate', () => this._openPrefs());
-        this.menu.addMenuItem(prefsItem);
-    }
-
-    // Group subtitle sitting above the rows that belong to it.
-    _addHeading(text) {
-        const item = new PopupMenu.PopupBaseMenuItem({reactive: false, can_focus: false});
-        item.add_child(new St.Label({text, x_expand: true, style_class: 'aiub-header'}));
-        this.menu.addMenuItem(item);
-    }
-
-    // A native, font-independent row: [name ........ value] / bar / reset.
-    _addRow(key, name) {
-        const item = new PopupMenu.PopupBaseMenuItem({reactive: false, can_focus: false});
-        const vbox = new St.BoxLayout({
-            orientation: Clutter.Orientation.VERTICAL,
-            x_expand: true,
-            style_class: 'aiub-row',
+    _buildMenu() {
+        this.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem('Providers'));
+        this._providers = new PopupMenu.PopupMenuSection();
+        // Keep the section's box and menu relationships; wrap only its actor
+        // so a long provider list can scroll as well as an expanded submenu.
+        this._providers.actor = new St.ScrollView({
+            style_class: 'aiub-providers',
+            hscrollbar_policy: St.PolicyType.NEVER,
+            vscrollbar_policy: St.PolicyType.AUTOMATIC,
+            child: this._providers.box,
         });
+        this._providers.actor._delegate = this._providers;
+        this.menu.addMenuItem(this._providers);
+        this.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
+        this.menu.addAction('Refresh now', () => {
+            this._refresh();
+            this._refreshReport();
+        });
+        this.menu.addAction('Open TUI', () => this._openTui());
+        this.menu.addAction('Settings', () => this._openPrefs());
+        this._paintReport(null);
+    }
 
-        const head = new St.BoxLayout({x_expand: true});
-        const nameL = new St.Label({text: name, x_expand: true, style_class: 'aiub-row-name'});
-        const valL = new St.Label({style_class: 'aiub-row-val'});
-        head.add_child(nameL);
-        head.add_child(valL);
+    _message(menu, text, styleClass = 'aiub-detail') {
+        const section = new PopupMenu.PopupMenuSection();
+        section.actor.add_child(wrappedLabel(text, styleClass));
+        menu.addMenuItem(section);
+    }
 
-        const barL = new St.Label({style_class: 'aiub-row-bar'});
-        const resetL = new St.Label({style_class: 'aiub-row-reset'});
+    _metricRow(row, colors) {
+        const item = verticalBox({x_expand: true, style_class: 'aiub-metric'});
+        item.add_child(wrappedLabel(`${row.label}: ${row.valueText}`, 'aiub-heading'));
+        item.add_child(barWidget(row.percent, DETAIL_BAR_W, 6,
+            colors[row.severity] || colors.low, row.elapsed));
+        const reset = row.reset === 'now' ? 'Resets now' : row.reset ? `Resets in ${row.reset}` : '';
+        const detail = [reset, row.detail].filter(Boolean).join(' · ');
+        if (detail)
+            item.add_child(wrappedLabel(detail, 'aiub-detail'));
+        return item;
+    }
 
-        vbox.add_child(head);
-        vbox.add_child(barL);
-        vbox.add_child(resetL);
-        item.add_child(vbox);
-        this.menu.addMenuItem(item);
+    _markIcon(brand) {
+        if (!brand)
+            return null;
+        if (!this._marks.has(brand)) {
+            const file = this._iconDir.get_child(`${brand}-symbolic.svg`);
+            this._marks.set(brand, file.query_exists(null) ? new Gio.FileIcon({file}) : null);
+        }
+        return this._marks.get(brand);
+    }
 
-        this._rows[key] = {item, nameL, valL, barL, resetL};
+    _overview(summary, colors) {
+        const box = verticalBox({x_expand: true, style_class: 'aiub-overview'});
+        const bars = this._settings.get_string('menu-summary-style') === 'bars';
+        for (const row of summary.rows) {
+            const line = new St.BoxLayout({x_expand: true, style_class: 'aiub-overview-row'});
+            line.add_child(new St.Label({text: row.label, x_expand: true,
+                y_align: Clutter.ActorAlign.CENTER}));
+            if (bars && row.headline !== 'value')
+                line.add_child(barWidget(row.percent, 56, 4, colors[row.severity] || colors.low, null));
+            line.add_child(new St.Label({text: row.valueText, style_class: 'aiub-overview-value',
+                y_align: Clutter.ActorAlign.CENTER}));
+            box.add_child(line);
+        }
+        if (summary.remaining)
+            box.add_child(new St.Label({text: `+${summary.remaining} more`, style_class: 'aiub-detail'}));
+        return box;
+    }
+
+    _providerMenu(entry, colors) {
+        const status = entry.error ? ' · Error' : entry.stale ? ' · cached' : '';
+        const title = entry.title + (entry.plan ? ` · ${entry.plan}` : '') + status;
+        const icons = this._settings.get_boolean('menu-show-icons');
+        const item = new PopupMenu.PopupSubMenuMenuItem(title, icons);
+        item.add_style_class_name('aiub-provider');
+        if (this._settings.get_boolean('menu-compact'))
+            item.add_style_class_name('aiub-compact');
+        // The content takes the available width so value columns align
+        // across providers; the native expander no longer needs to stretch.
+        const expander = item.get_children().find(actor =>
+            actor.has_style_class_name('popup-menu-item-expander'));
+        if (expander)
+            expander.x_expand = false;
+        if (icons) {
+            const mark = this._markIcon(entry.brand);
+            if (mark)
+                item.icon.gicon = mark;
+            else
+                item.icon.icon_name = 'application-x-executable-symbolic';
+            item.icon.y_align = Clutter.ActorAlign.START;
+        }
+        item.label.x_expand = true;
+        item.label.clutter_text.ellipsize = Pango.EllipsizeMode.END;
+        item.label.add_style_class_name('aiub-heading');
+        // Keep the native submenu's label, arrow and keyboard handling; only
+        // extend its content with an always-visible report preview.
+        const content = verticalBox({x_expand: true, style_class: 'aiub-provider-content'});
+        item.remove_child(item.label);
+        content.add_child(item.label);
+        const summary = summarize(entry.error ? [] : entry.rows);
+        if (summary.rows.length)
+            content.add_child(this._overview(summary, colors));
+        else if (!entry.error)
+            content.add_child(new St.Label({text: entry.rows.length ? 'Details available' : 'No usage data reported',
+                style_class: 'aiub-detail'}));
+        item.insert_child_at_index(content, icons ? 2 : 1);
+        item.accessible_name = [title, ...summary.rows.map(row => `${row.label}: ${row.valueText}`),
+            summary.remaining ? `+${summary.remaining} more` : ''].filter(Boolean).join('. ');
+        const section = new PopupMenu.PopupMenuSection();
+        const details = verticalBox({x_expand: true, style_class: 'aiub-details'});
+        section.actor.add_child(details);
+        item.menu.addMenuItem(section);
+        if (entry.plan)
+            details.add_child(wrappedLabel(entry.plan, 'aiub-heading'));
+        if (entry.error)
+            details.add_child(wrappedLabel(entry.error, 'aiub-detail'));
+        for (const row of entry.rows) {
+            if (row.type === 'metric') {
+                details.add_child(this._metricRow(row, colors));
+            } else if (row.type === 'block') {
+                if (row.label)
+                    details.add_child(wrappedLabel(row.label, 'aiub-heading'));
+                for (const line of row.body)
+                    details.add_child(wrappedLabel(line, 'aiub-detail'));
+            } else {
+                const text = row.value ? `${row.label ? row.label + ': ' : ''}${row.value}` : row.label;
+                details.add_child(wrappedLabel(text, row.value ? 'aiub-detail' : 'aiub-heading'));
+            }
+        }
+        if (!entry.error && entry.rows.length === 0)
+            details.add_child(wrappedLabel('No usage data reported', 'aiub-detail'));
+        return item;
+    }
+
+    _paintReport(report) {
+        const focus = global.stage.get_key_focus();
+        let focusedId = null;
+        let openId = null;
+        for (const [id, item] of this._providerItems) {
+            if (focus && (item === focus || item.menu.actor.contains(focus)))
+                focusedId = id;
+            if (item.menu.isOpen)
+                openId = id;
+            // Propagate the focus change before destroying the row. Parent
+            // sections otherwise retain a reference to the disposed item.
+            item.active = false;
+        }
+        const adjustment = this._providers.box.vadjustment;
+        const scroll = adjustment.value;
+        this._providers.removeAll();
+        this._providerItems.clear();
+        const monitor = Main.layoutManager.findMonitorForActor(this) || Main.layoutManager.primaryMonitor;
+        this._providers.actor.style = `max-height: ${Math.floor((monitor?.height || 800) * 0.6)}px;`;
+        if (this._panelError)
+            this._message(this._providers, `Top bar: ${this._panelError}`);
+        if (!report?.ok) {
+            this._message(this._providers, report?.error || 'Loading…');
+        } else if (report.entries.length === 0) {
+            this._message(this._providers, 'No providers enabled');
+        } else {
+            const colors = this._colors();
+            for (const entry of report.entries) {
+                const item = this._providerMenu(entry, colors);
+                this._providers.addMenuItem(item);
+                this._providerItems.set(entry.id, item);
+                if (entry.id === openId)
+                    item.menu.open(false);
+            }
+        }
+        if (focusedId !== null)
+            this._providerItems.get(focusedId)?.grab_key_focus();
+        adjustment.value = scroll;
     }
 
     _colors() {
@@ -202,31 +380,35 @@ class AiUsageBarIndicator extends PanelMenu.Button {
         const secs = Math.max(5, this._settings.get_int('refresh-interval'));
         this._timer = GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, secs, () => {
             this._refresh();
+            if (this.menu.isOpen)
+                this._refreshReport();
             return GLib.SOURCE_CONTINUE;
         });
     }
 
-    _refresh() {
-        // Dropping the request while busy meant a vendor change *during* a
-        // fetch never started one for the new vendor: the in-flight result for
-        // the OLD vendor was applied and stayed on the panel until the next
-        // timer tick. Remember that a refresh was asked for and run it as soon
-        // as the current one settles.
-        if (this._busy) {
-            this._refreshPending = true;
+    // Spawn `argv` in `job`'s slot (see newJob). `handlers.done(out, err, ok)`
+    // receives a finished, current run's output; `handlers.failed(short,
+    // detail)` a spawn failure, a timeout, or output that could not be read;
+    // `handlers.again()` re-requests a run that was asked for while busy.
+    _run(job, argv, handlers) {
+        if (this._destroyed)
+            return;
+        if (job.busy) {
+            job.pending = true;
             return;
         }
-        this._busy = true;
-        const token = ++this._refreshToken;
-
-        const bin = resolveBinary(this._settings);
-        // Captured for THIS attempt: the setting can change while we wait, and
-        // a late result must not be rendered as if it belonged to the vendor
-        // now selected.
-        const vendor = this._settings.get_string('vendor') || 'anthropic';
-        const argv = [bin, '--vendor', vendor, '--format', FORMAT];
+        job.busy = true;
+        const token = ++job.token;
         const cancellable = new Gio.Cancellable();
-        this._refreshCancellable = cancellable;
+        job.cancellable = cancellable;
+        // Run whatever was requested while we were busy — never after
+        // destroy, where it would spawn into a torn-down indicator.
+        const again = () => {
+            if (job.pending && !this._destroyed) {
+                job.pending = false;
+                handlers.again();
+            }
+        };
 
         let proc;
         try {
@@ -236,82 +418,127 @@ class AiUsageBarIndicator extends PanelMenu.Button {
             });
             proc.init(cancellable);
         } catch (e) {
-            this._busy = false;
-            this._refreshCancellable = null;
-            this._refreshPending = false;
-            this._setError(`could not run "${bin}"`, String(e));
+            job.busy = false;
+            job.cancellable = null;
+            job.pending = false;
+            handlers.failed(`could not run "${argv[0]}"`, String(e));
             return;
         }
-        this._refreshProc = proc;
+        job.proc = proc;
 
         let timedOut = false;
         const timeoutId = GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, REFRESH_TIMEOUT_SECS, () => {
             timedOut = true;
-            if (this._refreshTimeoutId === timeoutId)
-                this._refreshTimeoutId = 0;
+            if (job.timeoutId === timeoutId)
+                job.timeoutId = 0;
             try {
                 proc.force_exit();
             } catch (e) {}
             cancellable.cancel();
-            if (this._refreshToken === token) {
-                this._busy = false;
-                this._setError('ai-usagebar took too long', `timed out after ${REFRESH_TIMEOUT_SECS}s`);
+            if (job.token === token) {
+                job.busy = false;
+                handlers.failed('ai-usagebar took too long', `timed out after ${REFRESH_TIMEOUT_SECS}s`);
                 // Do not strand a request that arrived while this one hung.
-                if (this._refreshPending) {
-                    this._refreshPending = false;
-                    this._refresh();
-                }
+                again();
             }
             return GLib.SOURCE_REMOVE;
         });
-        this._refreshTimeoutId = timeoutId;
+        job.timeoutId = timeoutId;
 
         const cleanup = () => {
-            if (this._refreshTimeoutId === timeoutId) {
+            if (job.timeoutId === timeoutId) {
                 GLib.source_remove(timeoutId);
-                this._refreshTimeoutId = 0;
+                job.timeoutId = 0;
             }
-            if (this._refreshCancellable === cancellable)
-                this._refreshCancellable = null;
-            if (this._refreshProc === proc)
-                this._refreshProc = null;
+            if (job.cancellable === cancellable)
+                job.cancellable = null;
+            if (job.proc === proc)
+                job.proc = null;
         };
 
         proc.communicate_utf8_async(null, cancellable, (p, res) => {
-            const current = this._refreshToken === token;
+            // A superseded attempt must not paint: its output belongs to
+            // whatever was selected when it started.
+            const current = job.token === token && !this._destroyed;
             if (current)
-                this._busy = false;
+                job.busy = false;
             try {
                 const [, out, err] = p.communicate_utf8_finish(res);
                 cleanup();
-                if (timedOut)
+                if (timedOut || !current)
                     return;
-                // A superseded attempt must not paint the panel: its numbers
-                // belong to whatever vendor was selected when it started.
-                if (!current)
-                    return;
-                // The selection may have changed while this ran even without a
-                // newer attempt (the change is queued as `_refreshPending`).
-                if ((this._settings.get_string('vendor') || 'anthropic') !== vendor)
-                    return;
-                if ((!out || !out.trim()) && !p.get_successful()) {
-                    this._setError('ai-usagebar falhou', err || '');
-                    return;
-                }
-                this._consume(out || '');
+                handlers.done(out || '', err || '', p.get_successful());
             } catch (e) {
                 cleanup();
                 if (current && !(e instanceof GLib.Error &&
                       e.matches(Gio.IOErrorEnum, Gio.IOErrorEnum.CANCELLED)) && !timedOut)
-                    this._setError('could not read the output', String(e));
+                    handlers.failed('could not read the output', String(e));
             } finally {
-                // Run whatever was requested while we were busy.
-                if (current && this._refreshPending) {
-                    this._refreshPending = false;
-                    this._refresh();
-                }
+                if (current)
+                    again();
             }
         });
+    }
+
+    _stop(job) {
+        job.pending = false;
+        if (job.timeoutId) {
+            GLib.source_remove(job.timeoutId);
+            job.timeoutId = 0;
+        }
+        if (job.cancellable)
+            job.cancellable.cancel();
+        if (job.proc) {
+            try {
+                job.proc.force_exit();
+            } catch (e) {}
+            job.proc = null;
+        }
+    }
+
+    _refresh() {
+        // Dropping the request while busy meant a vendor change *during* a
+        // fetch never started one for the new vendor: the in-flight result for
+        // the OLD vendor was applied and stayed on the panel until the next
+        // timer tick. `_run` remembers that a refresh was asked for and runs
+        // it as soon as the current one settles.
+        //
+        // Captured for THIS attempt: the setting can change while we wait, and
+        // a late result must not be rendered as if it belonged to the vendor
+        // now selected.
+        const vendor = this._settings.get_string('vendor') || 'anthropic';
+        const argv = [resolveBinary(this._settings), '--vendor', vendor, '--format', FORMAT];
+        this._run(this._panelJob, argv, {
+            again: () => this._refresh(),
+            failed: (short, detail) => this._setError(short, detail),
+            done: (out, err, ok) => {
+                // The selection may have changed while this ran even without a
+                // newer attempt (the change is queued as `pending`).
+                if ((this._settings.get_string('vendor') || 'anthropic') !== vendor)
+                    return;
+                if (!out.trim() && !ok) {
+                    this._setError('ai-usagebar failed', err);
+                    return;
+                }
+                this._consume(out);
+            },
+        });
+    }
+
+    _refreshReport() {
+        const argv = [resolveBinary(this._settings), 'usage', '--json'];
+        this._run(this._reportJob, argv, {
+            again: () => this._refreshReport(),
+            failed: (short, detail) =>
+                this._showReport({ok: false, error: errorLine(short, detail), entries: []}),
+            done: (out, err, ok) =>
+                this._showReport(!out.trim() && !ok ? commandFailure(err) : parseReport(out)),
+        });
+    }
+
+    _showReport(report) {
+        this._report = report;
+        this._paintReport(report);
     }
 
     _consume(stdout) {
@@ -322,22 +549,28 @@ class AiUsageBarIndicator extends PanelMenu.Button {
             this._setError('invalid output', stdout);
             return;
         }
+        // The command answered, so a reason left over from a failed run no
+        // longer describes the top bar.
+        if (this._panelError) {
+            this._panelError = '';
+            this._paintReport(this._report);
+        }
         const raw = plainTextFromPango(data.text);
         const f = splitFormatOutput(raw);
         if (f.length <= FIELD.extraLimit) {
             // Loading… / ⚠ — show the binary's own text.
             this._data = null;
-            this._label.clutter_text.set_markup(`<span foreground="${FG}">${esc(raw) || '…'}</span>`);
+            this._setPanelMarkup(`<span foreground="${FG}">${esc(raw) || '…'}</span>`);
             return;
         }
+        // Only what the top bar draws. The click menu reads `usage --json`.
         this._data = {
-            plan: field(f[FIELD.plan]),
             hasUsageWindows: hasUsageWindows(f[FIELD.vendorShort]),
             grouped: isGrouped(f[FIELD.sessionModel]),
-            session: {pct: integer(f[FIELD.sessionPct]), reset: field(f[FIELD.sessionReset]),
+            session: {pct: integer(f[FIELD.sessionPct]),
                 model: field(f[FIELD.sessionModel]),
                 elapsed: markerElapsed(field(f[FIELD.sessionReset]), integer(f[FIELD.sessionElapsed]))},
-            weekly: {pct: integer(f[FIELD.weeklyPct]), reset: field(f[FIELD.weeklyReset]),
+            weekly: {pct: integer(f[FIELD.weeklyPct]),
                 model: field(f[FIELD.weeklyModel]),
                 elapsed: markerElapsed(field(f[FIELD.weeklyReset]), integer(f[FIELD.weeklyElapsed]))},
             // Per-model weekly bar: a non-empty scoped model is the presence
@@ -348,21 +581,18 @@ class AiUsageBarIndicator extends PanelMenu.Button {
                 if (scopedModel) {
                     const scopedPct = integer(f[FIELD.scopedPct]);
                     if (scopedPct != null && scopedPct >= 0 && scopedPct <= 100)
-                        return {pct: scopedPct, reset: field(f[FIELD.scopedReset]) || '—',
-                            model: scopedModel, label: scopedModel,
+                        return {pct: scopedPct, model: scopedModel,
                             elapsed: markerElapsed(field(f[FIELD.scopedReset]), integer(f[FIELD.scopedElapsed]))};
                     // A scoped model with malformed data is unavailable; do
                     // not fall back to a potentially unrelated Sonnet window.
-                    return {pct: null, reset: '—', model: scopedModel, label: scopedModel, elapsed: null};
+                    return {pct: null, model: scopedModel, elapsed: null};
                 }
-                return {pct: integer(f[FIELD.sonnetPct]), reset: field(f[FIELD.sonnetReset]),
-                    model: '', label: 'Sonnet only', elapsed: null};
+                return {pct: integer(f[FIELD.sonnetPct]), model: '', elapsed: null};
             })(),
             // A named extra window (model + reset) renders as a percentage bar;
             // without a name the slot stays a spent/limit money budget.
             extra: {pct: integer(f[FIELD.extraPct]), spent: field(f[FIELD.extraSpent]),
                 limit: field(f[FIELD.extraLimit]), model: field(f[FIELD.extraModel]),
-                reset: field(f[FIELD.extraReset]),
                 elapsed: markerElapsed(field(f[FIELD.extraReset]), integer(f[FIELD.extraElapsed]))},
         };
         this._render();
@@ -370,12 +600,9 @@ class AiUsageBarIndicator extends PanelMenu.Button {
 
     // Redraw both the panel and the dropdown from cached data + settings.
     _render() {
-        const d = this._data;
-        if (!d)
-            return;
-        const colors = this._colors();
-        this._renderPanel(d, colors);
-        this._renderDropdown(d, colors);
+        if (this._data)
+            this._renderPanel(this._data, this._colors());
+        this._paintReport(this._report);
     }
 
     _renderPanel(d, colors) {
@@ -423,7 +650,23 @@ class AiUsageBarIndicator extends PanelMenu.Button {
         }
 
         const gap = `<span foreground="${DIM}">   </span>`;
-        this._label.clutter_text.set_markup(parts.join(gap) || ' ');
+        this._setPanelMarkup(parts.join(gap));
+    }
+
+    // Every top-bar write goes through here. Empty markup, e.g. both windows
+    // switched off, swaps the label for the top-bar vendor's mark.
+    _setPanelMarkup(markup) {
+        const empty = !markup;
+        if (empty) {
+            const mark = this._markIcon(this._settings.get_string('vendor'));
+            if (mark)
+                this._icon.gicon = mark;
+            else
+                this._icon.icon_name = 'application-x-executable-symbolic';
+        }
+        this._icon.visible = empty;
+        this._label.visible = !empty;
+        this._label.clutter_text.set_markup(markup);
     }
 
     // The pools the panel should draw, tagged and in display order. Primary is
@@ -448,56 +691,12 @@ class AiUsageBarIndicator extends PanelMenu.Button {
             .map(name => pools[name]);
     }
 
-    _renderDropdown(d, colors) {
-        // Switching vendors can flip the layout; rebuild once when it does.
-        if (!!d.grouped !== !!this._grouped)
-            this._buildMenu(d.grouped);
-
-        this._planLabel.text = d.plan || 'AI Usage';
-
-        const upd = (key, pct, valueText, reset, visible, elapsed) => {
-            const r = this._rows[key];
-            r.item.visible = visible;
-            if (!visible)
-                return;
-            r.valL.text = valueText;
-            r.barL.clutter_text.set_markup(barMarkup(pct ?? 0, 18, colors, elapsed));
-            if (reset) {
-                r.resetL.text = `↺ resets in ${reset}`;
-                r.resetL.visible = true;
-            } else {
-                r.resetL.visible = false;
-            }
-        };
-
-        // Under a group heading the row is named by its pool, not by the window.
-        this._rows.session.nameL.text = d.session.model || 'Session';
-        this._rows.weekly.nameL.text = d.weekly.model || 'Weekly';
-        upd('session', d.session.pct, `${d.session.pct ?? 0}%`, d.session.reset,
-            d.hasUsageWindows && d.session.pct != null, d.session.elapsed);
-        upd('weekly', d.weekly.pct, `${d.weekly.pct ?? 0}%`, d.weekly.reset,
-            d.hasUsageWindows && d.weekly.pct != null, d.weekly.elapsed);
-        this._rows.sonnet.nameL.text = d.sonnet.label || 'Sonnet only';
-        upd('sonnet', d.sonnet.pct, `${d.sonnet.pct ?? 0}%`, d.sonnet.reset, d.sonnet.pct != null, d.sonnet.elapsed);
-        if (d.extra.model) {
-            // Named quota window (e.g. Antigravity's "Claude & GPT OSS (weekly)").
-            this._rows.extra.nameL.text = d.extra.model;
-            upd('extra', d.extra.pct, `${d.extra.pct}%`, d.extra.reset || '—',
-                d.extra.pct != null, d.extra.elapsed);
-        } else {
-            this._rows.extra.nameL.text = 'Extra Usage';
-            upd('extra', d.extra.pct, `${d.extra.spent} / ${d.extra.limit}`, null,
-                d.extra.pct != null && !!d.extra.spent && !!d.extra.limit, null); // $ budget → no meta
-        }
-    }
-
     _setError(short, detail) {
         this._data = null;
-        this._label.clutter_text.set_markup(`<span foreground="${RED}">⚠ ai</span>`);
-        const msg = detail ? `${short}\n${esc(detail).slice(0, 300)}` : short;
-        this._planLabel.clutter_text.set_markup(`<span foreground="${FG}">${esc(msg)}</span>`);
-        for (const r of Object.values(this._rows))
-            r.item.visible = false;
+        // The top bar stays a compact ⚠; the reason is the menu's first line.
+        this._setPanelMarkup(`<span foreground="${RED}">⚠ ai</span>`);
+        this._panelError = errorLine(short, detail);
+        this._paintReport(this._report);
     }
 
     _openTui() {
@@ -522,22 +721,13 @@ class AiUsageBarIndicator extends PanelMenu.Button {
     }
 
     destroy() {
+        this._destroyed = true;
         if (this._timer) {
             GLib.source_remove(this._timer);
             this._timer = 0;
         }
-        if (this._refreshTimeoutId) {
-            GLib.source_remove(this._refreshTimeoutId);
-            this._refreshTimeoutId = 0;
-        }
-        if (this._refreshCancellable)
-            this._refreshCancellable.cancel();
-        if (this._refreshProc) {
-            try {
-                this._refreshProc.force_exit();
-            } catch (e) {}
-            this._refreshProc = null;
-        }
+        this._stop(this._panelJob);
+        this._stop(this._reportJob);
         for (const id of this._viewIds ?? [])
             this._settings.disconnect(id);
         for (const id of this._sourceIds ?? [])
@@ -566,7 +756,8 @@ export default class AiUsageBarExtension extends Extension {
             existing.destroy();
             delete Main.panel.statusArea[ROLE];
         }
-        this._indicator = new Indicator(this._settings, () => this.openPreferences());
+        this._indicator = new Indicator(this._settings, () => this.openPreferences(),
+            this.dir.get_child('icons'));
         const box = this._settings.get_string('panel-box') || 'right';
         const index = Math.max(0, this._settings.get_int('panel-index'));
         Main.panel.addToStatusArea(ROLE, this._indicator, index, box);

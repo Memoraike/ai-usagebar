@@ -93,6 +93,10 @@ pub struct AnthropicSnapshot {
     pub scoped: Vec<ScopedWindow>,
     /// `None` when `extra_usage.is_enabled` is false or the block is absent.
     pub extra: Option<ExtraUsage>,
+    /// Banked limit resets from the `cedar_ember` block — the same idea as
+    /// Codex's rate-limit reset credits and SuperGrok's remaining resets.
+    /// Empty when the account has no grant or the endpoint withheld the block.
+    pub reset_credits: ResetCredits,
 }
 
 /// A usage window scoped to a specific model, labeled by the API
@@ -217,6 +221,33 @@ impl Default for DeepseekSnapshot {
     }
 }
 
+/// DeepInfra prepaid balance and current-month usage from the documented
+/// `/payment/checklist` and `/payment/usage` billing endpoints.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DeepInfraSnapshot {
+    /// General-purpose prepaid credit remaining, in US dollars.
+    pub balance: f64,
+    /// Current calendar-month spend, in US dollars.
+    pub monthly_spend: f64,
+    /// Optional monthly spending limit, in US dollars.
+    pub monthly_limit: Option<f64>,
+    /// Usage period in the API's `YYYY.MM` form.
+    pub period: String,
+}
+
+impl Eq for DeepInfraSnapshot {}
+
+impl DeepInfraSnapshot {
+    pub fn monthly_consumed_pct(&self) -> Option<i32> {
+        let limit = self.monthly_limit.filter(|limit| *limit > 0.0)?;
+        Some(
+            ((self.monthly_spend / limit) * 100.0)
+                .round()
+                .clamp(0.0, 9999.0) as i32,
+        )
+    }
+}
+
 /// Cursor — the two included-usage pools the dashboard shows, from the
 /// undocumented `cursor.com/api/usage-summary` endpoint (the same one the
 /// dashboard's own frontend calls), authenticated with the session token the
@@ -312,6 +343,13 @@ impl KiroSnapshot {
 }
 
 /// Kimi Code — weekly subscription quota plus a 5h rolling rate-limit window.
+///
+/// Accounts on the newer `/coding/v1/usages` response shape have no weekly
+/// counters at all: the top-level `usage` block is replaced by a `usages` map
+/// of ratios, of which only `limit_month_total` — the combined monthly pool —
+/// is read. On such accounts `has_weekly` is false, the weekly counters stay
+/// zero (never fabricated), and the monthly pool arrives as
+/// `monthly_pct`/`monthly_reset_at`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KimiSnapshot {
     pub plan: Option<String>,
@@ -319,6 +357,14 @@ pub struct KimiSnapshot {
     pub weekly_used: u64,
     pub weekly_remaining: u64,
     pub weekly_reset_at: Option<DateTime<Utc>>,
+    /// `false` on the newer `usages`-map shape, which exposes no weekly
+    /// bucket; renderers must drop the weekly row rather than draw zeros.
+    pub has_weekly: bool,
+    /// Combined monthly pool usage (0..=100) on the newer shape. The
+    /// `limit_month_code` entry is the Code slice *inside* that pool, never
+    /// its own allowance, so it is not carried here.
+    pub monthly_pct: Option<i32>,
+    pub monthly_reset_at: Option<DateTime<Utc>>,
     pub window_limit: u64,
     pub window_used: u64,
     pub window_remaining: u64,
@@ -347,6 +393,20 @@ impl KimiSnapshot {
     pub fn window_pct(&self) -> i32 {
         Self::pct(self.window_used, self.window_limit)
     }
+
+    /// Worst percentage across the windows this snapshot actually has: the
+    /// rolling window, the weekly quota when present, and the monthly pool
+    /// when present.
+    pub fn worst_pct(&self) -> i32 {
+        let mut worst = self.window_pct();
+        if self.has_weekly {
+            worst = worst.max(self.weekly_pct());
+        }
+        if let Some(monthly) = self.monthly_pct {
+            worst = worst.max(monthly);
+        }
+        worst
+    }
 }
 
 /// Discriminated union of vendor-specific snapshots. The widget and TUI match
@@ -359,12 +419,14 @@ pub enum VendorSnapshot {
     Zai(ZaiSnapshot),
     Openrouter(OpenRouterSnapshot),
     Deepseek(DeepseekSnapshot),
+    Deepinfra(DeepInfraSnapshot),
     Kimi(KimiSnapshot),
     Kilo(KiloSnapshot),
     Novita(NovitaSnapshot),
     Moonshot(MoonshotSnapshot),
     Grok(GrokSnapshot),
     SuperGrok(SuperGrokSnapshot),
+    Grokbot(GrokbotSnapshot),
     AnthropicApi(AnthropicApiSnapshot),
     Antigravity(AntigravitySnapshot),
     Cursor(CursorSnapshot),
@@ -374,10 +436,32 @@ pub enum VendorSnapshot {
     OpenCodeGo(crate::opencode_go::types::Usage),
     CommandCode(crate::commandcode::types::Snapshot),
     Ollama(OllamaSnapshot),
+    OrcaRouter(OrcaRouterSnapshot),
+    ModelStudio(ModelStudioSnapshot),
     /// A `[[custom]]` provider. Which one is not in the snapshot: the caller
     /// that fetched it holds the `CustomProviderConfig`, and the cache
     /// directory is keyed by its `id`.
     Custom(crate::custom::types::CustomSnapshot),
+}
+
+impl VendorSnapshot {
+    /// Banked, user-redeemable resets, for the vendors that have them.
+    ///
+    /// The one place this table lives. It had already been written twice —
+    /// once for the report's `reset_credits` field and once for the
+    /// expiry notifications — and adding a third provider to only one of them
+    /// is a silent half-feature: the sidebar lists a grant the notifier never
+    /// warns about. `None` is the honest answer for every other vendor; it is
+    /// not the same as an empty [`ResetCredits`], which means "this provider
+    /// banks resets and you currently hold none".
+    pub fn reset_credits(&self) -> Option<&ResetCredits> {
+        match self {
+            Self::Anthropic(snapshot) => Some(&snapshot.reset_credits),
+            Self::Openai(snapshot) => Some(&snapshot.reset_credits),
+            Self::SuperGrok(snapshot) => Some(&snapshot.reset_credits),
+            _ => None,
+        }
+    }
 }
 
 /// Google Antigravity 2.0 / CLI snapshot. The API groups models into Gemini
@@ -415,6 +499,8 @@ pub enum AntigravitySource {
     #[default]
     Local,
     Remote,
+    /// The running `agy` CLI's official status-line payload.
+    Statusline,
 }
 
 impl AntigravitySource {
@@ -422,6 +508,7 @@ impl AntigravitySource {
         match self {
             AntigravitySource::Local => "local",
             AntigravitySource::Remote => "remote",
+            AntigravitySource::Statusline => "statusline",
         }
     }
 
@@ -431,6 +518,7 @@ impl AntigravitySource {
         match s {
             "local" => Some(AntigravitySource::Local),
             "remote" => Some(AntigravitySource::Remote),
+            "statusline" => Some(AntigravitySource::Statusline),
             _ => None,
         }
     }
@@ -552,6 +640,17 @@ pub struct SuperGrokSnapshot {
     /// Remaining prepaid (purchased) API credit in USD, when present.
     pub prepaid_balance: Option<f64>,
     pub reset_credits: ResetCredits,
+    /// Per-product slices of the same included-credit pool (`GrokBuild`,
+    /// `GrokChat`, `GrokImagine`, …). Empty when the billing document omits
+    /// `productUsage`.
+    pub products: Vec<SuperGrokProduct>,
+}
+
+/// One SuperGrok product's share of the current included-credit window.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SuperGrokProduct {
+    pub label: String,
+    pub percent: i32,
 }
 
 impl Eq for SuperGrokSnapshot {}
@@ -578,6 +677,59 @@ impl SuperGrokPeriod {
             Self::Monthly => "mo",
             Self::Unknown => "period",
         }
+    }
+}
+
+/// Grok Bot desktop app — the weekly included-usage pool from
+/// `aiserver.v1.DashboardService/GetSandUsageStatus` (Connect-RPC), read with
+/// the app's own OAuth session. Distinct from [`GrokSnapshot`] (Management
+/// API prepaid dollars) and [`SuperGrokSnapshot`] (Grok Build subscription).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GrokbotSnapshot {
+    /// `grokPlanLabel`, falling back to `cursorPlanName`, then "Grok Bot".
+    pub plan: String,
+    /// The subscription that bills the pool, from `billingBrand` and the plan
+    /// reported for it ("Cursor Ultra"). `None` for a brand not recognized yet,
+    /// which is left unnamed rather than guessed.
+    pub billed_by: Option<String>,
+    /// `hasNonZeroIncludedLimit`. When false the account carries no included
+    /// allowance at all — a distinct "no included allowance" state, never a
+    /// fabricated 0% meter.
+    pub has_included_allowance: bool,
+    /// `usagePercent` of the included pool (0..=100). Meaningful only when
+    /// `has_included_allowance` is set.
+    pub weekly_pct: i32,
+    /// `hasAvailableUsage` — the account can still serve requests, which at
+    /// 100% of the included pool means on-demand is picking up the rest.
+    pub has_available_usage: bool,
+    /// `onDemandSettings.enabled` — pay-as-you-go past the included pool.
+    pub on_demand_enabled: bool,
+    /// `currentPeriodStart`.
+    pub period_start: Option<DateTime<Utc>>,
+    /// `nextResetTimestampUtc`.
+    pub reset_at: Option<DateTime<Utc>>,
+    /// `reset_at − period_start` when both are reported (7 days on the
+    /// captured account) — computed, never assumed.
+    pub window: Option<chrono::Duration>,
+}
+
+impl GrokbotSnapshot {
+    /// The plan a frontend shows: the subscription that bills the pool
+    /// ("Cursor Ultra") over the app's own label, which reads "Grok Bot Plan"
+    /// on every account.
+    pub fn display_plan(&self) -> &str {
+        self.billed_by.as_deref().unwrap_or(&self.plan)
+    }
+
+    /// At 100% of the included pool, `hasAvailableUsage` can still be true
+    /// because on-demand keeps serving — say so, but only when the account
+    /// actually has on-demand switched on.
+    pub fn on_demand_note(&self) -> Option<&'static str> {
+        (self.has_included_allowance
+            && self.weekly_pct >= 100
+            && self.has_available_usage
+            && self.on_demand_enabled)
+            .then_some("included pool exhausted — on-demand may still be serving usage")
     }
 }
 
@@ -657,6 +809,23 @@ pub struct ResetCredit {
     pub expires_at: Option<DateTime<Utc>>,
 }
 
+/// A provider's own label for a banked reset, rendered verbatim in Pango bar
+/// markup and in the `;;`-delimited desktop FORMAT protocol. Both vendors that
+/// carry one gate it here rather than each keeping a copy: an over-long or
+/// control-character-bearing title is dropped, leaving the expiry line alone,
+/// which still says everything the user has to act on.
+pub fn checked_reset_title(value: Option<String>) -> Option<String> {
+    const MAX_RESET_TITLE_CHARS: usize = 80;
+    let value = value
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())?;
+    if value.chars().count() > MAX_RESET_TITLE_CHARS || value.chars().any(char::is_control) {
+        None
+    } else {
+        Some(value)
+    }
+}
+
 impl ResetCredits {
     pub fn is_empty(&self) -> bool {
         self.available == 0
@@ -713,11 +882,16 @@ pub struct OllamaSnapshot {
     pub session: Option<UsageWindow>,
     /// 7d rolling window (`limits.weekly`).
     pub weekly: Option<UsageWindow>,
+    /// Calendar-month window (`limits.monthly`). Some Pro accounts report
+    /// this in place of `session`/`weekly` instead of alongside them.
+    pub monthly: Option<UsageWindow>,
     /// Per-model request counts inside the session window, in the order the
     /// API returned them. Renderers sort and truncate this for the tooltip.
     pub session_models: Vec<OllamaModelUsage>,
     /// Per-model request counts inside the weekly window.
     pub weekly_models: Vec<OllamaModelUsage>,
+    /// Per-model request counts inside the monthly window.
+    pub monthly_models: Vec<OllamaModelUsage>,
     /// `activity.cost` as a pre-formatted dollar string (`"0.00000"`,
     /// `"1.23456"`). Already a string on the wire — the renderer decides
     /// whether to keep it verbatim or reformat.
@@ -771,10 +945,69 @@ impl OpenRouterSnapshot {
         if self.total_credits <= 0.0 {
             return 0;
         }
-        ((self.total_usage / self.total_credits) * 100.0)
-            .round()
-            .clamp(0.0, 100.0) as i32
+        i32::from(crate::format::clamp_pct(
+            (self.total_usage / self.total_credits) * 100.0,
+        ))
     }
+}
+
+/// OrcaRouter — prepaid credit card from the one-api compatible dashboard
+/// billing endpoints (`/v1/dashboard/billing/usage` + `/subscription`), over an
+/// API key. Usage arrives in **US cents** (`total_usage: 275` = $2.75); the
+/// subscription's limit fields are USD and mean the *total* credit limit
+/// (remaining + used), with `100000000` as the unlimited sentinel.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OrcaRouterSnapshot {
+    /// Cumulative spend, exact US cents (`total_usage`).
+    pub spent_cents: i64,
+    /// Total credit limit in exact US cents. `None` for unlimited keys (the
+    /// `100000000` sentinel) or when the subscription response carried no
+    /// limit field at all — either way the card is spend-only.
+    pub limit_cents: Option<i64>,
+    /// Key expiry (`access_until`, Unix seconds); `None` = no expiry (a wire
+    /// `0` means the same thing).
+    pub access_until: Option<DateTime<Utc>>,
+}
+
+impl OrcaRouterSnapshot {
+    pub fn spent_usd(&self) -> f64 {
+        self.spent_cents as f64 / 100.0
+    }
+
+    pub fn limit_usd(&self) -> Option<f64> {
+        self.limit_cents.map(|c| c as f64 / 100.0)
+    }
+
+    /// Remaining credit in exact cents. Can be negative (spend past the
+    /// limit) — the sign belongs outside the symbol, like OpenRouter debt.
+    pub fn remaining_cents(&self) -> Option<i64> {
+        self.limit_cents.map(|limit| limit - self.spent_cents)
+    }
+
+    pub fn remaining_usd(&self) -> Option<f64> {
+        self.remaining_cents().map(|c| c as f64 / 100.0)
+    }
+
+    /// Integer-percentage of the limit consumed, computed in cents so no
+    /// float division is involved. `None` when there is no limit — an
+    /// unlimited key has no percentage to be exact *about*.
+    pub fn consumed_pct(&self) -> Option<i32> {
+        self.limit_cents.filter(|l| *l > 0).map(|limit| {
+            let pct = (self.spent_cents.saturating_mul(100)) / limit;
+            pct.clamp(0, 100) as i32
+        })
+    }
+}
+
+/// Alibaba Cloud Model Studio Token Plan — a 5-hour and a weekly ratio
+/// window, either of which the console account may not report. An absent
+/// window is no-data (possibly unlimited), never 0%.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelStudioSnapshot {
+    /// 5-hour window. `None` when `per5HourPercentage` was absent.
+    pub session: Option<UsageWindow>,
+    /// Weekly window. `None` when `per1WeekPercentage` was absent.
+    pub weekly: Option<UsageWindow>,
 }
 
 /// Worst-of severity class for the Waybar bar text color. Mirrors
@@ -838,6 +1071,7 @@ mod tests {
                 currency: None,
                 decimal_places: Some(2),
             }),
+            reset_credits: Default::default(),
         }
     }
 
@@ -979,6 +1213,9 @@ mod tests {
             weekly_used: 1 << 52,
             weekly_remaining: 0,
             weekly_reset_at: None,
+            has_weekly: true,
+            monthly_pct: None,
+            monthly_reset_at: None,
             window_limit: u64::MAX,
             window_used: u64::MAX - 1,
             window_remaining: 0,

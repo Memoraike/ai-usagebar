@@ -44,7 +44,8 @@ pub type FetchOutcome = crate::outcome::Outcome<CursorSnapshot>;
 /// `[cursor] db_path` (config override) vs [`db::default_db_path`], the same
 /// override pattern as `openai.codex_auth_path`. `agent_auth_path` is the
 /// headless `cursor-agent` CLI's own `auth.json`, tried when `db_path` is
-/// missing — see `db::resolve_access_token`.
+/// missing — see `db::resolve_access_token`, which on macOS also tries the
+/// CLI's Keychain items.
 pub async fn fetch_snapshot(
     client: &reqwest::Client,
     db_path: &Path,

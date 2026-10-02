@@ -35,6 +35,11 @@ pub struct Probes<'a> {
     /// which is why it is injected and asked only once Claude's credential
     /// file has already been ruled out.
     pub keychain_has_claude: &'a dyn Fn() -> bool,
+    /// Whether one of Command Code's auth files holds a live credential. Its
+    /// search list includes pi's shared keystore, which exists whenever the
+    /// user signed pi into any provider, so existence alone cannot mean
+    /// "signed in" the way the provider-owned files above can.
+    pub commandcode_signed_in: &'a dyn Fn(&[PathBuf]) -> bool,
 }
 
 /// One provider's row in the catalog.
@@ -70,6 +75,11 @@ pub fn statuses(cfg: &Config) -> Vec<VendorStatus> {
         env_set: &|name| std::env::var_os(name).is_some_and(|value| !value.is_empty()),
         exists: &|path| path.exists(),
         keychain_has_claude: &keychain_has_claude,
+        commandcode_signed_in: &|paths| {
+            paths
+                .iter()
+                .any(|path| crate::commandcode::creds::read_from(path).is_some())
+        },
     };
     statuses_with(cfg, &probes)
 }
@@ -123,10 +133,13 @@ fn credential_present(cfg: &Config, id: VendorId, probes: &Probes) -> bool {
         VendorId::Copilot => {
             any_exists(probes, [crate::copilot::credentials::default_hosts_path()])
         }
-        VendorId::CommandCode => match crate::commandcode::creds::default_paths() {
-            Ok(paths) => paths.iter().any(|path| (probes.exists)(path)),
-            Err(_) => false,
-        },
+        VendorId::CommandCode => {
+            match crate::commandcode::creds::effective_paths(cfg.commandcode.auth_paths.as_deref())
+            {
+                Ok(paths) => (probes.commandcode_signed_in)(&paths),
+                Err(_) => false,
+            }
+        }
         VendorId::NousResearch => {
             (probes.exists)(&crate::nous::credentials::default_credentials_path())
         }
@@ -157,6 +170,12 @@ fn credential_present(cfg: &Config, id: VendorId, probes: &Probes) -> bool {
         // SuperGrok rides the Grok Build CLI's own login; its executable is the
         // only local artifact, and config pins the trusted path.
         VendorId::Supergrok => (probes.exists)(&cfg.supergrok.grok_binary),
+        // The Grok Bot desktop app's own credential file is the login.
+        VendorId::Grokbot => any_exists(probes, [crate::grokbot::secrets_path(&cfg.grokbot)]),
+        // The `bl` CLI's own console-login file is the login.
+        VendorId::ModelStudio => {
+            any_exists(probes, [crate::modelstudio::config_path(&cfg.modelstudio)])
+        }
         // Nothing to check: handled by `needs_credential`, never reached.
         VendorId::Antigravity => true,
         // Key-only providers: the environment and inline checks above are the
@@ -165,13 +184,15 @@ fn credential_present(cfg: &Config, id: VendorId, probes: &Probes) -> bool {
         | VendorId::Zai
         | VendorId::Openrouter
         | VendorId::Deepseek
+        | VendorId::Deepinfra
         | VendorId::Kilo
         | VendorId::Novita
         | VendorId::Moonshot
         | VendorId::Grok
         | VendorId::Minimax
         | VendorId::OpenCodeGo
-        | VendorId::Ollama => false,
+        | VendorId::Ollama
+        | VendorId::OrcaRouter => false,
     }
 }
 
@@ -244,16 +265,21 @@ mod tests {
 
     /// Every probe answers "no", so a row is configured only because config
     /// says so. Nothing here reads a real `$HOME`, variable or Keychain.
-    fn probes<'a>(env: &'a dyn Fn(&str) -> bool, exists: &'a dyn Fn(&Path) -> bool) -> Probes<'a> {
+    fn probes<'a>(
+        env: &'a dyn Fn(&str) -> bool,
+        exists: &'a dyn Fn(&Path) -> bool,
+        commandcode_signed_in: &'a dyn Fn(&[PathBuf]) -> bool,
+    ) -> Probes<'a> {
         Probes {
             env_set: env,
             exists,
             keychain_has_claude: &|| false,
+            commandcode_signed_in,
         }
     }
 
     fn bare<'a>() -> Probes<'a> {
-        probes(&|_| false, &|_| false)
+        probes(&|_| false, &|_| false, &|_| false)
     }
 
     fn row(rows: &[VendorStatus], id: &str) -> VendorStatus {
@@ -279,7 +305,7 @@ mod tests {
     fn a_key_vendor_is_configured_by_its_environment_variable() {
         let cfg = Config::default();
         let set = |name: &str| name == "ZAI_API_KEY";
-        let rows = statuses_with(&cfg, &probes(&set, &|_| false));
+        let rows = statuses_with(&cfg, &probes(&set, &|_| false, &|_| false));
         assert!(row(&rows, "zai").configured);
         assert!(!row(&rows, "deepseek").configured);
     }
@@ -289,7 +315,7 @@ mod tests {
         let mut cfg = Config::default();
         cfg.zai.api_key_env = "WORK_ZAI_KEY".to_string();
         let set = |name: &str| name == "WORK_ZAI_KEY";
-        let rows = statuses_with(&cfg, &probes(&set, &|_| false));
+        let rows = statuses_with(&cfg, &probes(&set, &|_| false, &|_| false));
         let zai = row(&rows, "zai");
         assert_eq!(
             zai.env, "WORK_ZAI_KEY",
@@ -299,7 +325,7 @@ mod tests {
 
         // The default name must no longer count once overridden.
         let stale = |name: &str| name == "ZAI_API_KEY";
-        let rows = statuses_with(&cfg, &probes(&stale, &|_| false));
+        let rows = statuses_with(&cfg, &probes(&stale, &|_| false, &|_| false));
         assert!(!row(&rows, "zai").configured);
     }
 
@@ -342,6 +368,7 @@ mod tests {
             env_set: &|_| false,
             exists: &|_| false,
             keychain_has_claude: &|| true,
+            commandcode_signed_in: &|_| false,
         };
         assert!(row(&statuses_with(&cfg, &with_keychain), "anthropic").configured);
         assert!(!row(&statuses_with(&cfg, &bare()), "anthropic").configured);
@@ -363,9 +390,46 @@ mod tests {
         let mut cfg = Config::default();
         cfg.zai.enabled = false;
         let set = |name: &str| name == "ZAI_API_KEY";
-        let zai = row(&statuses_with(&cfg, &probes(&set, &|_| false)), "zai");
+        let zai = row(
+            &statuses_with(&cfg, &probes(&set, &|_| false, &|_| false)),
+            "zai",
+        );
         assert!(!zai.enabled, "switched off in config");
         assert!(zai.configured, "but its key is still there");
+    }
+
+    /// Command Code's search list includes pi's shared keystore, which exists
+    /// whenever the user signed pi into any provider. Existence of that file is
+    /// not a Command Code login — only a live credential inside it is, the same
+    /// answer the fetch's own resolver gives.
+    #[test]
+    fn a_shared_harness_keystore_is_not_a_commandcode_login() {
+        let mut cfg = Config::default();
+        cfg.commandcode.auth_paths = Some(vec![PathBuf::from("/home/x/.pi/agent/auth.json")]);
+
+        let keystore_only = statuses_with(&cfg, &probes(&|_| false, &|_| true, &|_| false));
+        assert!(
+            !row(&keystore_only, "commandcode").configured,
+            "a pi login for another provider is not a Command Code login"
+        );
+
+        let signed_in = statuses_with(&cfg, &probes(&|_| false, &|_| true, &|_| true));
+        assert!(row(&signed_in, "commandcode").configured);
+    }
+
+    /// A custom `auth_paths` install is configured by its own files, not by the
+    /// platform defaults.
+    #[test]
+    fn commandcode_configuration_follows_the_configured_auth_paths() {
+        let mut cfg = Config::default();
+        let custom = PathBuf::from("/opt/commandcode/auth.json");
+        cfg.commandcode.auth_paths = Some(vec![custom.clone()]);
+
+        let rows = statuses_with(
+            &cfg,
+            &probes(&|_| false, &|_| false, &|paths| paths == [custom.clone()]),
+        );
+        assert!(row(&rows, "commandcode").configured);
     }
 
     /// Auth metadata has to be usable, not merely present: a key provider that

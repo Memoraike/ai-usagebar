@@ -1,15 +1,63 @@
 # AI Usage Bar — macOS menu bar app
 
-A native macOS menu bar app for [`ai-usagebar`](../README.md). It shows the
-**5-hour (session)** and **weekly** usage bars — plus an optional
-dynamic **model-scoped** bar (for example, Fable) and **extra-usage (cost)**
-bar — in the menu bar next to the clock, with a native dropdown. For most
-vendors there are no usage windows to chart, so showing their **balance/credits**
-is the primary display mode (see [Vendor scope](#vendor-scope)). It's the macOS counterpart to the [GNOME Shell
-extension](https://github.com/akitaonrails/ai-usagebar/tree/main/gnome-extension): same binary, same One Dark colors and
-severity thresholds.
+The product UI is **`ai-usagebar-tray`**: an NSStatusItem plus a WKWebView
+popover. **Settings → Appearance → Popover Style** picks its look: **Classic**
+(every provider's card at a glance, the default) or **Native** (the system's
+own look — on macOS, one provider at a time behind tabs of logos and values,
+over AppKit glass). Both draw the same provider card: metrics, reset times,
+pace notes, the reset popover, the row menu and account switching.
 
-A single Swift file (`NSStatusItem` + `NSAttributedString`); no Xcode project.
+The menu-bar item shows the metrics you star in each provider (up to two):
+**Settings → Menu Bar → Menu Bar Shows** draws them as the usage **Chart**
+(the default) or as **Logos**, each starred provider's logo followed by its
+value, two starred metrics stacked. With nothing starred it shows the app
+icon. Left-click opens the popover; right-click opens the Options menu.
+
+```bash
+cargo build --release --bin ai-usagebar-tray
+./target/release/ai-usagebar-tray
+```
+
+Needs Node.js 20+ on PATH for the first build (`windows/popover/` Vite bundle).
+Left-click the status item to toggle the popover. Right-click it for the
+footer's Options menu as a native menu, in the popover's language: Customize
+(Classic only), Settings, Refresh, Detect Providers, Open TUI, Start at Login,
+Check for Updates, About, and Quit; the items that name a screen open the
+popover on it. No Dock icon.
+
+![Right-click menu under the menu bar icon — Customize, Settings, Refresh, Detect Providers, Open TUI, Start at Login (checked), Check for Updates, About and Quit](../screenshots/macos-tray-right-click-menu.png)
+
+![Chart mode in the macOS menu bar, next to the Cursor, Claude, Antigravity, Codex and Claude Code icons](../screenshots/macos-tray-icon.png)
+
+Star up to two metrics per provider from **Settings → Providers**, then open
+that provider's details, or right-click a row. Those metrics are what the
+status item shows.
+
+With named Claude or Codex accounts, each account's card also shows which login
+is active (a filled star) and an outline star to switch to the others; see "Switch from
+the macOS menu bar" in [docs/claude-accounts.md](../docs/claude-accounts.md).
+
+![Customize Claude — Always Visible rows Weekly (starred) and Fable, On Demand row Session, each with a star and an on/off switch, Back and Reset in the top bar](../screenshots/macos-tray-provider-stars.png)
+
+The footer's Options menu opens Settings. Settings uses five tabs: **General**
+(startup, refresh, shortcut), **Providers** (visibility, order, metric details),
+**Menu** (the menu-bar summary), **Preferences** (language, appearance, usage
+display), and **Alerts** (system notifications and the quota threshold). Start
+at Login writes a LaunchAgent under `~/Library/LaunchAgents`. Alerts are sent
+through macOS Notification Center after a fresh reading crosses the threshold.
+In **Preferences → Usage Display**, enable **Usage goal** to show a second,
+subtle bar below each metric. It marks how much of the quota would be used now
+at an even pace from the start of its reset window to 100% at the end. Five-hour,
+weekly, and other windows use the provider's reported duration. Monthly windows
+without an exact duration use the previous calendar month and are labeled as
+estimates. The current usage and goal percentages sit at the right edge of their
+respective bars. The reset note below them can include the projected usage at
+the end of the window; **Always Show Pacing** makes that projection visible
+even for metrics comfortably below the limit. Metrics without a reset time or
+usable window do not show a goal.
+
+A legacy Swift `NSMenu` (`ai-usagebar-menubar.swift`) remains in this folder
+for the old dropdown. Prefer the tray.
 
 > **Installing?** Follow the step-by-step in **[INSTALL.md](INSTALL.md)**.
 
@@ -22,8 +70,9 @@ The selector dynamically discovers **all providers** that ship in the binary via
   Claude & GPT OSS — each with its own 5h/weekly pair), MiniMax (chat and video
   pools, each with 5h/weekly tracking), GitHub Copilot (premium finite pool,
   with unlimited chat and completions reported cleanly), SuperGrok, Kiro,
-  Nous Research, OpenCode Go (session, weekly, and monthly pools), and Command Code
-  (session, weekly, and monthly pools).
+  Nous Research, OpenCode Go (session, weekly, and monthly pools), Command Code
+  (session, weekly, and monthly pools), and Grok Bot (weekly included-usage
+  pool from the Grok Bot desktop app).
 - **Included-usage pools:** Cursor (Cursor Models and Other Models, both reset
   on the billing cycle).
 - **Balance-only:** OpenRouter, DeepSeek, Kimi, Kilo, Novita, Moonshot, Grok
@@ -47,26 +96,26 @@ time, so one of those must be running for quota to load.
 
 ## Requirements
 
-- macOS with the **Command Line Tools** (`xcode-select --install`) for `swiftc`.
-- The `ai-usagebar` binary on the Mac. Install it with `cargo install ai-usagebar`
-  (lands in `~/.cargo/bin`) — see the [main README](../README.md).
+- Rust (`rustc` 1.90+) and **Node.js 20+** (the tray embeds the Vite popover).
 - Run `claude` once on the Mac so its OAuth creds are in the login **Keychain**;
   ai-usagebar reads them there automatically (no env vars).
 
 ## Build & run
 
 ```bash
-cd macos
-./build.sh                 # swiftc -O → ./ai-usagebar-menubar
-./run-tests.sh             # optional: pure-logic test harness
-./ai-usagebar-menubar &    # appears in the menu bar (no Dock icon)
+cargo build --release --bin ai-usagebar-tray
+./target/release/ai-usagebar-tray
 ```
 
-Start at login — toggle **Preferences… → System → "Start at login"** in the
-app, or from the shell:
+Start at login from the popover **Settings → Launch at Login**. That writes
+`~/Library/LaunchAgents/com.akitaonrails.ai-usagebar-tray.plist`.
+
+The legacy Swift dropdown:
 
 ```bash
-./install-agent.sh         # installs a LaunchAgent (RunAtLoad)
+cd macos
+./build.sh
+./ai-usagebar-menubar &
 ```
 
 > Not code-signed. It's a local binary you built yourself, so Gatekeeper
@@ -181,12 +230,27 @@ ai-usagebar account switch work --desktop   # quits and reopens Claude.app
 
 See the main README's *Switching the active Claude account* for the full story.
 
-## Multiple OpenRouter accounts
+## Multiple Codex accounts
 
-Entries from `[[openrouter.accounts]]` appear as separate menu choices and use
-`--vendor openrouter --account <label>` behind the scenes. Each account keeps
-its own cache. Set `[openrouter] show_default_account = false` when you do not
-want the unnamed key listed. See the main
+Entries from `[[openai.accounts]]` appear as “Codex · label” in the provider
+submenu, Preferences, Overview, and the vendor-cycle shortcut. Each is fetched
+with `--vendor openai --account <label>`; Rust resolves its `codex_auth_path`
+and keeps its cache separate. Named accounts do not require a default Codex
+login. Disabling `[openai]` hides all its accounts.
+
+Setting `[ui] overview_vendors = ["openai"]` includes all configured Codex
+accounts. Each Overview checkbox still controls that account's visibility.
+Selecting an entry changes whose usage is displayed, not the active Codex login.
+
+## Multiple API-key accounts
+
+Entries from `[[openrouter.accounts]]` — and the same array under `[zai]`,
+`[deepseek]`, `[kilo]`, `[novita]`, `[moonshot]`, `[grok]`, `[minimax]`, and
+`[orcarouter]` — appear as separate menu choices and use
+`--vendor <vendor> --account <label>` behind the scenes. Each account keeps its
+own cache. Set `show_default_account = false` in the provider's section when
+you do not want the unnamed key listed. See the main
+[API-key account guide](../docs/api-key-accounts.md) and the
 [OpenRouter account guide](../docs/openrouter-accounts.md) for configuration.
 
 ## Live config reload
@@ -203,3 +267,15 @@ Runs `ai-usagebar --vendor <v> --format '{plan};;{session_pct};;…'`, parses th
 Waybar JSON (`{text, …}`), and draws the bars as colored `NSAttributedString`s
 in the status item and the dropdown. The subprocess runs **off the main thread**
 (`DispatchQueue.global` → back to `.main` for UI), so the UI never blocks.
+
+### Enable a connected provider
+
+Preferences → Vendors shows **Disabled** even when a credential is available.
+Click **Enable** to include the provider in usage reporting; if it still needs
+a credential, the row then offers its usual sign-in or configuration action.
+Enabling does not sign in, switch accounts, or change the selected provider.
+The menu reloads the configuration automatically.
+
+This requires a binary supporting `ai-usagebar settings enable <vendor>`.
+If enabling fails, Preferences shows an error and keeps the provider state
+from the catalog. Update the binary if it does not recognize the command.

@@ -89,9 +89,17 @@ impl Snapshot {
     /// "Credits", and `completions` the inline suggestions it meters.
     pub fn quotas(&self) -> impl Iterator<Item = (&'static str, &Quota)> {
         [
-            ("Premium requests", "Premium requests", self.premium.as_ref()),
+            (
+                "Premium requests",
+                "Premium requests",
+                self.premium.as_ref(),
+            ),
             ("Credits", "Chat", self.chat.as_ref()),
-            ("Inline suggestions", "Completions", self.completions.as_ref()),
+            (
+                "Inline suggestions",
+                "Completions",
+                self.completions.as_ref(),
+            ),
         ]
         .into_iter()
         .filter_map(|(credit_label, count_label, quota)| {
@@ -281,7 +289,10 @@ mod tests {
 
         assert!(!snapshot.premium.clone().unwrap().in_plan());
         assert_eq!(
-            snapshot.quotas().map(|(label, _)| label).collect::<Vec<_>>(),
+            snapshot
+                .quotas()
+                .map(|(label, _)| label)
+                .collect::<Vec<_>>(),
             ["Credits", "Inline suggestions"]
         );
 
@@ -305,11 +316,19 @@ mod tests {
         .unwrap();
         let snapshot = to_snapshot(response).unwrap();
         assert_eq!(
-            snapshot.quotas().map(|(label, _)| label).collect::<Vec<_>>(),
+            snapshot
+                .quotas()
+                .map(|(label, _)| label)
+                .collect::<Vec<_>>(),
             ["Chat"]
         );
         assert_eq!(
-            snapshot.chat.clone().unwrap().used_of_entitlement().unwrap(),
+            snapshot
+                .chat
+                .clone()
+                .unwrap()
+                .used_of_entitlement()
+                .unwrap(),
             "10 of 50"
         );
     }
@@ -338,7 +357,10 @@ mod tests {
         assert!(!premium.in_plan());
         assert_eq!(premium.used_pct(), 0);
         assert_eq!(
-            snapshot.quotas().map(|(label, _)| label).collect::<Vec<_>>(),
+            snapshot
+                .quotas()
+                .map(|(label, _)| label)
+                .collect::<Vec<_>>(),
             ["Chat", "Completions"]
         );
         assert_eq!(snapshot.worst_pct(), 36);

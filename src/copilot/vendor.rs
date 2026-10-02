@@ -152,7 +152,11 @@ fn render_tooltip(
         } else if let Some(used) = quota.used_of_entitlement() {
             format!("{}% · {used} used", quota.used_pct())
         } else {
-            format!("{}% · {:.0}% remaining", quota.used_pct(), quota.percent_remaining)
+            format!(
+                "{}% · {:.0}% remaining",
+                quota.used_pct(),
+                quota.percent_remaining
+            )
         };
         lines.push(TooltipLine::Body(format!("  {label}  {}", escape(&usage))));
     }
@@ -283,13 +287,7 @@ mod tests {
     fn renderer_headlines_the_worst_quota_and_canonical_provider_name() {
         let snap = sample();
         let outcome = VendorOutcome::fresh(crate::usage::VendorSnapshot::Copilot(snap.clone()));
-        let output = render(
-            &outcome,
-            &snap,
-            &Theme::default(),
-            &opts(),
-            Utc::now(),
-        );
+        let output = render(&outcome, &snap, &Theme::default(), &opts(), Utc::now());
         assert!(output.text.contains("85%"));
         assert!(output.tooltip.contains("GitHub Copilot Pro"));
     }

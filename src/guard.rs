@@ -61,6 +61,97 @@ pub(crate) fn production_code(source: &str) -> String {
         .join("\n")
 }
 
+/// Every call of `opener` (a macro or method head ending in `(`, such as
+/// `"println!("`) in `code`, as the text from the opener through its matching
+/// `)`. A call left unclosed runs to the end of `code`.
+///
+/// Parentheses inside string and character literals are not counted: a message
+/// like `"step 1) done"` must not end the call early and hide an argument
+/// after it, and a stray `)` must not underflow the depth. Matching is
+/// textual, so `"println!("` also finds the tail of `eprintln!(` — pass
+/// `"println!("` and `"print!("` to cover all four macros without visiting one
+/// twice.
+pub(crate) fn calls<'a>(code: &'a str, opener: &str) -> Vec<&'a str> {
+    let mut out = Vec::new();
+    let mut from = 0;
+    while let Some(found) = code[from..].find(opener) {
+        let start = from + found;
+        let end = start + call_len(&code[start..]);
+        out.push(&code[start..end]);
+        from = end.max(start + 1);
+    }
+    out
+}
+
+/// Byte length of the balanced call at the start of `call`. Every byte the
+/// scanner branches on is ASCII, so each slice boundary is a char boundary.
+fn call_len(call: &str) -> usize {
+    let bytes = call.as_bytes();
+    let mut depth = 0usize;
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'(' => depth += 1,
+            b')' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return i + 1;
+                }
+            }
+            b'"' => i = string_end(bytes, i, None),
+            b'r' => {
+                if let Some(hashes) = raw_string_hashes(bytes, i) {
+                    i = string_end(bytes, i + 1 + hashes, Some(hashes));
+                }
+            }
+            b'\'' => {
+                // `'('` and `'\''` are char literals; `'a` is a lifetime.
+                if bytes.get(i + 1) == Some(&b'\\') {
+                    i = bytes[i + 2..]
+                        .iter()
+                        .position(|&b| b == b'\'')
+                        .map_or(bytes.len(), |n| i + 2 + n);
+                } else if bytes.get(i + 2) == Some(&b'\'') {
+                    i += 2;
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    bytes.len()
+}
+
+/// Index of the last byte of the string whose opening quote is at `open`.
+/// `raw` carries the `#` count of a raw string, which ignores escapes and
+/// closes on a quote followed by that many hashes; `None` is an ordinary
+/// string, which skips `\"`.
+fn string_end(bytes: &[u8], open: usize, raw: Option<usize>) -> usize {
+    let hashes = raw.unwrap_or(0);
+    let mut i = open + 1;
+    while i < bytes.len() {
+        if raw.is_none() && bytes[i] == b'\\' {
+            i += 2;
+            continue;
+        }
+        if bytes[i] == b'"' && bytes[i + 1..].iter().take(hashes).all(|&b| b == b'#') {
+            return i + hashes;
+        }
+        i += 1;
+    }
+    bytes.len()
+}
+
+/// The `#` count of a raw string literal starting at `at` (`r"…"`, `r#"…"#`),
+/// or `None` when `at` is just an `r` inside an identifier.
+fn raw_string_hashes(bytes: &[u8], at: usize) -> Option<usize> {
+    if at > 0 && (bytes[at - 1].is_ascii_alphanumeric() || bytes[at - 1] == b'_') {
+        return None;
+    }
+    let hashes = bytes[at + 1..].iter().take_while(|&&b| b == b'#').count();
+    (bytes.get(at + 1 + hashes) == Some(&b'"')).then_some(hashes)
+}
+
 fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
     for entry in std::fs::read_dir(dir).expect("a readable source directory") {
         let path = entry.expect("a readable directory entry").path();
@@ -189,5 +280,36 @@ mod tests {
     fn changelog() -> Option<String> {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("CHANGELOG.md");
         std::fs::read_to_string(&path).ok()
+    }
+
+    /// A `)` inside a message must not end the call early and hide the
+    /// argument after it — the shape a scanner that counts every paren misses.
+    #[test]
+    fn calls_ignore_parens_inside_literals() {
+        let code =
+            r##"println!("step 1) {}", path.display()); other(); println!(r#"a ) "b" "#, x);"##;
+        let found = super::calls(code, "println!(");
+        assert_eq!(found.len(), 2, "{found:?}");
+        assert!(found[0].ends_with("path.display())"), "{}", found[0]);
+        assert!(found[1].ends_with("x)"), "{}", found[1]);
+    }
+
+    #[test]
+    fn calls_handle_char_literals_lifetimes_and_escapes() {
+        let code = r#"print!("{}", f(')', '"', "\"", &'a str)); tail()"#;
+        let found = super::calls(code, "print!(");
+        assert_eq!(found, [r#"print!("{}", f(')', '"', "\"", &'a str))"#]);
+    }
+
+    /// `"println!("` is a substring of `eprintln!(`; each call is still one
+    /// hit, and an unbalanced tail neither panics nor loops.
+    #[test]
+    fn calls_visit_each_macro_once_and_survive_an_unclosed_call() {
+        let code = "eprintln!(\"a\"); println!(\"b\"); println!(\"c\"";
+        let found = super::calls(code, "println!(");
+        assert_eq!(
+            found,
+            ["println!(\"a\")", "println!(\"b\")", "println!(\"c\""]
+        );
     }
 }

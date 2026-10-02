@@ -2,6 +2,8 @@
 
 ai-usagebar can report several OpenRouter keys without running separate config
 or cache roots. The existing `[openrouter]` key remains the default account.
+The same `[[<vendor>.accounts]]` array works for the other API-key providers;
+the [API-key account guide](api-key-accounts.md) covers them.
 
 ## Add named accounts
 
@@ -28,6 +30,15 @@ tightens the config file to mode `0600` on Unix.
 
 Labels cannot be empty, contain path separators, drive prefixes, or control
 characters, or use a reserved cache filename. Duplicate labels are rejected.
+
+## What one entry separates
+
+Each account entry is one OpenRouter login's key — one entry per workspace is
+the pattern for working across several workspaces. Be aware of what it does
+*not* separate: keys created inside the same OpenRouter workspace share that
+workspace's billing account, so two entries holding two keys from one
+workspace both report that workspace's credits and spend. The per-entry split
+is per login session (workspace), not per key within a single bill.
 
 ## Select an account
 
