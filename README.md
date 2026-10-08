@@ -1,6 +1,6 @@
 # ai-usagebar
 
-Native Omarchy Quattro panel, Waybar widget, and tabbed TUI for AI plan usage across **Claude**, **Codex/ChatGPT**, **GitHub Copilot**, **Z.AI (GLM)**, **OpenRouter**, **DeepSeek**, **DeepInfra**, **Kimi**, **Nous Research**, **OpenCode Go**, **Command Code**, and other supported AI coding services.
+Native Omarchy Quattro panel, Waybar widget, and tabbed TUI for AI plan usage across **Claude**, **Codex/ChatGPT**, **GitHub Copilot**, **Z.AI (GLM)**, **OpenRouter**, **DeepSeek**, **DeepInfra**, **Kimi**, **Nous Research**, **OpenCode Go**, **Command Code**, **Devin**, and other supported AI coding services.
 
 ai-usagebar began as a Rust port of
 [`claudebar`](https://github.com/mryll/claudebar) and remains drop-in
@@ -174,7 +174,15 @@ three-letter code Waybar's `{vendor_short}` prints, so a bar cycling several
 providers says which one it is showing. Use **Top bar usage window** to pin the
 bar to one quota window — auto (highest), 5-hour, weekly, or monthly — instead
 of always showing the highest percent; the tooltip and panel hero echo the
-pinned value while panel rows and alert state still follow the highest quota.
+pinned value while panel rows list every window. **Show usage as** reads
+percentages as what is used (the default) or what is left of the same window.
+**Show provider logos** draws each provider's own mark; turn it off for the
+generic robot icon. The **Metrics** section expands per provider and switches
+each metric on or off; a switched-off metric disappears from the panel, the bar
+and the tooltip, and is left out of the highest percent that sets the bar value
+and the alert state, which follows the used share in either reading. The
+settings page is an accordion: one section open at a time, the first open by
+default.
 
 The source-built `ai-usagebar` AUR package can replace `ai-usagebar-bin` in
 the first command.
@@ -250,9 +258,12 @@ the popover's Options — Customize (Classic only), Settings, Refresh, Detect
 Providers, Open TUI, Start at Login, Check for Updates, About, and Quit — in
 the popover's language. On its first run the
 tray detects which vendors already have a credential on this PC (local files
-and keys only, never the network) and turns exactly those on in
-`config.toml` — it never turns a vendor off. Settings adds a global shortcut
-that toggles the popover from anywhere, the poll interval, and an update mode
+and keys only, never the network) and enables eligible vendors in
+`config.toml` — it never turns a vendor off. Opt-in-only providers such as
+Devin are never activated by automatic detection, including **Detect Providers**;
+enable Devin explicitly in Settings or with `[devin] enabled = true`. Settings
+adds a global shortcut that toggles the popover from anywhere, the poll interval,
+and an update mode
 (Automatic / Notify me / Off) that installs new releases from GitHub after
 verifying their `.sha256`; all three live in the `[tray]` section of
 `config.toml` (`shortcut`, `refresh_minutes` = 1, 5 or 10; default 5;
@@ -285,6 +296,7 @@ come from environment variables or `config.toml`.
 | Kimi | Existing Kimi Code CLI login **or** API key (`KIMI_API_KEY` or config) | Opt in, then either log in with `kimi` (nothing to paste) or set an API key, which wins when present. A Kimi For Coding subscription can issue one at kimi.com/code/console. |
 | Kilo | API key (`KILO_API_KEY` env or `[kilo] api_key` in config) | Set either. Opt-in. For a team balance, also set `[kilo] organization_id`; omit it for the personal balance. |
 | Novita | API key (`NOVITA_API_KEY` env or `[novita] api_key` in config) | Set either. Opt-in. |
+| Lyceum | API key (`LYCEUM_API_KEY` env or `[lyceum] api_key` in config) | Opt-in. Reports the available USD balance and amount used; no percentage quota or reset is inferred. |
 | OrcaRouter | API key (`ORCAROUTER_API_KEY` env or `[orcarouter] api_key` in config) | Set either. Opt-in. Reports the credit card (spend / total limit / remaining, key expiry) from the one-api compatible dashboard billing endpoints. |
 | Moonshot | API key (`MOONSHOT_API_KEY` or config) | Opt in. Set region `cn` for CNY; `global` uses USD. |
 | Grok (xAI) | Management key | Opt in with `XAI_MANAGEMENT_KEY` or config. An inference key does not work. |
@@ -298,6 +310,7 @@ come from environment variables or `config.toml`.
 | OpenCode Go | API key (`OPENCODE_GO_API_KEY` env or `[opencode-go] api_key` in config) | Enable `[opencode-go]`, then enter the key in the Omarchy settings panel or set the environment variable. |
 | Command Code | Existing `commandcode` or pi login | Enable `[commandcode]` and sign in to either one once. No key to paste; `COMMANDCODE_API_KEY` overrides if you prefer one. |
 | Model Studio | Existing `bl auth login --console` (Alibaba Cloud) | Opt in (`[modelstudio]`), install the official `bl` CLI, and run `bl auth login --console` once. Reports the Token Plan's 5-hour and weekly percentage windows with resets, through the same console gateway the CLI uses; the credential file `~/.bailian/config.json` is only ever read. |
+| Devin | Existing official Devin CLI login | Opt in (`[devin]`) after signing in with the Devin CLI. Reuses its existing `credentials.toml` read-only; ai-usagebar never logs in, refreshes, or writes credentials. Reports daily and weekly quota usage and an optional overage balance. |
 
 ### Nous credits and OpenCode Go
 
@@ -305,7 +318,10 @@ Nous usage percentage is calculated from the subscription-credit pool only:
 `(monthly subscription credits - subscription credits remaining) / monthly subscription credits`.
 Top-up/purchased credits are not mixed into that percentage. When the Portal
 reports them, the tooltip and TUI show subscription credits, top-up credits, and
-total usable credits as separate values.
+total usable credits as separate values. `[nous] headline = "amount"` puts those
+credits still usable on the bar instead of the percentage, the way the
+prepaid-balance vendors do; the percentage keeps the meter, the severity colour
+and the detail line. The default is `"percent"`.
 
 Nous login is interactive because the device code is authorized in the browser.
 Leave the terminal open until it reports that login completed, then refresh the
@@ -568,7 +584,7 @@ Codex, Z.AI, and OpenRouter are enabled by default; other providers are
 opt-in.
 
 Both binaries also accept `--config <PATH>` to read and write an alternate
-file instead of the default (`%APPDATA%\ai-usagebar\config.toml` on Windows).
+file instead of the default (`%APPDATA%\ai-usagebar\config\config.toml` on Windows).
 The file must already exist, and the override applies to every subcommand —
 handy for testing a config side by side with the real one:
 
@@ -678,9 +694,9 @@ Each entry has
 may add `severity`, an absolute `reset_at`, and `window_secs`, the exact length
 of the reset window in seconds. `window_secs` is present only when the vendor
 states the window (rolling 5h/7d windows; Cursor's billing cycle from
-`billingCycleStart`/`billingCycleEnd`, assumed to be 30 days when the start is
-missing) and is omitted, not `null`, otherwise — a calendar month or an unstated
-window gives a frontend nothing to pace against. Cursor's On-Demand text row
+`billingCycleStart`/`billingCycleEnd`, never guessed as a month when the start
+is missing) and is omitted, not `null`, otherwise — a calendar month or an
+unstated window gives a frontend nothing to pace against. Cursor's On-Demand text row
 may also carry `used_cents`, `limit_cents`, and `percent`: the spend and the
 prepaid cap in USD cents, and how much of that cap is already used (rounded
 half up, and above 100 when spend passes the cap). Those fields are omitted,
@@ -694,6 +710,12 @@ rather than inferring a balance row from its label. These fields are additive, s
 existing consumers remain compatible. `short_name` is the same three-letter
 code `{vendor_short}` prints, so a frontend that wants a compact provider tag
 takes it from the report instead of keeping its own table.
+
+With `[context] enabled`, a Claude entry whose Claude Code sessions are working
+or waiting on you also carries `activity`, e.g. `{"working": 2, "waiting": 1}`,
+and an `Activity` text row reading `2 working · 1 waiting`. Both are omitted,
+not zeroed, while that account has nothing running; see
+[Local context overlay](#local-context-overlay).
 
 ## Standalone TUI
 
@@ -742,6 +764,19 @@ on first; it then shows up in the picker.
 
 ## Native desktop integrations
 
+Grok Bot pacing uses the account's reported period in every frontend. Waybar
+exposes weekly pace placeholders and tooltip markers; the macOS menu bar uses
+the elapsed alias. The TUI and `usage --json` carry elapsed-time and point-delta
+notes for Quattro, GNOME, KDE and Linux Mint, while Windows keeps its own
+usage projection. Missing period bounds do not produce pace estimates.
+
+Cursor pacing works the same way, against the billing cycle: the widget exposes
+`{cursor_elapsed}` and a per-pool pace family (`{cursor_auto_pace*}`,
+`{cursor_api_pace*}`), the tooltip marks each pool, the macOS menu bar draws its
+pace marker from the elapsed alias, and the TUI and `usage --json` carry the
+elapsed-time and point-delta notes for Quattro, GNOME and KDE. A cycle whose
+start the API did not report is not paced.
+
 ### Omarchy Quattro
 
 Omarchy 4's Quattro shell can host ai-usagebar as a native Quickshell plugin.
@@ -767,7 +802,19 @@ The widget reads the providers and accounts already enabled in
 - QML settings can pin the bar to one quota window — auto (highest),
   5-hour, weekly, or monthly — instead of always showing the highest
   percent. The tooltip and panel hero echo the pinned value; panel rows
-  and alert state still follow the highest quota.
+  list every window.
+- QML settings can read percentages as what is used (the default) or what is
+  left of the same window, and can turn the provider logos off for the generic
+  robot icon. Both apply immediately.
+- The Metrics section of the QML settings expands per provider and switches
+  each metric on or off, for that provider or account (Cursor and Antigravity list
+  their time windows instead, since the model pools have buttons on the panel). A switched-off metric
+  leaves the panel, the bar and the tooltip, and is ignored when the bar picks
+  the highest percent and when it decides whether the icon is alarming, which
+  follows the used share in either reading. The last metric on stays on.
+  Cursor and Antigravity expose their independent model pools as buttons:
+  Cursor Models/Other Models and Gemini/Claude & GPT OSS. With both pools on,
+  the bar shows both figures, one per pool.
 - Right-click launches the TUI.
 - Middle-click or the mouse wheel switches providers.
 - The selected provider or named account is remembered across shell reloads
@@ -783,6 +830,11 @@ only after a right-click. It installs no service, asks for no elevated
 privileges, and does not overwrite user configuration.
 
 ### macOS menu bar and Windows tray
+
+For macOS releases, move **AI Usage.app** from the archive into `/Applications`
+and open it. The bundle includes the tray, CLI and TUI, and gives menu-bar
+managers a stable application identity. See [installation](macos/INSTALL.md),
+including migration from a bare tray executable and Hidden Bar troubleshooting.
 
 `ai-usagebar-tray` shows the same report in a popover that opens from the
 macOS menu bar or the Windows notification area. The **Popover Style** setting
@@ -823,9 +875,11 @@ itself:
 | <img src="screenshots/macos-tray-native-update-light.png" width="300" alt="Native popover on macOS with an Update available card above the provider tabs: AI Usage v1.27.0 is ready to install, with an Install Update button and a blue dot beside the version in the footer"> | <img src="screenshots/windows-tray-native-update-light.png" width="300" alt="Native popover on Windows 11 with the same Update available card and Install Update button above the provider tabs"> |
 | <img src="screenshots/macos-tray-native-update-dark.png" width="300" alt="The same Update available card on macOS, dark"> | <img src="screenshots/windows-tray-native-update-dark.png" width="300" alt="The same Update available card on Windows 11, dark"> |
 
-On macOS the menu bar item shows the starred metrics — Chart (default):
+On macOS, Chart (default) shows the starred metrics:
 <img src="screenshots/macos-menu-bar-chart.png" width="40" alt="Menu bar item in Chart mode"> ·
-Logos: <img src="screenshots/macos-menu-bar-logos.png" width="240" alt="Menu bar item in Logos mode: each starred provider's logo with its percentage">
+Logos shows one highest-usage percentage per starred provider (lowest remaining
+in Left), excluding hidden metrics, just like Quattro's auto window. ·
+Quattro: one chip with the selected provider's logo, short name and highest percentage.
 
 ### Desktop integrations
 
@@ -1031,7 +1085,7 @@ Waybar examples.
 
 ### Multiple keys for other API-key providers
 
-Z.AI, DeepSeek, DeepInfra, Kilo, Novita, Moonshot, Grok, MiniMax, and OrcaRouter take the
+Z.AI, DeepSeek, DeepInfra, Kilo, Novita, Moonshot, Grok, MiniMax, OrcaRouter, and Lyceum take the
 same array: one `[[<vendor>.accounts]]` entry per extra key, selected with
 `--vendor <vendor> --account <label>`. Region, team, organization, and display
 settings stay per provider. See the
@@ -1162,8 +1216,25 @@ The reader handles Claude Code's undocumented local JSONL defensively:
 - it does not follow discovered symlinks;
 - it performs filesystem work off the UI thread.
 
-When the feature is disabled, nothing under `~/.claude/projects` is read.
-Context options remain in TOML rather than the Settings modal.
+While enabled, `usage` (and every panel built on `usage --json`) also says
+what each Claude account's live sessions are doing: an `Activity` row such as
+`2 working · 1 waiting`, read from the `sessions/` directory Claude Code keeps
+in that account's config directory — the directory of the credentials file its
+quota is fetched from, so `~/.claude` by default, and `~/.claude` too for an
+account `account switch` made the live login. The default entry follows
+`credentials_path`, not the `CLAUDE_CONFIG_DIR` of the shell that runs
+`usage`; give another directory its own account to see its sessions.
+
+Those files outlive a crashed Claude Code, so a session counts only while a
+process with its pid is running — on Linux, the process that started when the
+file says it did, which also rules out a recycled pid. A file written on
+another operating system (a config directory shared across a dual boot) never
+counts. Agent SDK runs (`entrypoint: "sdk-cli"`, as `claude -p` and background
+agents write) are not counted, and the files are only ever read.
+
+When the feature is disabled, nothing under `~/.claude/projects` or any
+account's `sessions/` is read. Context options remain in TOML rather than the
+Settings modal.
 
 ### Settings overlay
 

@@ -46,6 +46,9 @@ impl StripStyle {
 /// Stars the popover persists: provider id → metric keys, in star order.
 pub type Stars = BTreeMap<String, Vec<String>>;
 
+/// Metrics hidden in the popover's Customize: provider id → metric keys.
+pub type HiddenRows = BTreeMap<String, Vec<String>>;
+
 /// One resolved starred metric, ready to draw.
 #[derive(Debug, Clone, PartialEq)]
 pub struct StripMetric {
@@ -57,12 +60,26 @@ pub struct StripMetric {
     /// 0..=1 fill for bounded metrics (used fraction).
     pub fraction: f64,
     pub bounded: bool,
+    /// The remaining share as text (`82%`) for a percentage row, the way the
+    /// popover's Left reading shows it; `None` for a value headline or a row
+    /// with no percent, which read the same either way.
+    pub left_value: Option<String>,
+    /// The report named this metric's own figure as its headline
+    /// (`headline = "value"`, a prepaid balance): a figure, not a quota
+    /// window, so it never wins the highest-window race the Quattro chip runs.
+    pub value_headline: bool,
+    /// Under a group heading (SuperGrok's product slices, the Claude entry's
+    /// CLI sessions): a breakdown, not a quota window of its own.
+    pub grouped: bool,
 }
+
+/// One provider's visible metrics: entry id, display name, and metrics.
+pub type StripGroup = (String, String, Vec<StripMetric>);
 
 /// Resolved strip contents. `groups` drives Text; `bars` drives Bars.
 #[derive(Debug, Clone, PartialEq)]
 pub struct StripContent {
-    pub groups: Vec<(String, String, Vec<StripMetric>)>,
+    pub groups: Vec<StripGroup>,
     pub bars: Vec<StripMetric>,
 }
 
@@ -183,6 +200,33 @@ pub fn parse_strip_ipc(value: &Value) -> (StripStyle, Stars, Vec<String>) {
     (style, stars, order)
 }
 
+/// Parse `hidden_rows` from the popover's `strip` IPC: the metric keys the
+/// user switched off, per provider. Missing or malformed means nothing is
+/// hidden, the menu bar's behavior before the popover reports any.
+#[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
+pub fn parse_hidden_rows(value: &Value) -> HiddenRows {
+    let mut hidden = HiddenRows::new();
+    let Some(map) = value.get("hidden_rows").and_then(Value::as_object) else {
+        return hidden;
+    };
+    for (id, keys) in map {
+        let id = id.trim();
+        let Some(keys) = keys.as_array() else {
+            continue;
+        };
+        let mut list: Vec<String> = Vec::new();
+        for key in keys.iter().filter_map(Value::as_str).map(str::trim) {
+            if !key.is_empty() && !list.iter().any(|k| k == key) {
+                list.push(key.to_string());
+            }
+        }
+        if !id.is_empty() && !list.is_empty() {
+            hidden.insert(id.to_string(), list);
+        }
+    }
+    hidden
+}
+
 /// Resolve starred metrics from a host payload. `order` is the popover's
 /// visible card order; empty means payload order. Missing stars fall back to
 /// the first two bounded metrics of each ready entry so the glyph has
@@ -215,48 +259,15 @@ pub fn content_from_payload(payload: &Value, stars: &Stars, order: &[String]) ->
             walk.push(id);
         }
     }
-    let mut groups = Vec::new();
-    for id in walk {
-        let Some(entry) = by_id.get(&id) else {
-            continue;
-        };
-        if entry.get("status").and_then(Value::as_str) == Some("error") {
-            continue;
-        }
-        let name = entry
-            .get("display_name")
-            .or_else(|| entry.get("name"))
-            .and_then(Value::as_str)
-            .unwrap_or(id.as_str())
-            .to_string();
-        let metrics = metrics_for_entry(entry, &id, &name);
-        let wanted = if stars.is_empty() {
-            metrics
-                .iter()
-                .filter(|m| m.bounded)
-                .take(MAX_STARS_PER_PROVIDER)
-                .map(|m| m.key.clone())
-                .collect()
-        } else {
-            stars.get(&id).cloned().unwrap_or_default()
-        };
-        if wanted.is_empty() {
-            continue;
-        }
-        let mut picked = Vec::new();
-        for key in wanted {
-            if let Some(metric) = metrics
-                .iter()
-                .find(|m| m.key == key && !m.value.trim().is_empty())
-            {
-                picked.push(metric.clone());
-            }
-        }
-        if picked.is_empty() {
-            continue;
-        }
-        groups.push((id, name, picked));
-    }
+    let groups: Vec<StripGroup> = walk
+        .into_iter()
+        .filter_map(|id| {
+            let entry = by_id.get(&id)?;
+            let starred =
+                (!stars.is_empty()).then(|| stars.get(&id).map(Vec::as_slice).unwrap_or_default());
+            entry_group(&id, entry, starred)
+        })
+        .collect();
     let bars: Vec<StripMetric> = groups
         .iter()
         .flat_map(|(_, _, metrics)| metrics.iter().cloned())
@@ -264,6 +275,74 @@ pub fn content_from_payload(payload: &Value, stars: &Stars, order: &[String]) ->
         .take(MAX_BARS)
         .collect();
     StripContent { groups, bars }
+}
+
+/// Every quota window of one payload entry that has a value, stars aside,
+/// the set the Quattro bar's `selectMetric` picks from: grouped rows only
+/// when the entry has nothing else. The Quattro look draws its chip from this,
+/// so it agrees with the popover tab that selects it, whichever window is
+/// the busiest (Z.AI's third, monthly MCP window counts like its 5h and
+/// weekly ones). A metric whose key is in `hidden` (switched off in the
+/// popover's Customize) is left out, as the popover tab leaves it out; with
+/// every metric hidden the entry has nothing to show. Only the macOS menu bar
+/// draws the Quattro look, so other hosts compile it unused.
+#[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
+pub fn quota_group(payload: &Value, id: &str, hidden: &[String]) -> Option<StripGroup> {
+    let entry = payload
+        .get("entries")?
+        .as_array()?
+        .iter()
+        .find(|entry| entry.get("id").and_then(Value::as_str) == Some(id))?;
+    if entry.get("status").and_then(Value::as_str) == Some("error") {
+        return None;
+    }
+    let name = entry_name(entry, id);
+    let shown: Vec<StripMetric> = metrics_for_entry(entry, id, &name)
+        .into_iter()
+        .filter(|m| !m.value.trim().is_empty() && !hidden.contains(&m.key))
+        .collect();
+    let windows: Vec<StripMetric> = shown.iter().filter(|m| !m.grouped).cloned().collect();
+    let metrics = if windows.is_empty() { shown } else { windows };
+    (!metrics.is_empty()).then(|| (id.to_string(), name, metrics))
+}
+
+fn entry_name(entry: &Value, id: &str) -> String {
+    entry
+        .get("display_name")
+        .or_else(|| entry.get("name"))
+        .and_then(Value::as_str)
+        .unwrap_or(id)
+        .to_string()
+}
+
+/// Resolve one entry's visible metrics. `starred` is the provider's star
+/// keys, or `None` before any star exists, which picks the first bounded
+/// metrics. `None` for an errored entry or one with nothing to show.
+fn entry_group(id: &str, entry: &Value, starred: Option<&[String]>) -> Option<StripGroup> {
+    if entry.get("status").and_then(Value::as_str) == Some("error") {
+        return None;
+    }
+    let name = entry_name(entry, id);
+    let metrics = metrics_for_entry(entry, id, &name);
+    let wanted: Vec<String> = match starred {
+        Some(keys) => keys.to_vec(),
+        None => metrics
+            .iter()
+            .filter(|m| m.bounded)
+            .take(MAX_STARS_PER_PROVIDER)
+            .map(|m| m.key.clone())
+            .collect(),
+    };
+    let picked: Vec<StripMetric> = wanted
+        .iter()
+        .filter_map(|key| {
+            metrics
+                .iter()
+                .find(|m| &m.key == key && !m.value.trim().is_empty())
+                .cloned()
+        })
+        .collect();
+    (!picked.is_empty()).then(|| (id.to_string(), name, picked))
 }
 
 fn metrics_for_entry(entry: &Value, id: &str, name: &str) -> Vec<StripMetric> {
@@ -311,6 +390,10 @@ fn metrics_for_entry(entry: &Value, id: &str, name: &str) -> Vec<StripMetric> {
             .map(str::to_string)
             .or_else(|| percent.map(|percent| format!("{}%", percent.round() as i64)))
             .unwrap_or_default();
+        let value_headline = section.get("headline").and_then(Value::as_str) == Some("value");
+        let left_value = percent
+            .filter(|_| !value_headline)
+            .map(|percent| format!("{}%", (100.0 - percent).max(0.0).round() as i64));
         let mut key = metric_key(id, raw_label, effective_group);
         let count = seen.entry(key.clone()).or_insert(0);
         *count += 1;
@@ -325,6 +408,9 @@ fn metrics_for_entry(entry: &Value, id: &str, name: &str) -> Vec<StripMetric> {
             value,
             fraction: (percent.unwrap_or(0.0) / 100.0).clamp(0.0, 1.0),
             bounded: true,
+            left_value,
+            value_headline,
+            grouped: !effective_group.is_empty(),
         });
     }
     rows
@@ -722,6 +808,79 @@ mod tests {
         assert_eq!(bars[0].label, "ship the release (Sessions)");
         assert_eq!(bars[1].key, "metric:Grok Build (Breakdown)");
         assert_eq!(bars[1].label, "Grok Build (Breakdown)");
+    }
+
+    /// The Left reading's text matches the popover's `leftPercent`
+    /// (`max(0, 100 - percent)`); a value headline keeps its value.
+    #[test]
+    fn left_value_is_the_remaining_percent() {
+        let payload = json!({"entries":[{"id":"zai", "status":"ready", "sections":[
+            {"type":"metric", "label":"Weekly", "percent":18, "value":"18%"},
+            {"type":"metric", "label":"Over", "percent":130, "value":"130%"},
+            {"type":"metric", "label":"Credits", "percent":40, "value":"$4 of $10", "headline":"value"},
+            {"type":"metric", "label":"Balance", "value":"$40"}]}]});
+        let (_, _, metrics) = quota_group(&payload, "zai", &[]).unwrap();
+        let left: Vec<Option<&str>> = metrics.iter().map(|m| m.left_value.as_deref()).collect();
+        assert_eq!(left, vec![Some("82%"), Some("0%"), None, None]);
+    }
+
+    /// A metric switched off in the popover's Customize is not a quota window
+    /// the Quattro look can pick; with the windows hidden a grouped row stands
+    /// in, and with everything hidden the entry has nothing to show.
+    #[test]
+    fn quota_group_leaves_out_hidden_metrics() {
+        let payload = json!({"entries":[{"id":"zai", "status":"ready", "sections":[
+            {"type":"metric", "label":"Session (5h)", "percent":0, "value":"0%"},
+            {"type":"metric", "label":"MCP tools (monthly)", "percent":18, "value":"18%"},
+            {"type":"metric", "label":"Glm", "group":"Models", "percent":40, "value":"40%"}]}]});
+        let keys = |hidden: &[&str]| {
+            let hidden: Vec<String> = hidden.iter().map(|k| k.to_string()).collect();
+            quota_group(&payload, "zai", &hidden)
+                .map(|(_, _, metrics)| metrics.into_iter().map(|m| m.key).collect::<Vec<_>>())
+        };
+
+        assert_eq!(
+            keys(&[]),
+            Some(vec![
+                "metric:Session (5h)".to_string(),
+                "metric:MCP tools (monthly)".to_string()
+            ])
+        );
+        assert_eq!(
+            keys(&["metric:MCP tools (monthly)"]),
+            Some(vec!["metric:Session (5h)".to_string()])
+        );
+        assert_eq!(
+            keys(&["metric:Session (5h)", "metric:MCP tools (monthly)"]),
+            Some(vec!["metric:Glm (Models)".to_string()])
+        );
+        assert_eq!(
+            keys(&[
+                "metric:Session (5h)",
+                "metric:MCP tools (monthly)",
+                "metric:Glm (Models)"
+            ]),
+            None
+        );
+    }
+
+    /// `hidden_rows` is optional: an older popover, or a malformed field,
+    /// hides nothing; blank ids and keys and repeats are dropped.
+    #[test]
+    fn parse_hidden_rows_reads_the_strip_ipc() {
+        let hidden = parse_hidden_rows(&json!({"hidden_rows": {
+            "zai": [" metric:MCP tools (monthly) ", "metric:MCP tools (monthly)", "", 7],
+            "": ["metric:Weekly"],
+            "openai": [],
+            "kimi": "metric:Weekly"
+        }}));
+        assert_eq!(hidden.len(), 1);
+        assert_eq!(
+            hidden["zai"],
+            vec!["metric:MCP tools (monthly)".to_string()]
+        );
+        assert!(parse_hidden_rows(&json!({"stars": {}})).is_empty());
+        assert!(parse_hidden_rows(&json!({"hidden_rows": ["zai"]})).is_empty());
     }
 
     #[test]

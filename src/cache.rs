@@ -436,6 +436,23 @@ pub fn home_dir() -> Result<PathBuf> {
         .ok_or_else(|| AppError::Other("could not resolve home directory (no HOME?)".into()))
 }
 
+/// The identity a vendor cache is scoped to: the first 8 bytes (16 hex chars)
+/// of the SHA-256 of the credential. A re-login changes it, so one login's
+/// figures are never served as another's; the secret itself is never stored.
+/// Existing cache files carry this exact value, so the truncation is a
+/// compatibility contract, not a tunable.
+pub fn fingerprint_of(secret: &str) -> String {
+    use sha2::{Digest, Sha256};
+    use std::fmt::Write as _;
+
+    let digest = Sha256::digest(secret.as_bytes());
+    let mut hex = String::with_capacity(16);
+    for byte in digest.iter().take(8) {
+        let _ = write!(hex, "{byte:02x}");
+    }
+    hex
+}
+
 /// Test-only: a named file inside a fresh `TempDir` with **no open handle** on
 /// it. [`atomic_write`] replaces its destination via rename, which on Windows
 /// fails while the destination is held open (as a live `NamedTempFile` handle
@@ -478,6 +495,15 @@ mod tests {
         cache.write_payload(b"hello world").unwrap();
         let got = cache.maybe_payload().unwrap();
         assert_eq!(got.as_deref(), Some(&b"hello world"[..]));
+    }
+
+    #[test]
+    fn fingerprint_is_the_first_eight_sha256_bytes_in_lower_hex() {
+        // SHA-256("abc") = ba7816bf 8f01cfea 414140de ... — pinned because
+        // existing on-disk caches are keyed by exactly this value.
+        assert_eq!(fingerprint_of("abc"), "ba7816bf8f01cfea");
+        assert_eq!(fingerprint_of("").len(), 16);
+        assert_ne!(fingerprint_of("a"), fingerprint_of("b"));
     }
 
     #[test]

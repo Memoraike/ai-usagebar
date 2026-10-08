@@ -34,6 +34,9 @@ pub struct RenderInput<'a> {
     pub format_pace_color: bool,
     pub tooltip_pace_pts: bool,
     pub now: DateTime<Utc>,
+    /// Live Claude Code session status for the tooltip, when the sessions
+    /// directory yields any (#356). None = no line.
+    pub claude_sessions: Option<&'a crate::claude_sessions::SessionsSummary>,
 }
 
 /// Compose the full Waybar output for an Anthropic snapshot.
@@ -558,6 +561,13 @@ fn render_default_tooltip(input: &RenderInput) -> String {
         }
     }
 
+    if let Some(text) = input.claude_sessions.and_then(|s| s.describe()) {
+        lines.push(Line::Body("".into()));
+        lines.push(Line::Body(format!(
+            " <span foreground='{dim}'>  {text}</span>"
+        )));
+    }
+
     let updated = updated_at_hm(input.now, input.outcome.cache_age);
     lines.push(Line::Body("".into()));
     lines.push(Line::Sep);
@@ -649,6 +659,7 @@ mod tests {
 
     fn input<'a>(outcome: &'a FetchOutcome, theme: &'a Theme) -> RenderInput<'a> {
         RenderInput {
+            claude_sessions: None,
             outcome,
             theme,
             format: DEFAULT_FORMAT,

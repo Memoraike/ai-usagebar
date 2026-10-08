@@ -84,10 +84,10 @@ TUI keys: `Tab` / `h` `l` cycle tabs, `r` refresh, `s` Settings, `q` quit.
 
 ## Configuration
 
-Default file: `%APPDATA%\ai-usagebar\config.toml`.
+Default file: `%APPDATA%\ai-usagebar\config\config.toml`.
 
 ```powershell
-$dir = "$env:APPDATA\ai-usagebar"
+$dir = "$env:APPDATA\ai-usagebar\config"
 New-Item -ItemType Directory -Force -Path $dir | Out-Null
 Copy-Item config.example.toml "$dir\config.toml"
 notepad "$dir\config.toml"

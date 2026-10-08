@@ -148,7 +148,9 @@ BarWidget {
     }
     if (root.panelItem && root.panelItem.plainTooltipText)
       return root.panelItem.plainTooltipText
-    return "AI usage"
+    return root.panelItem && root.panelItem.tr
+      ? root.panelItem.tr("app.name")
+      : "AI usage"
   }
 
   readonly property string tipHtml: {
@@ -350,20 +352,8 @@ BarWidget {
               NumberAnimation { duration: 140; easing.type: Easing.OutCubic }
             }
 
-            // Trailing value / provider tag after the brand mark. When
-            // showValue is off the chip is icon-only — collapsing this keeps
-            // the slot on the same edge padding as a plain WidgetButton
-            // (hitGaps still owns Style.spaceReal(17)/2 each side).
-            readonly property bool hasTrailing: {
-              var c = chipHit.chip
-              if (!c) return false
-              if (c.segments && c.segments.length > 0) return true
-              if (String(c.providerPrefix || "") !== "") return true
-              if (String(c.label || "") !== "") return true
-              return false
-            }
-
             BrandMark {
+              visible: chipHit.chip.labelOnly !== true
               anchors.verticalCenter: parent.verticalCenter
               brand: chipHit.chip.brand || ""
               fallback: chipHit.chip.icon || "󰚩"
@@ -372,13 +362,6 @@ BarWidget {
               foreground: root.chipIconColor(chipHit.chip)
               fontFamily: button.fontFamily
               fontSize: button.fontSize
-            }
-
-            Item {
-              visible: chipContent.hasTrailing
-              width: visible ? Style.space(6) : 0
-              height: 1
-              anchors.verticalCenter: parent.verticalCenter
             }
 
             Text {

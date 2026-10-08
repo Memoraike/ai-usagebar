@@ -625,15 +625,10 @@ async fn build_outcome(client: &Client, config: &Config, tab: &TabId) -> Result<
                     crate::anthropic::desktop_creds::account_target(config, label)?
                 }
                 Some(label) => config.anthropic.account_target(label)?,
-                None => {
-                    let target = match config.anthropic.credentials_path.clone() {
-                        Some(p) => crate::anthropic::creds::CredsTarget::Explicit(p),
-                        None => crate::anthropic::creds::CredsTarget::Default(
-                            crate::anthropic::creds::default_path().unwrap_or_default(),
-                        ),
-                    };
-                    (target, crate::cache::Cache::for_vendor("anthropic")?)
-                }
+                None => (
+                    config.anthropic.default_creds_target(),
+                    crate::cache::Cache::for_vendor("anthropic")?,
+                ),
             };
             let endpoints = crate::anthropic::fetch::Endpoints::default();
             let outcome = crate::anthropic::fetch_snapshot(
@@ -667,10 +662,12 @@ async fn build_outcome(client: &Client, config: &Config, tab: &TabId) -> Result<
         }
         VendorId::Openrouter => {
             let (api_key, cache) = api_key_and_cache(config, vendor, tab.account.as_deref())?;
+            let management_key = config.openrouter_management_key(tab.account.as_deref());
             let endpoints = crate::openrouter::fetch::Endpoints::default();
             let outcome = crate::openrouter::fetch_snapshot(
                 client,
                 &api_key,
+                management_key.as_deref(),
                 &cache,
                 &endpoints,
                 DEFAULT_TTL,
@@ -865,6 +862,12 @@ async fn build_outcome(client: &Client, config: &Config, tab: &TabId) -> Result<
             .await?;
             Ok(outcome.into())
         }
+        VendorId::Devin => {
+            let cache = crate::cache::Cache::for_vendor("devin")?;
+            let outcome =
+                crate::devin::fetch::fetch_snapshot(&config.devin, &cache, DEFAULT_TTL).await?;
+            Ok(outcome.into())
+        }
         VendorId::Minimax => {
             let (api_key, cache) = api_key_and_cache(config, vendor, tab.account.as_deref())?;
             let endpoints = crate::minimax::fetch::Endpoints::for_region(&config.minimax.region);
@@ -989,6 +992,12 @@ async fn build_outcome(client: &Client, config: &Config, tab: &TabId) -> Result<
                 DEFAULT_TTL,
             )
             .await?;
+            Ok(outcome.into())
+        }
+        VendorId::Lyceum => {
+            let (api_key, cache) = api_key_and_cache(config, vendor, tab.account.as_deref())?;
+            let outcome =
+                crate::lyceum::fetch::fetch_snapshot(client, &api_key, &cache, DEFAULT_TTL).await?;
             Ok(outcome.into())
         }
     }
@@ -1247,11 +1256,13 @@ mod tests {
                 label: "work".into(),
                 api_key_env: Some("OPENROUTER_WORK_API_KEY".into()),
                 api_key: None,
+                management_api_key_env: None,
             },
             crate::config::ApiKeyAccount {
                 label: "personal".into(),
                 api_key_env: None,
                 api_key: Some("personal-key".into()),
+                management_api_key_env: None,
             },
         ];
         assert_eq!(
@@ -1304,6 +1315,7 @@ mod tests {
                 label: "work".into(),
                 api_key_env: Some("OPENROUTER_WORK_API_KEY".into()),
                 api_key: None,
+                management_api_key_env: None,
             });
         assert_eq!(
             tabs_from_config(&config),
@@ -1557,6 +1569,7 @@ mod tests {
                 is_free_tier: false,
                 limit: None,
                 limit_remaining: None,
+                recent_models: Vec::new(),
             }),
             stale: false,
             last_error: None,

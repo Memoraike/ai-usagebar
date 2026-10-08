@@ -19,7 +19,7 @@ import { m } from "./paraglide/messages.js";
 
 export const LAYOUT_KEY = "aiub.tray.layout.v1";
 const COLLAPSED_METRIC_CAP = 2;
-const lang = (locale) => locale === "pt-BR" ? "pt-BR" : "en";
+const lang = (locale) => locale === "pt-BR" || locale === "ko" ? locale : "en";
 /** At most two starred metrics per provider, matching OpenUsage. */
 export const MAX_STARS_PER_PROVIDER = 2;
 
@@ -41,7 +41,8 @@ export function emptyPayload(hostError) {
     nextRefreshAt: 0,
     startupEnabled: false,
     hostError: hostError || "",
-    menuBarChart: false,
+    menuBarLook: "chart",
+    menuBarShortName: true,
     notificationsEnabled: true,
     notificationsThreshold: 97,
     os: "",
@@ -89,7 +90,8 @@ function normalizePayload(parsed) {
     nextRefreshAt: Number(parsed.next_refresh_at) || 0,
     startupEnabled: parsed.startup_enabled === true,
     hostError: clean(parsed.host_error, 1200),
-    menuBarChart: parsed.menu_bar_chart === true,
+    menuBarLook: normalizeMenuBarLook(parsed.menu_bar_look),
+    menuBarShortName: parsed.menu_bar_short_name !== false,
     notificationsEnabled: parsed.notifications_enabled !== false,
     notificationsThreshold: Number.isInteger(parsed.notifications_threshold) && parsed.notifications_threshold >= 1 && parsed.notifications_threshold <= 100 ? parsed.notifications_threshold : 97,
     os: normalizeOs(parsed.os),
@@ -195,6 +197,11 @@ function normalizeOs(value) {
   const os = String(value || "").toLowerCase();
   if (["macos", "windows", "linux"].includes(os)) return os;
   return "";
+}
+
+// The menu-bar look the host reports; anything else reads as the default chart.
+function normalizeMenuBarLook(value) {
+  return value === "logos" || value === "quattro" ? value : "chart";
 }
 
 // The host's refresh interval; anything outside the offered set reads as the
@@ -653,6 +660,15 @@ function clampPercent(value) {
   return Math.max(0, Math.min(100, number));
 }
 
+// The goal in the meter's reading: the share that should be spent by now in
+// Used mode, the share that should still remain in Left mode. Reading it as
+// spent beside a meter that shows what is left put `97%` next to `7% left`.
+export function usageGoalPercent(goal, showAs) {
+  if (!goal) return null;
+  const elapsed = clampPercent(goal.percent);
+  return showAs === "used" ? elapsed : 100 - elapsed;
+}
+
 // Where the "you should be here" tick sits on the meter, as a percent of its
 // width. The meter fills with what is consumed in Used mode and with what
 // remains in Left mode, so the tick follows the same reading.
@@ -779,6 +795,7 @@ export function projectCards(payload, nowMs, locale) {
           reset: resetLabel(section, now, locale),
           resetAt: section.resetAt || "",
           window: section.window || 0,
+          grouped: Boolean(metricGroup),
         };
         row.key = metricRowKey(entry.id, section.label, metricGroup);
         rows.push(row);
@@ -1010,7 +1027,20 @@ export function stripCommand(layout, cards) {
   } else {
     for (const id of Object.keys(source)) stars[id] = source[id];
   }
-  return { style: "bars", stars, order };
+  // The macOS Quattro chip leaves out the metrics hidden here, like the native tab.
+  const hiddenRows = {};
+  for (const card of cards || []) {
+    const keys = hiddenMetricKeys(card, layout || emptyLayout());
+    if (keys.length) hiddenRows[card.id] = keys;
+  }
+  // The menu bar's percentages follow the popover's Used/Left reading.
+  return {
+    style: "bars",
+    stars,
+    order,
+    show_as: normalizeShowAs(layout && layout.showAs),
+    hidden_rows: hiddenRows,
+  };
 }
 
 function cleanIdList(list) {
@@ -1380,6 +1410,19 @@ export function visibleRowsFor(card, opts) {
     if (row) out.push(row);
   }
   return out;
+}
+
+/**
+ * Keys of the card's metric rows switched off in Customize. A hidden metric
+ * does not count toward the provider's headline percentage: the native tab
+ * and, through `stripCommand`, the macOS menu bar's Quattro chip both skip it.
+ * @returns {string[]}
+ */
+export function hiddenMetricKeys(card, layout) {
+  const off = prefsForCard(card, layout).off || {};
+  return (card.rows || [])
+    .filter((row) => row.kind === "metric" && off[rowKey(row)])
+    .map(rowKey);
 }
 
 export function cardHasExtras(card, hideExtras, prefs) {
@@ -1823,6 +1866,18 @@ export function shortcutFromKeyEvent(event) {
   if (event.metaKey) parts.push("Win");
   parts.push(key);
   return parts.join("+");
+}
+
+// Display-only spelling of a stored shortcut. macOS names the canonical `Win`
+// and `Alt` modifiers "Cmd" and "Option"; the value itself stays "Win+U" so the
+// host still registers it.
+export function displayShortcut(value, os) {
+  const text = String(value || "");
+  if (os !== "macos") return text;
+  return text
+    .split("+")
+    .map((part) => (part === "Win" ? "Cmd" : part === "Alt" ? "Option" : part))
+    .join("+");
 }
 
 // Collapses "system" into the scheme the OS currently prefers.

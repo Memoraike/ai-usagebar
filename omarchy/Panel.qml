@@ -5,6 +5,7 @@ import Quickshell.Io
 import qs.Commons
 import qs.Ui
 import "Model.js" as Model
+import "I18n.js" as I18n
 
 // Native Omarchy Quattro popup. BarWidget.qml owns the bar slot and injects
 // its button as this panel's anchor; collection stays in the Rust binary.
@@ -56,10 +57,19 @@ Panel {
   readonly property bool showProvider: Model.booleanSetting(setting("showProvider", false), false)
   readonly property bool showAll: Model.booleanSetting(setting("showAll", false), false)
   readonly property bool colorCodeUsage: Model.booleanSetting(setting("colorCodeUsage", false), false)
+  readonly property string uiLocaleSetting: String(setting("uiLocale", "auto") || "auto")
+  // Bind Qt.locale so Auto tracks the shell language without a restart.
+  readonly property string uiLocale: I18n.resolveLocale(uiLocaleSetting, Qt.locale().name)
   readonly property string barWindow: Model.normalizeBarWindow(setting("barWindow", "auto"))
   readonly property bool showCursorModels: Model.booleanSetting(setting("showCursorModels", true), true)
   readonly property bool showCursorOther: Model.booleanSetting(setting("showCursorOther", true), true)
   readonly property bool showCursorOnDemand: Model.booleanSetting(setting("showCursorOnDemand", true), true)
+  readonly property bool showCursorCredits: Model.booleanSetting(setting("showCursorCredits", true), true)
+  readonly property bool showAntigravityGemini: Model.booleanSetting(setting("showAntigravityGemini", true), true)
+  readonly property bool showAntigravityClaudeGpt: Model.booleanSetting(setting("showAntigravityClaudeGpt", true), true)
+  readonly property bool brandIcons: Model.booleanSetting(setting("brandIcons", true), true)
+  readonly property string showAs: Model.normalizeShowAs(setting("showAs", "used"))
+  readonly property var hiddenMetrics: Model.normalizeHiddenMetrics(setting("hiddenMetrics", {}))
   readonly property var visibleEntries: Model.filteredEntries(entries, configuredProvider)
   readonly property int entryIndex: Model.selectedIndex(visibleEntries, selectedEntryId)
   readonly property var entry: entryIndex >= 0 ? visibleEntries[entryIndex] : null
@@ -67,14 +77,35 @@ Panel {
     if (!entry) return ""
     return String(entry.fetched_at || "")
   }
-  readonly property var summary: Model.headline(entry, barWindow)
+  readonly property var shapedEntries: visibleEntries.map(function(item) {
+    return Model.panelEntry(
+      item,
+      hiddenMetrics,
+      cursorPoolFlags(),
+      antigravityPoolFlags())
+  })
+  readonly property var shapedEntry: entryIndex >= 0 ? shapedEntries[entryIndex] : null
+  readonly property var summary: Model.headline(shapedEntry, barWindow, showAs)
   // barWindow pins the bar value and its echoes (hero detail, tooltip).
   // Panel rows and alert state keep the historical highest-percent headline,
   // matching every other frontend (Waybar class, KDE isAlarming, TUI).
   // Grouped sub-rows (SuperGrok's product slices) gain a heading row here so
   // they render as a breakdown of the meter above, not peers of it.
   readonly property bool cursorEntry: isCursorEntry(entry)
-  readonly property var entrySections: entry ? Model.groupedSections(entry.sections) : []
+  readonly property bool antigravityEntry: isAntigravityEntry(entry)
+  readonly property var entrySections: entry
+    ? Model.groupedSections(Model.panelEntry(
+      entry,
+      hiddenMetrics,
+      cursorPoolFlags(),
+      antigravityPoolFlags()).sections) : []
+  readonly property var metricEntries: visibleEntries.map(function(item) {
+    return {
+      id: item.id,
+      name: Model.providerName(item),
+      rows: Model.metricChoices(item, hiddenMetrics)
+    }
+  }).filter(function(item) { return item.rows.length > 0 })
   readonly property bool filterMiss: configuredProvider !== "" && entries.length > 0 && visibleEntries.length === 0
   readonly property bool entryAlarming: shownAlarming()
   // A cached or failed provider response stays a status line, but a report
@@ -82,6 +113,17 @@ Panel {
   readonly property bool reportMissing: loadError !== "" && entries.length === 0
   readonly property bool alarming: (showAll ? shownAnyAlarming() : entryAlarming)
     || reportMissing
+
+  function tr(key, params) {
+    return I18n.t(uiLocale, key, params || null)
+  }
+
+  function setUiLocale(value) {
+    var next = I18n.normalizeLocaleTag(value)
+    if (next === "") next = "auto"
+    if (next === uiLocaleSetting) return
+    persistWidgetSettings({ uiLocale: next })
+  }
 
   function alpha(color, opacity) {
     return Qt.rgba(color.r, color.g, color.b, opacity)
@@ -220,6 +262,27 @@ Panel {
     persistWidgetSettings({ barWindow: next })
   }
 
+  function setBrandIcons(enabled) {
+    var next = enabled === true
+    if (next === brandIcons) return
+    persistWidgetSettings({ brandIcons: next })
+  }
+
+  function setShowAs(value) {
+    var next = Model.normalizeShowAs(value)
+    if (next === showAs) return
+    persistWidgetSettings({ showAs: next })
+  }
+
+  function setMetricShown(entryId, key) {
+    var target = null
+    for (var i = 0; i < visibleEntries.length; i++)
+      if (visibleEntries[i].id === entryId) target = visibleEntries[i]
+    if (!target) return
+    if (!Model.canToggleMetric(target, hiddenMetrics, key)) return
+    persistWidgetSettings({ hiddenMetrics: Model.toggleMetricChoice(hiddenMetrics, target, key) })
+  }
+
   function isCursorEntry(item) {
     if (!item) return false
     var id = String(item.id || "")
@@ -227,18 +290,44 @@ Panel {
     return (at < 0 ? id : id.slice(0, at)) === "cursor"
   }
 
+  function isAntigravityEntry(item) {
+    if (!item) return false
+    var id = String(item.id || "")
+    var at = id.indexOf("@")
+    return (at < 0 ? id : id.slice(0, at)) === "antigravity"
+  }
+
   function cursorPoolFlags() {
     return {
       models: showCursorModels,
       other: showCursorOther,
-      demand: showCursorOnDemand
+      demand: showCursorOnDemand,
+      credits: showCursorCredits
+    }
+  }
+
+  function antigravityPoolFlags() {
+    return {
+      gemini: showAntigravityGemini,
+      third_party: showAntigravityClaudeGpt
     }
   }
 
   function cursorShownFlags() {
-    if (typeof Model.cursorBarFlags === "function")
-      return Model.cursorBarFlags(entry, cursorPoolFlags())
-    return cursorPoolFlags()
+    var base = typeof Model.cursorBarFlags === "function"
+      ? Model.cursorBarFlags(Model.windowEntry(entry, hiddenMetrics), cursorPoolFlags())
+      : cursorPoolFlags()
+    var flags = {
+      models: base.models === true,
+      other: base.other === true,
+      demand: base.demand === true,
+      credits: base.credits === true
+    }
+    // Hot reload can keep an older Model.js that has no credits flag. The
+    // grant is still in the report, so the switch follows this file.
+    if (base.credits === undefined)
+      flags.credits = showCursorCredits && creditGrantBits(entry).length > 0
+    return flags
   }
 
   function cursorPoolOn(id) {
@@ -248,18 +337,45 @@ Panel {
   function cursorPoolCanTurnOff(id) {
     var flags = cursorShownFlags()
     if (flags[id] !== true) return false
-    var count = (flags.models ? 1 : 0) + (flags.other ? 1 : 0) + (flags.demand ? 1 : 0)
+    var count = (flags.models ? 1 : 0) + (flags.other ? 1 : 0) + (flags.demand ? 1 : 0) + (flags.credits ? 1 : 0)
     return count > 1
   }
 
   function cursorPoolButtons() {
     var has = typeof Model.cursorPoolPresence === "function"
-      ? Model.cursorPoolPresence(entry)
-      : { models: true, other: true, demand: true }
+      ? Model.cursorPoolPresence(Model.windowEntry(entry, hiddenMetrics))
+      : { models: true, other: true, demand: true, credits: false }
     var rows = []
-    if (has.models) rows.push({ poolId: "models", label: "Cursor Models" })
-    if (has.other) rows.push({ poolId: "other", label: "Other Models" })
-    if (has.demand) rows.push({ poolId: "demand", label: "On-Demand" })
+    if (has.models) rows.push({ poolId: "models", label: root.tr("pool.models") })
+    if (has.other) rows.push({ poolId: "other", label: root.tr("pool.other") })
+    if (has.demand) rows.push({ poolId: "demand", label: root.tr("pool.demand") })
+    if (has.credits || creditGrantBits(entry).length > 0)
+      rows.push({ poolId: "credits", label: root.tr("pool.credits") })
+    return rows
+  }
+
+  function antigravityShownFlags() {
+    if (typeof Model.antigravityBarFlags !== "function") return antigravityPoolFlags()
+    return Model.antigravityBarFlags(Model.windowEntry(entry, hiddenMetrics), antigravityPoolFlags())
+  }
+
+  function antigravityPoolOn(id) {
+    return antigravityShownFlags()[id] === true
+  }
+
+  function antigravityPoolCanTurnOff(id) {
+    var flags = antigravityShownFlags()
+    if (flags[id] !== true) return false
+    return (flags.gemini ? 1 : 0) + (flags.third_party ? 1 : 0) > 1
+  }
+
+  function antigravityPoolButtons() {
+    var has = typeof Model.antigravityPoolPresence === "function"
+      ? Model.antigravityPoolPresence(Model.windowEntry(entry, hiddenMetrics))
+      : { gemini: true, third_party: true }
+    var rows = []
+    if (has.gemini) rows.push({ poolId: "gemini", label: root.tr("pool.antigravity_gemini") })
+    if (has.third_party) rows.push({ poolId: "third_party", label: root.tr("pool.antigravity_third_party") })
     return rows
   }
 
@@ -267,37 +383,76 @@ Panel {
     var saved = cursorPoolFlags()
     var shown = cursorShownFlags()
     var next = Model.toggleCursorPool(shown, id)
+    // Older Model.js ignores the credits id and hands the same flags back.
+    if (id === "credits" && next.credits === shown.credits) {
+      next = {
+        models: shown.models,
+        other: shown.other,
+        demand: shown.demand,
+        credits: !shown.credits
+      }
+      if (!next.models && !next.other && !next.demand && !next.credits) return
+    }
     if (next.models === shown.models && next.other === shown.other
-        && next.demand === shown.demand) return
+        && next.demand === shown.demand && next.credits === shown.credits) return
     var has = typeof Model.cursorPoolPresence === "function"
       ? Model.cursorPoolPresence(entry)
-      : { models: true, other: true, demand: true }
+      : { models: true, other: true, demand: true, credits: false }
     persistWidgetSettings({
       showCursorModels: has.models ? next.models : saved.models,
       showCursorOther: has.other ? next.other : saved.other,
-      showCursorOnDemand: has.demand ? next.demand : saved.demand
+      showCursorOnDemand: has.demand ? next.demand : saved.demand,
+      showCursorCredits: has.credits ? next.credits : saved.credits
     })
+  }
+
+  function toggleAntigravityPool(id) {
+    var saved = antigravityPoolFlags()
+    var shown = antigravityShownFlags()
+    var next = Model.toggleAntigravityPool(shown, id)
+    if (next.gemini === shown.gemini && next.third_party === shown.third_party) return
+    var has = typeof Model.antigravityPoolPresence === "function"
+      ? Model.antigravityPoolPresence(entry)
+      : { gemini: true, third_party: true }
+    persistWidgetSettings({
+      showAntigravityGemini: has.gemini ? next.gemini : saved.gemini,
+      showAntigravityClaudeGpt: has.third_party ? next.third_party : saved.third_party
+    })
+  }
+
+  function providerPoolButtons() {
+    return antigravityEntry ? antigravityPoolButtons() : cursorPoolButtons()
+  }
+
+  function providerPoolOn(id) {
+    return antigravityEntry ? antigravityPoolOn(id) : cursorPoolOn(id)
+  }
+
+  function providerPoolCanTurnOff(id) {
+    return antigravityEntry ? antigravityPoolCanTurnOff(id) : cursorPoolCanTurnOff(id)
+  }
+
+  function toggleProviderPool(id) {
+    if (antigravityEntry) toggleAntigravityPool(id)
+    else toggleCursorPool(id)
   }
 
   function entryIsAlarming(item) {
     if (!item) return false
-    if (isCursorEntry(item) && typeof Model.cursorDualHeadline === "function") {
-      var dual = Model.cursorDualHeadline(item, cursorPoolFlags())
-      // Brand / active chrome only when every visible Cursor pool is critical.
-      // A lone exhausted pool still paints that segment red when colour-coding
-      // is off; it must not tint the icon while another pool is still fine.
+    var dual = providerDualHeadline(item)
+    if (isCursorEntry(item) || isAntigravityEntry(item)) {
       if (dual) return dual.allCritical === true
     }
     return Model.isAlarming(item)
   }
 
   function shownAlarming() {
-    return entryIsAlarming(entry)
+    return entryIsAlarming(shapedEntry)
   }
 
   function shownAnyAlarming() {
-    for (var i = 0; i < visibleEntries.length; i++)
-      if (entryIsAlarming(visibleEntries[i])) return true
+    for (var i = 0; i < shapedEntries.length; i++)
+      if (entryIsAlarming(shapedEntries[i])) return true
     return false
   }
 
@@ -397,12 +552,12 @@ Panel {
   }
 
   function statusMessage() {
-    if (filterMiss) return "No configured entry matches ‘" + configuredProvider + "’. Clear the provider setting or use an id from ai-usagebar usage --json."
+    if (filterMiss) return root.tr("status.filter_miss", { id: configuredProvider })
     if (entry && entry.error !== "") return entry.error
     if (loadError !== "") return entries.length > 0
-      ? "Refresh failed; showing the previous report. " + loadError
+      ? root.tr("status.refresh_failed", { error: loadError })
       : loadError
-    if (entry && entry.stale) return "Cached data · the provider could not supply a fresh response."
+    if (entry && entry.stale) return root.tr("status.cached")
     return ""
   }
 
@@ -411,20 +566,86 @@ Panel {
   }
 
   function heroMeta() {
-    if (!entry) return loading ? "Loading providers" : "Usage report"
-    if (entry.error !== "") return "Provider unavailable"
-    var text = entry.plan || "Usage and limits"
-    if (entry.stale) text += " · cached"
+    if (!entry) return loading ? root.tr("hero.loading") : root.tr("hero.usage_report")
+    if (entry.error !== "") return root.tr("hero.provider_unavailable")
+    var text = entry.plan || root.tr("hero.usage_limits")
+    if (entry.stale) text += " · " + root.tr("tip.cached")
     return Model.autoTextSafe(text)
   }
 
-  // Cursor reports two model pools, and the bar must show both. Reading the
-  // sections here keeps the chip correct even when a hot reload is still
-  // holding an older copy of Model.js, which only kept the higher pool.
+  // A credit grant is a metric beside the two model pools. The bar and its
+  // hover read it here, so a headline that only knows the pools still shows it.
+  function creditGrantBits(item) {
+    var sections = item && item.sections ? item.sections : []
+    var bits = []
+    for (var i = 0; i < sections.length; i++) {
+      var row = sections[i]
+      if (!row || row.type !== "metric") continue
+      var label = String(row.label || "")
+      if (label === "" || label === "Cursor Models" || label === "Other Models") continue
+      if (row.percent === null || row.percent === undefined || row.percent === "") continue
+      bits.push({
+        text: Model.percentText(row.percent, showAs),
+        line: label + " · " + Model.percentText(row.percent, showAs),
+        severity: row.severity || "low"
+      })
+    }
+    return bits
+  }
+
+  function withCreditGrants(pools, item) {
+    if (!pools || !showCursorCredits) return pools
+    var grants = creditGrantBits(item)
+    if (grants.length === 0) return pools
+    var text = String(pools.text || "")
+    var tooltip = String(pools.tooltip || pools.text || "")
+    var segments = pools.segments ? pools.segments.slice() : []
+    var tooltipRows = pools.tooltipRows ? pools.tooltipRows.slice() : []
+    if (tooltipRows.length === 0 && tooltip !== "") {
+      var prior = tooltip.split("\n")
+      for (var p = 0; p < prior.length; p++) {
+        var priorLine = prior[p].trim()
+        if (priorLine !== "") tooltipRows.push({ text: priorLine, severity: pools.severity || "low" })
+      }
+    }
+    var added = false
+    for (var i = 0; i < grants.length; i++) {
+      var bit = grants[i]
+      var name = bit.line.split(" · ")[0]
+      if (tooltip.indexOf(name + " · ") >= 0) continue
+      added = true
+      text = text === "" ? bit.text : text + " · " + bit.text
+      tooltip = tooltip === "" ? bit.line : tooltip + "\n" + bit.line
+      if (segments.length > 0) {
+        segments.push({ text: " · ", severity: "" })
+        segments.push({ text: bit.text, severity: bit.severity })
+      }
+      tooltipRows.push({ text: bit.line, severity: bit.severity })
+    }
+    if (!added) return pools
+    return {
+      text: text,
+      tooltip: tooltip,
+      severity: pools.severity,
+      allCritical: pools.allCritical === true,
+      segments: segments,
+      tooltipRows: tooltipRows
+    }
+  }
+
+  function providerDualHeadline(item) {
+    if (isAntigravityEntry(item) && typeof Model.antigravityDualHeadline === "function")
+      return Model.antigravityDualHeadline(item, antigravityPoolFlags(), showAs, barWindow)
+    if (isCursorEntry(item) && typeof Model.cursorDualHeadline === "function")
+      return Model.cursorDualHeadline(item, cursorPoolFlags(), showAs)
+    return null
+  }
+
   function cursorPools(item) {
+    var pools = null
     if (typeof Model.cursorDualHeadline === "function") {
-      var dual = Model.cursorDualHeadline(item, cursorPoolFlags())
-      if (dual && dual.text) return {
+      var dual = Model.cursorDualHeadline(item, cursorPoolFlags(), showAs)
+      if (dual && dual.text) pools = {
         text: dual.text,
         tooltip: dual.tooltip || dual.text,
         severity: dual.severity,
@@ -433,71 +654,96 @@ Panel {
         tooltipRows: dual.tooltipRows || []
       }
     }
-    if (!item) return null
-    var id = String(item.id || "")
-    var at = id.indexOf("@")
-    if ((at < 0 ? id : id.slice(0, at)) !== "cursor") return null
-    var sections = item.sections || []
-    var auto = null
-    var api = null
-    for (var i = 0; i < sections.length; i++) {
-      var row = sections[i]
-      if (!row || row.type !== "metric") continue
-      if (row.label === "Cursor Models") auto = row.percent
-      else if (row.label === "Other Models") api = row.percent
+    if (!pools && item) {
+      var id = String(item.id || "")
+      var at = id.indexOf("@")
+      if ((at < 0 ? id : id.slice(0, at)) === "cursor") {
+        var sections = item.sections || []
+        var auto = null
+        var api = null
+        for (var i = 0; i < sections.length; i++) {
+          var row = sections[i]
+          if (!row || row.type !== "metric") continue
+          if (row.label === "Cursor Models") auto = row.percent
+          else if (row.label === "Other Models") api = row.percent
+        }
+        if (auto !== null && api !== null && auto !== undefined && api !== undefined) {
+          // This branch exists for a STALE Model.js during a plugin hot
+          // reload, so it must not call any Model.* helper the fresh panel
+          // code expects — percentText included. Format locally.
+          var fmt = function(p) {
+            var v = (showAs === "left") ? (100 - p) : p
+            return v + "%"
+          }
+          pools = {
+            text: fmt(auto) + " · " + fmt(api),
+            tooltip: "Cursor Models " + fmt(auto)
+              + " · Other Models " + fmt(api),
+            segments: [],
+            tooltipRows: []
+          }
+        }
+      }
     }
-    if (auto === null || api === null || auto === undefined || api === undefined) return null
-    return {
-      text: auto + "% · " + api + "%",
-      tooltip: "Cursor Models " + auto + "% · Other Models " + api + "%",
-      segments: [],
-      tooltipRows: []
-    }
+    return withCreditGrants(pools, item)
+  }
+
+  function providerPools(item) {
+    if (!isAntigravityEntry(item)) return cursorPools(item)
+    var dual = providerDualHeadline(item)
+    return dual && dual.text ? {
+      text: dual.text,
+      tooltip: dual.tooltip || dual.text,
+      severity: dual.severity,
+      allCritical: dual.allCritical === true,
+      segments: dual.segments || [],
+      tooltipRows: dual.tooltipRows || []
+    } : null
   }
 
   function panelHeadline(item) {
-    if (isCursorEntry(item) && typeof Model.cursorDualHeadline === "function") {
-      var dual = Model.cursorDualHeadline(item)
-      if (dual && dual.text) return dual.text
-    }
+    var dual = providerDualHeadline(item)
+    if ((isCursorEntry(item) || isAntigravityEntry(item)) && dual && dual.text) return dual.text
     return usageText(item, false)
   }
 
   function usageText(item, rich) {
-    var pools = cursorPools(item)
+    var pools = providerPools(item)
     if (pools) return rich ? pools.tooltip : pools.text
-    var head = Model.headline(item, barWindow)
+    var head = Model.headline(item, barWindow, showAs)
     return rich ? (head.tooltip || head.text) : head.text
   }
 
   function shownEntries() {
-    if (showAll) return visibleEntries
-    if (entry) return [entry]
-    return visibleEntries.length > 0 ? [visibleEntries[0]] : []
+    if (showAll) return shapedEntries
+    if (shapedEntry) return [shapedEntry]
+    return shapedEntries.length > 0 ? [shapedEntries[0]] : []
   }
 
   readonly property var barChips: labeledChips()
 
   function labeledChips() {
     var chips = Model.barChips(
-      visibleEntries, entry, showAll, showValue, showProvider, loading, alarming, vertical, barWindow)
+      shapedEntries, shapedEntry, showAll, showValue, showProvider, loading, alarming, vertical,
+      barWindow, showAs, brandIcons)
     if (!showValue || vertical) return chips
     var rows = shownEntries()
     var next = []
     for (var i = 0; i < chips.length; i++) {
       var chip = chips[i]
-      var pools = i < rows.length ? cursorPools(rows[i]) : null
+      var pools = i < rows.length ? providerPools(rows[i]) : null
       if (!pools || chip.label === "!") {
         if (chip.label === "!" || i >= rows.length) {
           next.push(chip)
           continue
         }
         // Non-Cursor chips: headline severity drives icon RAG when colour-coding is on.
-        var head = Model.headline(rows[i], barWindow)
+        var head = Model.headline(rows[i], barWindow, showAs)
         next.push({
           id: chip.id,
           brand: chip.brand,
           icon: chip.icon,
+          labelOnly: chip.labelOnly,
           label: chip.label,
           providerPrefix: "",
           alarming: chip.alarming,
@@ -508,7 +754,7 @@ Panel {
       }
       var label = pools.text
       var providerPrefix = ""
-      if (showProvider) {
+      if (showProvider || chip.labelOnly === true) {
         var provider = Model.providerShort(rows[i])
         if (provider !== "") {
           label = provider + " " + label
@@ -529,6 +775,7 @@ Panel {
         id: chip.id,
         brand: chip.brand,
         icon: chip.icon,
+        labelOnly: chip.labelOnly,
         label: label,
         providerPrefix: providerPrefix,
         alarming: chipAlarm,
@@ -541,8 +788,9 @@ Panel {
 
   function barText() {
     if (showAll)
-      return Model.barStrip(visibleEntries, alarming, vertical, showValue, showProvider, loading, barWindow)
-    var value = entry ? usageText(entry, false) : summary.text
+      return Model.barStrip(shapedEntries, alarming, vertical, showValue, showProvider, loading,
+        barWindow, showAs)
+    var value = shapedEntry ? usageText(shapedEntry, false) : summary.text
     return Model.barLabel(alarming, vertical, showValue, loading,
       entry !== null, value, showProvider ? Model.providerShort(entry) : "",
       Model.providerIcon(entry))
@@ -561,51 +809,55 @@ Panel {
   // Colored hover rows when Cursor (or showAll) exposes per-pool severity.
   function tooltipRows() {
     function rowsFor(item) {
-      var pools = cursorPools(item)
+      var pools = providerPools(item)
       if (pools && pools.tooltipRows && pools.tooltipRows.length > 0) {
         var out = []
         for (var r = 0; r < pools.tooltipRows.length; r++) {
           var row = pools.tooltipRows[r]
-          var text = Model.autoTextSafe(row.text || "").trim()
+          var text = ""
+          if (row.pool)
+            text = I18n.tipPoolLine(root.uiLocale, row.pool, Model.shownPercent(row.percent, root.showAs))
+          else
+            text = Model.autoTextSafe(row.text || "").trim()
           if (text === "") continue
           if (item && item.stale && r === pools.tooltipRows.length - 1)
-            text += " · cached"
+            text += " · " + root.tr("tip.cached")
           out.push({ text: text, severity: row.severity || "low" })
         }
         return out
       }
       var lines = tooltipLines(item)
       if (lines.length === 0) return []
-      var head = Model.headline(item, barWindow)
+      var head = Model.headline(item, barWindow, showAs)
       var sev = head && head.severity ? head.severity : "low"
       if (lines.length > 1) {
         var multi = []
         for (var i = 0; i < lines.length; i++) {
           var bit = lines[i]
-          if (item && item.stale && i === lines.length - 1) bit += " · cached"
+          if (item && item.stale && i === lines.length - 1) bit += " · " + root.tr("tip.cached")
           multi.push({ text: bit, severity: sev })
         }
         return multi
       }
       var single = Model.providerName(item)
       if (lines.length === 1) single += " · " + lines[0]
-      if (item && item.stale) single += " · cached"
+      if (item && item.stale) single += " · " + root.tr("tip.cached")
       return [{ text: single, severity: sev }]
     }
 
-    if (showAll && visibleEntries.length > 0) {
+    if (showAll && shapedEntries.length > 0) {
       var chips = []
-      for (var e = 0; e < visibleEntries.length; e++) {
-        var chunk = rowsFor(visibleEntries[e])
+      for (var e = 0; e < shapedEntries.length; e++) {
+        var chunk = rowsFor(shapedEntries[e])
         for (var c = 0; c < chunk.length; c++) chips.push(chunk[c])
       }
       return chips
     }
     if (!entry) {
-      var msg = Model.autoTextSafe(statusMessage() || "AI usage")
+      var msg = Model.autoTextSafe(statusMessage() || root.tr("app.name"))
       return msg !== "" ? [{ text: msg, severity: "" }] : []
     }
-    return rowsFor(entry)
+    return rowsFor(shapedEntry)
   }
 
   readonly property var ragTooltipRows: tooltipRows()
@@ -619,7 +871,7 @@ Panel {
       }
       if (lines.length > 0) return lines.join("\n")
     }
-    return Model.autoTextSafe(statusMessage() || "AI usage")
+    return Model.autoTextSafe(statusMessage() || root.tr("app.name"))
   }
 
   onEntriesChanged: Qt.callLater(syncSelection)
@@ -756,19 +1008,23 @@ Panel {
 
           PanelHero {
             width: parent.width
-            title: root.settingsOpen ? "Settings"
-              : (root.entry ? Model.providerName(root.entry) : "AI usage")
-            meta: root.settingsOpen ? "Display, provider & API keys" : root.heroMeta()
-            detail: root.settingsOpen
-              ? "Existing configuration stays in place until you save."
-              : (root.entry && root.summary.text !== "Ready" ? Model.autoTextSafe(root.panelHeadline(root.entry)) : "")
+            title: root.settingsOpen ? root.tr("hero.settings")
+              : (root.entry ? Model.providerName(root.entry) : root.tr("app.name"))
+            meta: root.settingsOpen ? root.tr("hero.settings_meta") : root.heroMeta()
+            // Long settings copy must not live in the hero detail pill — that
+            // control is a single-line chip and overflows in RU/pt-BR. The
+            // sentence renders as a wrapped caption under the hero instead.
+            detail: root.settingsOpen ? ""
+              : (root.entry && root.summary.text !== "Ready" && root.summary.text !== root.tr("ready")
+                ? Model.autoTextSafe(root.panelHeadline(root.shapedEntry)) : "")
             foreground: root.foreground
             fontFamily: root.fontFamily
 
             iconComponent: Component {
               BrandMark {
-                brand: root.settingsOpen ? "" : Model.brandIconFile(root.entry)
-                fallback: root.settingsOpen ? "󰒓" : Model.providerIcon(root.entry)
+                brand: root.settingsOpen || !root.brandIcons ? "" : Model.brandIconFile(root.entry)
+                fallback: root.settingsOpen ? "󰒓"
+                  : (root.brandIcons ? Model.providerIcon(root.entry) : "󰚩")
                 // Colour-coding: full RAG from worst pool. Off: same aggregate,
                 // binary foreground vs urgent when worst is critical.
                 foreground: root.colorCodeUsage
@@ -787,7 +1043,7 @@ Panel {
                 PanelActionButton {
                   visible: !root.settingsOpen
                   iconText: "󰑐"
-                  tooltipText: "Refresh usage"
+                  tooltipText: root.tr("action.refresh")
                   foreground: root.foreground
                   fontFamily: root.fontFamily
                   enabled: !usageProcess.running
@@ -796,13 +1052,24 @@ Panel {
 
                 PanelActionButton {
                   iconText: root.settingsOpen ? "󰁍" : "󰒓"
-                  tooltipText: root.settingsOpen ? "Back to usage" : "Settings"
+                  tooltipText: root.settingsOpen ? root.tr("action.back") : root.tr("action.settings")
                   foreground: root.foreground
                   fontFamily: root.fontFamily
                   onClicked: root.settingsOpen ? root.closeSettings() : root.openSettings()
                 }
               }
             }
+          }
+
+          Text {
+            visible: root.settingsOpen
+            width: parent.width
+            text: root.tr("hero.settings_detail")
+            textFormat: Text.PlainText
+            color: root.dim
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
+            wrapMode: Text.WordWrap
           }
 
           SettingsView {
@@ -816,13 +1083,22 @@ Panel {
             showProvider: root.showProvider
             showAll: root.showAll
             colorCodeUsage: root.colorCodeUsage
+            uiLocale: root.uiLocale
+            uiLocaleSetting: root.uiLocaleSetting
             barWindow: root.barWindow
+            showAs: root.showAs
+            brandIcons: root.brandIcons
+            metricEntries: root.metricEntries
             onSaved: root.startRefresh()
             onShowValueRequested: function(enabled) { root.setShowValue(enabled) }
             onShowProviderRequested: function(enabled) { root.setShowProvider(enabled) }
             onShowAllRequested: function(enabled) { root.setShowAll(enabled) }
             onColorCodeUsageRequested: function(enabled) { root.setColorCodeUsage(enabled) }
+            onUiLocaleRequested: function(value) { root.setUiLocale(value) }
             onBarWindowRequested: function(value) { root.setBarWindow(value) }
+            onShowAsRequested: function(value) { root.setShowAs(value) }
+            onMetricToggleRequested: function(entryId, key) { root.setMetricShown(entryId, key) }
+            onBrandIconsRequested: function(enabled) { root.setBrandIcons(enabled) }
             onFallbackRequested: root.openTerminalSettings()
             onNousLoginRequested: root.openNousLogin()
             onCopilotLoginRequested: root.openCopilotLogin()
@@ -869,14 +1145,14 @@ Panel {
 
           Flow {
             id: cursorPoolToggles
-            visible: !root.settingsOpen && root.cursorEntry
+            visible: !root.settingsOpen && (root.cursorEntry || root.antigravityEntry)
             width: parent.width
             height: visible ? childrenRect.height : 0
             flow: Flow.LeftToRight
             spacing: Style.spacing.md
 
             Repeater {
-              model: root.cursorPoolButtons()
+              model: root.providerPoolButtons()
 
               delegate: Button {
                 required property var modelData
@@ -884,14 +1160,14 @@ Panel {
                 height: Style.spacing.controlHeight
                 width: implicitWidth
                 text: modelData.label
-                selected: root.cursorPoolOn(modelData.poolId)
-                enabled: root.cursorPoolCanTurnOff(modelData.poolId) || !root.cursorPoolOn(modelData.poolId)
+                selected: root.providerPoolOn(modelData.poolId)
+                enabled: root.providerPoolCanTurnOff(modelData.poolId) || !root.providerPoolOn(modelData.poolId)
                 bordered: true
                 foreground: root.foreground
                 fontFamily: root.fontFamily
                 fontSize: Style.font.bodySmall
                 verticalPadding: Style.spacing.controlPaddingY
-                onClicked: root.toggleCursorPool(modelData.poolId)
+                onClicked: root.toggleProviderPool(modelData.poolId)
               }
             }
           }
@@ -927,14 +1203,14 @@ Panel {
             spacing: Style.space(8)
 
             PanelSectionHeader {
-              text: "USAGE"
+              text: root.tr("section.usage")
               foreground: root.foreground
               fontFamily: root.fontFamily
             }
 
             Text {
               width: parent.width
-              text: "Collecting configured providers…"
+              text: root.tr("loading.providers")
               color: root.dim
               font.family: root.fontFamily
               font.pixelSize: Style.font.body
@@ -954,7 +1230,7 @@ Panel {
             }
 
             PanelSectionHeader {
-              text: "USAGE & BALANCE"
+              text: root.tr("section.usage_balance")
               foreground: root.foreground
               fontFamily: root.fontFamily
             }
@@ -1002,7 +1278,7 @@ Panel {
             visible: !root.settingsOpen && !root.loading && !root.entry && root.statusMessage() === ""
             width: parent.width
             topPadding: Style.space(20)
-            text: "No configured provider reported usage."
+            text: root.tr("empty.no_usage")
             color: root.dim
             font.family: root.fontFamily
             font.pixelSize: Style.font.body
@@ -1014,7 +1290,7 @@ Panel {
             visible: !root.settingsOpen && root.entryFetchedAt !== ""
             width: parent.width
             topPadding: Style.space(2)
-            text: Model.formatUpdated(root.entryFetchedAt, root.nowMs)
+            text: I18n.formatUpdated(root.entryFetchedAt, root.nowMs, root.uiLocale)
               + (usageProcess.running ? " · refreshing…" : "")
             color: root.dim
             font.family: root.fontFamily
@@ -1045,8 +1321,13 @@ Panel {
       ? root.alpha(root.foreground, 0.38)
       : metricRow.ragColor
     readonly property int indent: grouped ? Style.space(10) : 0
-    readonly property string detailText: Model.metricDetail(row)
-    readonly property string resetText: row ? Model.formatReset(row.reset_at, root.nowMs) : ""
+    readonly property string detailText: I18n.displayDetail(root.uiLocale, Model.metricDetail(row))
+    readonly property string resetText: row ? I18n.formatReset(row.reset_at, root.nowMs, root.uiLocale) : ""
+    readonly property int shownPercent: row ? Model.shownPercent(row.percent, root.showAs) : 0
+    readonly property var valueView: Model.metricValueView(row, root.showAs)
+    readonly property string valueText: valueView.left
+      ? I18n.t(root.uiLocale, "metric.left", { percent: valueView.percent })
+      : valueView.text
 
     spacing: Style.space(grouped ? 4 : 6)
 
@@ -1056,7 +1337,7 @@ Panel {
 
       Text {
         id: metricLabel
-        text: metricRow.row ? metricRow.row.label : ""
+        text: metricRow.row ? I18n.displayLabel(root.uiLocale, metricRow.row.label) : ""
         textFormat: Text.PlainText
         color: metricRow.labelColor
         font.family: root.fontFamily
@@ -1071,8 +1352,7 @@ Panel {
 
       Text {
         id: metricValue
-        text: metricRow.row && metricRow.row.value !== ""
-          ? metricRow.row.value : (metricRow.row ? metricRow.row.percent + "%" : "")
+        text: metricRow.valueText
         textFormat: Text.PlainText
         color: metricRow.valueColor
         font.family: root.fontFamily
@@ -1100,7 +1380,7 @@ Panel {
         anchors.verticalCenter: meterTrack.verticalCenter
         height: meterTrack.height
         radius: meterTrack.radius
-        width: meterTrack.width * root.clamp(metricRow.row ? metricRow.row.percent / 100 : 0, 0, 1)
+        width: meterTrack.width * root.clamp(metricRow.shownPercent / 100, 0, 1)
         color: metricRow.fillColor
 
         Behavior on width {
@@ -1156,7 +1436,7 @@ Panel {
     Text {
       id: detailLabel
       visible: !detailRow.heading && text !== ""
-      text: detailRow.row ? detailRow.row.label : ""
+      text: detailRow.row ? I18n.displayLabel(root.uiLocale, detailRow.row.label) : ""
       textFormat: Text.PlainText
       color: root.foreground
       font.family: root.fontFamily

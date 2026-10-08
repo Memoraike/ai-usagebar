@@ -25,7 +25,7 @@ Output modes:
     between ticks. Useful while iterating on `--format` or `--tooltip-format`.
   - --json: force JSON output even when stdout is a TTY (for scripting).
   - --config PATH: read and write an alternate config file instead of the
-    default `%APPDATA%/ai-usagebar/config.toml` (Windows) or
+    default `%APPDATA%/ai-usagebar/config/config.toml` (Windows) or
     `~/.config/ai-usagebar/config.toml`. Accepted in any position, before or
     after the subcommand; the file must already exist, and Settings saves
     write back to it."
@@ -122,8 +122,8 @@ pub struct Cli {
     pub creds_path: Option<std::path::PathBuf>,
 
     /// Select a named Claude, Codex (OpenAI), or API-key vendor (Z.AI,
-    /// OpenRouter, DeepSeek, Kilo, Novita, Moonshot, Grok, MiniMax, OrcaRouter)
-    /// account from the matching `[[...accounts]]` config array. Without it,
+    /// OpenRouter, DeepSeek, Kilo, Novita, Moonshot, Grok, MiniMax, OrcaRouter,
+    /// Lyceum) account from the matching `[[...accounts]]` config array. Without it,
     /// the vendor's default account
     /// and original cache path are unchanged. For Claude it conflicts with the
     /// lower-level `--creds-path` because both select a credential source.
@@ -424,6 +424,8 @@ pub enum Vendor {
     OrcaRouter,
     #[value(name = "modelstudio")]
     ModelStudio,
+    Lyceum,
+    Devin,
 }
 
 impl Vendor {
@@ -454,6 +456,8 @@ impl Vendor {
             Vendor::Ollama => crate::vendor::VendorId::Ollama,
             Vendor::OrcaRouter => crate::vendor::VendorId::OrcaRouter,
             Vendor::ModelStudio => crate::vendor::VendorId::ModelStudio,
+            Vendor::Lyceum => crate::vendor::VendorId::Lyceum,
+            Vendor::Devin => crate::vendor::VendorId::Devin,
         }
     }
 }
@@ -551,6 +555,8 @@ fn id_to_vendor(id: crate::vendor::VendorId) -> Vendor {
         crate::vendor::VendorId::Ollama => Vendor::Ollama,
         crate::vendor::VendorId::OrcaRouter => Vendor::OrcaRouter,
         crate::vendor::VendorId::ModelStudio => Vendor::ModelStudio,
+        crate::vendor::VendorId::Lyceum => Vendor::Lyceum,
+        crate::vendor::VendorId::Devin => Vendor::Devin,
     }
 }
 

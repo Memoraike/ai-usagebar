@@ -13,7 +13,46 @@ use std::time::Duration;
 
 use chrono::{DateTime, Local, Utc};
 
-use crate::usage::{ResetCredit, ResetCredits};
+use crate::countdown;
+use crate::pacing;
+use crate::usage::{ResetCredit, ResetCredits, UsageWindow};
+use crate::vendor::RenderOpts;
+
+/// The five per-window placeholder values every windowed renderer registers
+/// (`pct`, `reset`, `elapsed` and the two pace glyphs). A window the account
+/// does not report yields empty strings, the missing-placeholder convention.
+#[derive(Default)]
+pub struct WindowPlaceholders {
+    pub pct: String,
+    pub reset: String,
+    pub elapsed: String,
+    pub ratio_pace: String,
+    pub point_pace: String,
+}
+
+pub fn window_placeholders(
+    window: Option<&UsageWindow>,
+    opts: &RenderOpts,
+    now: DateTime<Utc>,
+) -> WindowPlaceholders {
+    let Some(window) = window else {
+        return WindowPlaceholders::default();
+    };
+    let pace = pacing::calc(
+        window.utilization_pct,
+        window.resets_at,
+        now,
+        window.window_duration,
+        opts.pace_tolerance,
+    );
+    WindowPlaceholders {
+        pct: window.utilization_pct.to_string(),
+        reset: countdown::format(window.resets_at, now),
+        elapsed: pace.elapsed_pct.to_string(),
+        ratio_pace: pace.ratio_pace.glyph().to_string(),
+        point_pace: pace.point_pace.glyph().to_string(),
+    }
+}
 
 /// A monetary amount, with the sign outside the symbol. `format!("${v:.2}")`
 /// puts it inside — `$-5.71` — which reads as a typo rather than as debt, and
@@ -175,6 +214,96 @@ fn reset_credit_line(credit: &ResetCredit, now: DateTime<Utc>) -> String {
     }
 }
 
+/// The spending-page pair for one Cursor credit grant: `$21.00/$25.00
+/// remaining`, plus the expiry when the grant has one.
+///
+/// Money goes through [`crate::usage::fmt_minor`] so the sign and the dollar
+/// symbol match every other USD figure. The date is the local clock time, the
+/// same way a banked reset is written.
+pub fn cursor_credit_line(
+    remaining_cents: i64,
+    total_cents: i64,
+    expires_at: Option<DateTime<Utc>>,
+    now: DateTime<Utc>,
+) -> String {
+    let pair = format!(
+        "{}/{}",
+        crate::usage::fmt_minor(remaining_cents, 2, Some("USD")),
+        crate::usage::fmt_minor(total_cents, 2, Some("USD"))
+    );
+    let balance = format!("{pair} remaining");
+    match credit_expiry_clause(expires_at, now) {
+        Some(clause) => format!("{balance} · {clause}"),
+        None => balance,
+    }
+}
+
+/// The grant as the same meter On-Demand uses: remaining dollars beside a bar
+/// of how much of the grant is already spent, with that spend in the caption.
+///
+/// `(used percent, remaining dollars, caption)`. The percent is half-up, the
+/// same rounding as a usage bar, and it stays within 0–100 because a grant
+/// cannot be spent past its own total.
+pub fn cursor_credit_meter(
+    remaining_cents: i64,
+    total_cents: i64,
+    expires_at: Option<DateTime<Utc>>,
+    now: DateTime<Utc>,
+) -> (u16, String, String) {
+    let total = total_cents.max(0);
+    let remaining = remaining_cents.max(0).min(total);
+    let spent = total.saturating_sub(remaining);
+    let pct = if total <= 0 {
+        0
+    } else {
+        let rounded = (i128::from(spent) * 100 + i128::from(total) / 2) / i128::from(total);
+        u16::try_from(rounded).unwrap_or(100).min(100)
+    };
+    let mut caption = format!(
+        "{} of {} used ({pct}%)",
+        crate::usage::fmt_minor(spent, 2, Some("USD")),
+        crate::usage::fmt_minor(total, 2, Some("USD"))
+    );
+    if let Some(clause) = credit_expiry_clause(expires_at, now) {
+        caption.push_str(" · ");
+        caption.push_str(&clause);
+    }
+    (
+        pct,
+        crate::usage::fmt_minor(remaining, 2, Some("USD")),
+        caption,
+    )
+}
+
+fn credit_expiry_clause(expires_at: Option<DateTime<Utc>>, now: DateTime<Utc>) -> Option<String> {
+    match expires_at {
+        Some(expires) if expires <= now => Some(format!("expired {}", local_date_hm(expires))),
+        Some(expires) => Some(format!(
+            "expires {} ({})",
+            local_date_hm(expires),
+            crate::countdown::format(Some(expires), now)
+        )),
+        None => None,
+    }
+}
+
+/// The title Cursor puts on the grant.
+///
+/// The spending card is "Credits". The IDE banner says "Use your $N free
+/// credits", or names a scoped product ("Cursor Grok 4.6 Credit", "Cloud
+/// Agent Credits", "Bugbot Credit"). `display_name` is that product title
+/// when it says "credit". A server label that does not ("Power user grant")
+/// and a `grant_type` such as "promo" are not the words on those screens, so
+/// the row says "Credits".
+pub fn cursor_credit_label(display_name: &str) -> String {
+    let name = display_name.trim();
+    if name.to_lowercase().contains("credit") {
+        name.to_string()
+    } else {
+        "Credits".to_string()
+    }
+}
+
 pub fn updated_at_hm(now: DateTime<Utc>, cache_age: Option<Duration>) -> String {
     match cache_age {
         Some(age) => local_time_hm(now - chrono::Duration::from_std(age).unwrap_or_default()),
@@ -238,6 +367,30 @@ mod tests {
     /// The doc example above is not a CI gate — `.github/workflows/ci.yml` runs
     /// `cargo test --all-targets`, which skips doctests — so the rule every
     /// gauge in the app clamps through is asserted here as well.
+    #[test]
+    fn a_grant_is_titled_the_way_cursor_titles_it() {
+        assert_eq!(cursor_credit_label(""), "Credits");
+        assert_eq!(cursor_credit_label("Power user grant"), "Credits");
+        assert_eq!(cursor_credit_label("promo"), "Credits");
+        assert_eq!(
+            cursor_credit_label("Cursor Grok 4.6 Credit"),
+            "Cursor Grok 4.6 Credit"
+        );
+        assert_eq!(
+            cursor_credit_label("Cloud Agent Credits"),
+            "Cloud Agent Credits"
+        );
+    }
+
+    #[test]
+    fn a_spent_grant_stays_a_full_meter() {
+        let now = DateTime::from_timestamp(1_700_000_000, 0).unwrap();
+        let (pct, value, caption) = cursor_credit_meter(0, 2500, None, now);
+        assert_eq!(pct, 100);
+        assert_eq!(value, "$0.00");
+        assert_eq!(caption, "$25.00 of $25.00 used (100%)");
+    }
+
     #[test]
     fn a_percentage_is_rounded_held_to_the_meter_and_nan_safe() {
         assert_eq!(clamp_pct(0.0), 0);

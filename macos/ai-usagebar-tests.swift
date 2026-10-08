@@ -218,6 +218,21 @@ func testParserBalances() {
         (0...max).map { set[$0] ?? "" }
     }
 
+    let grokbot = snapshot(FORMAT, vendor: "grokbot",
+                          fields: fields(through: 16, set: [0: "Cursor Ultra", 3: "70", 4: "5d 0h", 14: "50", 16: "gbt"]))
+    assertEqual(grokbot?.weekly?.pct, 70, "grokbot weekly usage")
+    assertEqual(grokbot?.weekly?.elapsed, 50, "grokbot elapsed alias drives the marker")
+    assertNil(grokbot?.session, "grokbot does not fabricate a session")
+    let grokbotMissingReset = snapshot(FORMAT, vendor: "grokbot",
+                                     fields: fields(through: 16, set: [3: "70", 4: "—", 14: "0", 16: "gbt"]))
+    assertNil(grokbotMissingReset?.weekly?.elapsed, "grokbot missing reset has no marker")
+    let grokbotMissingPeriod = snapshot(FORMAT, vendor: "grokbot",
+                                      fields: fields(through: 16, set: [3: "70", 4: "5d 0h", 16: "gbt"]))
+    assertNil(grokbotMissingPeriod?.weekly?.elapsed, "grokbot missing period has no marker")
+    let grokbotNoAllowance = snapshot(FORMAT, vendor: "grokbot",
+                                    fields: fields(through: 16, set: [0: "Grok Bot Plan", 16: "gbt"]))
+    assertNil(grokbotNoAllowance?.weekly, "grokbot no allowance has no weekly meter")
+
     // OpenRouter: balance at 17, vendor_short "opr".
     let opr = snapshot(FORMAT, vendor: "openrouter",
                        fields: fields(through: 17, set: [16: "opr", 17: "$12.34"]))
@@ -243,6 +258,18 @@ func testParserBalances() {
     let moon = snapshot(FORMAT, vendor: "moonshot",
                         fields: fields(through: 21, set: [21: "¥42.00"]))
     assertEqual(moon?.creditBalance, "¥42.00", "moonshot balance via km_balance")
+
+    // Lyceum: balance at 52 (appended after oll_monthly, keeping indices stable).
+    let lyc = snapshot(FORMAT, vendor: "lyceum",
+                       fields: fields(through: 52, set: [52: "$7.77"]))
+    assertEqual(lyc?.creditBalance, "$7.77", "lyceum balance via lyceum_balance")
+    assertEqual(lyc?.hasUsageWindows, false, "lyceum suppresses 5h/7d windows")
+
+    // DeepInfra: balance at 53 (appended after lyceum_balance, keeping indices stable).
+    let dif = snapshot(FORMAT, vendor: "deepinfra",
+                       fields: fields(through: 53, set: [53: "$15.50"]))
+    assertEqual(dif?.creditBalance, "$15.50", "deepinfra balance via dif_balance")
+    assertEqual(dif?.hasUsageWindows, false, "deepinfra suppresses 5h/7d windows")
     assertEqual(moon?.hasUsageWindows, false, "moonshot suppresses 5h/7d windows")
 
     // Grok: balance at 22.
@@ -291,6 +318,23 @@ func testParserBalances() {
     assertEqual(cur?.weeklyLabel, "Other Models", "cursor relabels the weekly bar")
     assertEqual(cur?.sessionTag, "auto", "cursor session tag")
     assertEqual(cur?.weeklyTag, "premium", "cursor weekly tag")
+
+    // Both pools share the billing cycle, so the one elapsed share the widget
+    // prints on the session and weekly aliases places both pace markers. A
+    // cycle of unknown length prints no elapsed and draws no marker.
+    let curPaced = snapshot(FORMAT, vendor: "cursor",
+                            fields: fields(through: 16, set: [
+                               0: "Cursor Ultra", 1: "70", 2: "5d 0h", 3: "30", 4: "5d 0h",
+                               13: "50", 14: "50", 16: "cur"
+                            ]))
+    assertEqual(curPaced?.session?.elapsed, 50, "cursor Cursor Models marker follows the cycle")
+    assertEqual(curPaced?.weekly?.elapsed, 50, "cursor Other Models marker follows the cycle")
+    let curUnstated = snapshot(FORMAT, vendor: "cursor",
+                               fields: fields(through: 16, set: [
+                                  0: "Cursor Ultra", 1: "70", 2: "5d 0h", 3: "30", 4: "5d 0h", 16: "cur"
+                               ]))
+    assertNil(curUnstated?.session?.elapsed, "cursor with no exact cycle has no session marker")
+    assertNil(curUnstated?.weekly?.elapsed, "cursor with no exact cycle has no weekly marker")
 
     // Antigravity has two independent model pools, each with a 5h and weekly
     // window. The fourth window reuses `extra_pct`, but it is not a spend bar:
@@ -467,6 +511,33 @@ func testParserBalances() {
     assertEqual(ollama?.weekly?.pct, 23, "ollama weekly pct")
     assertEqual(ollama?.weeklyLabel, "Weekly", "ollama weekly label")
     assertEqual(ollama?.weekly?.elapsed, 45, "ollama weekly elapsed")
+    assertNil(ollama?.sonnet, "session/weekly ollama has no monthly bar")
+
+    // Monthly-only shape: session/weekly placeholders stay empty (not "0"),
+    // monthly rides the primary bar. A present window at 0% used is still 0.
+    let ollamaMonthly = snapshot(FORMAT, vendor: "ollama",
+                                 fields: fields(through: 51, set: [
+                                    0: "pro", 16: "oll", 50: "42", 51: "—"
+                                 ]))
+    assertEqual(ollamaMonthly?.hasUsageWindows, true, "ollama monthly shows a window")
+    assertEqual(ollamaMonthly?.session?.pct, 42, "ollama monthly pct on the primary bar")
+    assertEqual(ollamaMonthly?.sessionLabel, "Monthly", "ollama monthly label")
+    assertEqual(ollamaMonthly?.sessionTag, "mo", "ollama monthly tag")
+    assertNil(ollamaMonthly?.weekly, "ollama monthly suppresses fake 5h/7d")
+    assertNil(ollamaMonthly?.sonnet, "ollama monthly is not a third-slot bar")
+
+    let ollamaMonthlyZero = snapshot(FORMAT, vendor: "ollama",
+                                     fields: fields(through: 51, set: [
+                                        0: "pro", 16: "oll", 50: "0"
+                                     ]))
+    assertEqual(ollamaMonthlyZero?.session?.pct, 0, "present 0% monthly is real usage")
+    assertEqual(ollamaMonthlyZero?.sessionLabel, "Monthly", "zero monthly keeps the label")
+    assertNil(ollamaMonthlyZero?.weekly, "zero monthly still has no 5h/7d")
+
+    let ollamaEmpty = snapshot(FORMAT, vendor: "ollama",
+                               fields: fields(through: 16, set: [0: "pro", 16: "oll"]))
+    assertNil(ollamaEmpty?.session, "omitted windows are not 0% session")
+    assertNil(ollamaEmpty?.weekly, "omitted windows are not 0% weekly")
 
     let sgk = snapshot(FORMAT, vendor: "supergrok",
                        fields: fields(through: 40, set: [
@@ -704,6 +775,19 @@ func testCompactToggle() {
                 "past the threshold → %-text regardless")
     assertEqual(overviewUsesBars(count: 4, barsMax: 4, compact: false), true,
                 "boundary: exactly barsMax still draws bars")
+}
+
+func testMenuLabelWidth() {
+    print("menuLabelWidth")
+    assertEqual(menuLabelWidth([]), 12, "no labels keeps the 12-column floor")
+    assertEqual(menuLabelWidth(["Session", "Weekly"]), 12, "short labels keep the floor")
+    // Cursor's pools: the 13-char label sets the column for the 12-char one.
+    assertEqual(menuLabelWidth(["Cursor Models", "Other Models"]), 14,
+                "a longer label widens the column for its siblings, plus one space")
+    assertEqual(menuLabelWidth(["Other Models"]), 13, "a 12-char label still keeps a gap")
+    assertEqual(rightAligned("49%", width: 4), " 49%", "a shorter value is padded on the left")
+    assertEqual(rightAligned("100%", width: 4), "100%", "the widest value is untouched")
+    assertEqual(rightAligned("1000%", width: 4), "1000%", "a wider value is never cut")
 }
 
 func testShortReset() {
@@ -1091,6 +1175,10 @@ func testApiKeyAccounts() {
                 "Preferences includes named API-key accounts")
     assertEqual(accountLabels(inTOML: "[[kilo.accounts]]\nlabel = \"team\"\n", vendor: "kilo"), ["team"],
                 "any vendor's array is parsed")
+    assertEqual(API_KEY_ACCOUNT_VENDORS.contains("deepinfra"), true,
+                "deepinfra is in API_KEY_ACCOUNT_VENDORS")
+    assertEqual(API_KEY_ACCOUNT_VENDORS.count, 11,
+                "eleven API-key account vendors match Rust Config::API_KEY_ACCOUNT_VENDORS")
 }
 
 func testEnableVendorCommand() {
@@ -1144,6 +1232,7 @@ struct TestRunner {
         testClaudeAccounts()
         testDesktopAccounts()
         testCompactToggle()
+        testMenuLabelWidth()
         testShortReset()
         testResetSeconds()
         testResetClockLabel()

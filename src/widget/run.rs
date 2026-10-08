@@ -23,6 +23,7 @@ use crate::grokbot;
 use crate::kilo;
 use crate::kimi;
 use crate::kiro;
+use crate::lyceum;
 use crate::minimax;
 use crate::modelstudio;
 use crate::moonshot;
@@ -172,7 +173,9 @@ async fn build_output(cli: &Cli) -> Result<WaybarOutput> {
         Vendor::CommandCode => commandcode_output(cli, &config).await,
         Vendor::Ollama => ollama_output(cli, &config).await,
         Vendor::OrcaRouter => orcarouter_output(cli, &config).await,
+        Vendor::Lyceum => lyceum_output(cli, &config).await,
         Vendor::ModelStudio => modelstudio_output(cli, &config).await,
+        Vendor::Devin => devin_output(cli, &config).await,
     }
 }
 
@@ -617,6 +620,28 @@ async fn novita_output(cli: &Cli, config: &Config) -> Result<WaybarOutput> {
     ))
 }
 
+async fn lyceum_output(cli: &Cli, config: &Config) -> Result<WaybarOutput> {
+    let (api_key, cache) = api_key_target(cli, config, VendorId::Lyceum)?;
+    let client = http_client()?;
+    let outcome = match lyceum::fetch::fetch_snapshot(&client, &api_key, &cache, DEFAULT_TTL).await
+    {
+        Ok(outcome) => outcome,
+        Err(error) if error.is_transient() => {
+            return Ok(WaybarOutput::loading(cli.icon.as_deref()));
+        }
+        Err(error) => return Err(error),
+    };
+    let snapshot = outcome.snapshot.clone();
+    let vendor_outcome: crate::vendor::VendorOutcome = outcome.into();
+    Ok(lyceum::vendor::render(
+        &vendor_outcome,
+        &snapshot,
+        &theme_from_cli(cli),
+        &RenderOpts::from_cli(cli),
+        Utc::now(),
+    ))
+}
+
 async fn kilo_output(cli: &Cli, config: &Config) -> Result<WaybarOutput> {
     let (api_key, cache) = api_key_target(cli, config, VendorId::Kilo)?;
     let client = http_client()?;
@@ -793,11 +818,13 @@ async fn zai_output(cli: &Cli, config: &Config) -> Result<WaybarOutput> {
 
 async fn openrouter_output(cli: &Cli, config: &Config) -> Result<WaybarOutput> {
     let (api_key, cache) = api_key_target(cli, config, VendorId::Openrouter)?;
+    let management_key = config.openrouter_management_key(cli.account.as_deref());
     let client = http_client()?;
     let endpoints = openrouter::fetch::Endpoints::default();
     let outcome = match openrouter::fetch_snapshot(
         &client,
         &api_key,
+        management_key.as_deref(),
         &cache,
         &endpoints,
         DEFAULT_TTL,
@@ -983,6 +1010,29 @@ async fn modelstudio_output(cli: &Cli, config: &Config) -> Result<WaybarOutput> 
     ))
 }
 
+async fn devin_output(cli: &Cli, config: &Config) -> Result<WaybarOutput> {
+    let cache = vendor_cache(cli, "devin")?;
+    let outcome =
+        match crate::devin::fetch::fetch_snapshot(&config.devin, &cache, DEFAULT_TTL).await {
+            Ok(outcome) => outcome,
+            Err(error) if error.is_transient() => {
+                return Ok(WaybarOutput::loading(cli.icon.as_deref()));
+            }
+            Err(error) => return Err(error),
+        };
+    let theme = theme_from_cli(cli);
+    let snapshot = outcome.snapshot.clone();
+    let vendor_outcome: VendorOutcome = outcome.into();
+    let opts = RenderOpts::from_cli(cli);
+    Ok(crate::devin::vendor::render(
+        &vendor_outcome,
+        &snapshot,
+        &theme,
+        &opts,
+        chrono::Utc::now(),
+    ))
+}
+
 async fn anthropic_output(cli: &Cli, config: &Config) -> Result<WaybarOutput> {
     let client = http_client()?;
     let (creds_target, cache) = anthropic_target(cli, config)?;
@@ -1009,6 +1059,9 @@ fn render_with_theme(outcome: &FetchOutcome, theme: &Theme, cli: &Cli) -> Waybar
         .format
         .clone()
         .unwrap_or_else(|| DEFAULT_FORMAT.to_string());
+    let claude_sessions = crate::claude_sessions::sessions_dir().and_then(|dir| {
+        crate::claude_sessions::scan(&dir, &crate::claude_sessions::ProdLiveness, Utc::now())
+    });
     let input = RenderInput {
         outcome,
         theme,
@@ -1019,6 +1072,7 @@ fn render_with_theme(outcome: &FetchOutcome, theme: &Theme, cli: &Cli) -> Waybar
         format_pace_color: cli.format_pace_color,
         tooltip_pace_pts: cli.tooltip_pace_pts,
         now: Utc::now(),
+        claude_sessions: claude_sessions.as_ref(),
     };
     render_anthropic(&input)
 }
@@ -1400,6 +1454,7 @@ mod tests {
                 label: "work".into(),
                 api_key_env: None,
                 api_key: Some("work-key".into()),
+                management_api_key_env: None,
             });
         config
             .openrouter
@@ -1408,6 +1463,7 @@ mod tests {
                 label: "personal".into(),
                 api_key_env: None,
                 api_key: Some("personal-key".into()),
+                management_api_key_env: None,
             });
         let root = tempfile::tempdir().unwrap();
         let root_str = root.path().to_str().unwrap();
@@ -1469,6 +1525,7 @@ mod tests {
             label: "work".into(),
             api_key_env: None,
             api_key: Some("work-key".into()),
+            management_api_key_env: None,
         });
         let root = tempfile::tempdir().unwrap();
         let root_str = root.path().to_str().unwrap();
