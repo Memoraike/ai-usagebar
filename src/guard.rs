@@ -282,6 +282,168 @@ mod tests {
         std::fs::read_to_string(&path).ok()
     }
 
+    /// Every AUR source array must have a matching sha256sums array of the same
+    /// length, both in PKGBUILDs and .SRCINFO files (#335).
+    ///
+    /// When sources and checksums drift (e.g. adding a detached .sig without a
+    /// matching 'SKIP'), makepkg rejects the package.
+    #[test]
+    fn aur_checksum_arrays_match_source_arrays() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let aur_dir = root.join("packaging/aur");
+        if !aur_dir.exists() {
+            return;
+        }
+
+        for filename in ["PKGBUILD", "PKGBUILD-bin"] {
+            let path = aur_dir.join(filename);
+            let content = match std::fs::read_to_string(&path) {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
+            let sources = count_pkgbuild_arrays(&content, "source");
+            let checksums = count_pkgbuild_arrays(&content, "sha256sums");
+            assert!(
+                !sources.is_empty(),
+                "{filename} must declare at least one source array"
+            );
+            for (src_var, src_len) in &sources {
+                let suffix = src_var.strip_prefix("source").unwrap_or("");
+                let sha_var = format!("sha256sums{suffix}");
+                let sha_len = checksums.get(&sha_var).copied().unwrap_or(0);
+                assert_eq!(
+                    *src_len, sha_len,
+                    "{filename}: {src_var} ({src_len} elements) and \
+                     {sha_var} ({sha_len} elements) differ in length"
+                );
+            }
+            for sha_var in checksums.keys() {
+                let suffix = sha_var.strip_prefix("sha256sums").unwrap_or("");
+                let src_var = format!("source{suffix}");
+                assert!(
+                    sources.contains_key(&src_var),
+                    "{filename}: {sha_var} declared without corresponding {src_var}"
+                );
+            }
+        }
+
+        for filename in [".SRCINFO", ".SRCINFO-bin"] {
+            let path = aur_dir.join(filename);
+            let content = match std::fs::read_to_string(&path) {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
+            let sources = count_srcinfo_lines(&content, "source");
+            let checksums = count_srcinfo_lines(&content, "sha256sums");
+            assert!(
+                !sources.is_empty(),
+                "{filename} must declare at least one source entry"
+            );
+            for (src_key, src_len) in &sources {
+                let suffix = src_key.strip_prefix("source").unwrap_or("");
+                let sha_key = format!("sha256sums{suffix}");
+                let sha_len = checksums.get(&sha_key).copied().unwrap_or(0);
+                assert_eq!(
+                    *src_len, sha_len,
+                    "{filename}: {src_key} ({src_len} lines) and \
+                     {sha_key} ({sha_len} lines) differ in count"
+                );
+            }
+            for sha_key in checksums.keys() {
+                let suffix = sha_key.strip_prefix("sha256sums").unwrap_or("");
+                let src_key = format!("source{suffix}");
+                assert!(
+                    sources.contains_key(&src_key),
+                    "{filename}: {sha_key} declared without corresponding {src_key}"
+                );
+            }
+        }
+    }
+
+    fn count_pkgbuild_arrays(content: &str, prefix: &str) -> BTreeMap<String, usize> {
+        let mut results = BTreeMap::new();
+        let mut in_array: Option<(String, usize)> = None;
+
+        for line in content.lines() {
+            let trimmed = line.trim();
+            if trimmed.starts_with('#') {
+                continue;
+            }
+            if let Some((name, count)) = in_array.as_mut() {
+                let part = trimmed.split('#').next().unwrap_or("").trim();
+                *count += count_quoted_items(part);
+                if part.contains(')') {
+                    results.insert(name.clone(), *count);
+                    in_array = None;
+                }
+            } else if let Some((var_name, rest)) = trimmed.split_once("=(") {
+                let var_name = var_name.trim();
+                if var_name.starts_with(prefix) {
+                    let part = rest.split('#').next().unwrap_or("").trim();
+                    let count = count_quoted_items(part);
+                    if part.contains(')') {
+                        results.insert(var_name.to_string(), count);
+                    } else {
+                        in_array = Some((var_name.to_string(), count));
+                    }
+                }
+            }
+        }
+        results
+    }
+
+    fn count_quoted_items(s: &str) -> usize {
+        let mut count = 0;
+        let mut in_single = false;
+        let mut in_double = false;
+        let mut in_word = false;
+
+        for c in s.chars() {
+            if in_single {
+                if c == '\'' {
+                    in_single = false;
+                    count += 1;
+                }
+            } else if in_double {
+                if c == '"' {
+                    in_double = false;
+                    count += 1;
+                }
+            } else if c == '\'' {
+                in_single = true;
+                in_word = false;
+            } else if c == '"' {
+                in_double = true;
+                in_word = false;
+            } else if c == '(' || c == ')' || c.is_whitespace() {
+                if in_word {
+                    count += 1;
+                    in_word = false;
+                }
+            } else {
+                in_word = true;
+            }
+        }
+        if in_word {
+            count += 1;
+        }
+        count
+    }
+
+    fn count_srcinfo_lines(content: &str, prefix: &str) -> BTreeMap<String, usize> {
+        let mut counts = BTreeMap::new();
+        for line in content.lines() {
+            let trimmed = line.trim();
+            if let Some((key, _)) = trimmed.split_once('=') {
+                let key = key.trim();
+                if key.starts_with(prefix) {
+                    *counts.entry(key.to_string()).or_insert(0) += 1;
+                }
+            }
+        }
+        counts
+    }
+
     /// A `)` inside a message must not end the call early and hide the
     /// argument after it — the shape a scanner that counts every paren misses.
     #[test]

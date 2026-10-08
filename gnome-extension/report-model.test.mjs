@@ -1,9 +1,31 @@
 import assert from 'node:assert/strict';
+import {readFileSync} from 'node:fs';
 import {commandFailure, elapsedPercent, errorLine, finitePercent, formatDuration, formatReset, metricDetail,
     parseReport, projectEntry, summarize, brandSlug} from './report-model.js';
 
 const now = Date.parse('2026-09-24T18:00:00Z');
 const labels = rows => rows.map(row => `${row.type}:${row.label}`);
+
+{
+    const fixture = JSON.parse(readFileSync(new URL('../tests/fixtures/grokbot_paced_report.json', import.meta.url), 'utf8'));
+    const entry = projectEntry(fixture.entries[0], Date.parse('2026-09-25T12:00:00Z'));
+    assert.equal(entry.title, 'Grok Bot');
+    assert.equal(entry.rows[0].elapsed, 50);
+    assert.equal(entry.rows[0].detail, '50% elapsed · 20pts ahead');
+    const missing = projectEntry({...fixture.entries[0], sections: [{...fixture.entries[0].sections[0], window_secs: undefined}]}, now);
+    assert.equal(missing.rows[0].elapsed, null);
+}
+
+{
+    const fixture = JSON.parse(readFileSync(new URL('../tests/fixtures/cursor_paced_report.json', import.meta.url), 'utf8'));
+    const entry = projectEntry(fixture.entries[0], Date.parse('2026-09-25T12:00:00Z'));
+    assert.equal(entry.title, 'Cursor');
+    assert.deepEqual(entry.rows.map(row => row.elapsed), [50, 50]);
+    assert.equal(entry.rows[0].detail, 'Auto + Composer · 50% elapsed · 20pts ahead');
+    assert.equal(entry.rows[1].detail, 'Named / API models · on-demand off · 50% elapsed · 20pts under');
+    const unstated = projectEntry({...fixture.entries[0], sections: fixture.entries[0].sections.map(section => ({...section, window_secs: undefined}))}, now);
+    assert.deepEqual(unstated.rows.map(row => row.elapsed), [null, null]);
+}
 
 assert.equal(finitePercent(37), 37);
 assert.equal(finitePercent('83'), 83);

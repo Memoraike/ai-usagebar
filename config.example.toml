@@ -11,7 +11,7 @@
 # Valid: anthropic | anthropic_api | openai | copilot | zai | openrouter | deepseek
 #        | kimi | kilo | novita | moonshot | grok | supergrok | grokbot | antigravity
 #        | cursor | minimax | kiro | nous | opencode-go | commandcode | ollama
-#        | orcarouter | modelstudio
+#        | orcarouter | modelstudio | lyceum | devin
 # When unset, the TUI opens on the Overview (all vendors at once); set this to
 # open directly on a vendor's tab instead.
 # primary = "anthropic"
@@ -95,7 +95,9 @@
 # popover Settings → Menu Bar.
 # [tray]
 # Global shortcut that opens and closes the popover from any window.
-# Ctrl / Alt / Win plus a key; Shift may be added. Omit for none.
+# Ctrl / Alt / Win plus a key; Shift may be added. Omit for none. On macOS the
+# Command and Option keys are accepted as Cmd/Command and Option, and shown as
+# Cmd/Option.
 # shortcut = "Ctrl+Shift+U"
 # How often the tray re-reads every provider: 1, 5 or 10 minutes; the panel's
 # Refresh button is always immediate.
@@ -104,9 +106,19 @@
 # (banner with an Install button; default) | off (no background checks).
 # updates = "notify"
 # macOS menu bar: "bars" (default) draws the usage chart; "provider" draws each
-# provider's logo followed by its value. Both show the metrics starred in each
-# provider (up to two). Settings → Menu Bar → Menu Bar Shows sets it.
+# provider's logo followed by its value; "quattro" draws one chip, the logo, the
+# short name (cld, cdx, …) and the highest percentage among all the windows of
+# the provider selected in the popover, like the Quattro bar, leaving out any
+# metric hidden in the popover's Customize. Chart shows up to two starred
+# metrics per provider. Logos shows one value per starred provider: the highest
+# used percentage across visible quota windows, just like Name and Quattro auto.
+# In the Left reading this is the lowest remaining percentage. Hidden metrics
+# are excluded. Settings → Menu Bar → Menu Bar Shows sets it.
 # menu_bar_style = "bars"
+# "name", the 1.32.0 spelling of "quattro", is still read as it.
+# The "quattro" chip's short name; false leaves just the logo and the value. A
+# provider with no logo keeps its name. Settings → Menu Bar → Show Short Name.
+# menu_bar_short_name = true
 
 # Quota-threshold desktop notifications, fired after a fresh fetch when a
 # window crosses the threshold (Linux notify-send or macOS Notification Center;
@@ -119,10 +131,13 @@
 # enabled = true    # false turns every quota/expiry notification off
 # threshold = 97    # 1..=100; at 100 only an exhausted window notifies
 
-# Optional, TUI-only monitor for local Claude Code session context. When
-# enabled, press `c` in ai-usagebar-tui. The scanner reads only bounded tails
+# Optional monitor for local Claude Code session context. When enabled, press
+# `c` in ai-usagebar-tui. The scanner reads only bounded tails
 # below ~/.claude/projects, skips subagent transcripts and never follows
-# discovered symlinks. Nothing is read while this remains disabled.
+# discovered symlinks. While enabled, `usage --json` also reports how many of
+# each Claude account's live sessions are working or waiting on you, read from
+# the `sessions/` directory beside its credentials file. Nothing is read while
+# this remains disabled.
 [context]
 enabled = false
 # Where the view docks when opened: full (own screen) | split (beside the
@@ -238,6 +253,11 @@ api_key_env = "ZAI_API_KEY"      # checked first; if set + non-empty, used
 enabled = true
 api_key_env = "OPENROUTER_API_KEY"
 # api_key = "sk-or-v1-..."
+# Optional management key: unlocks the "Recent models" block, which reads
+# /api/v1/activity — an endpoint that rejects the regular inference key.
+# Create one at https://openrouter.ai/settings/management-keys. Unset, the
+# activity request is skipped and the block stays hidden.
+# management_api_key_env = "OPENROUTER_MANAGEMENT_API_KEY"
 # Which number goes on the bar. OpenRouter reports credits purchased against
 # credits used, so it has a denominator of its own and defaults to "percent";
 # "amount" puts the dollar balance there instead. There is deliberately no
@@ -253,9 +273,10 @@ api_key_env = "OPENROUTER_API_KEY"
 # label = "work"
 # api_key_env = "OPENROUTER_WORK_API_KEY"
 # api_key = "sk-or-v1-..."  # optional fallback; chmod 600 when inline
+# management_api_key_env = "OPENROUTER_WORK_MANAGEMENT_API_KEY"  # optional
 #
 # The same array works for [zai], [deepseek], [deepinfra], [kilo], [novita],
-# [moonshot], [grok], [minimax], and [orcarouter] — e.g.
+# [moonshot], [grok], [minimax], [orcarouter], and [lyceum] — e.g.
 # [[deepinfra.accounts]] — with the same show_default_account switch.
 # Region/team/organization/display settings stay per provider. See
 # docs/api-key-accounts.md.
@@ -375,6 +396,15 @@ api_key_env = "NOVITA_API_KEY"     # checked first; if set + non-empty, used
 # display_limit = 200              # tank size in USD; see the group note above
 # headline = "amount"              # "amount" | "percent"
 
+[lyceum]
+# Disabled by default; this reads only the credits endpoint, not inference.
+enabled = false
+api_key_env = "LYCEUM_API_KEY"
+# api_key = "..."                  # fallback; chmod 600 the file if used
+# [[lyceum.accounts]]              # optional named account
+# label = "work"
+# api_key_env = "LYCEUM_WORK_API_KEY"
+
 [orcarouter]
 # Disabled by default — enable once you've set a key (env var or inline).
 # Saving a key in the Settings overlay writes the inline fallback AND flips
@@ -479,7 +509,9 @@ enabled = false
 # no separate login step for ai-usagebar. Shows this billing cycle's two
 # included-usage pools — "Cursor Models" (Auto + Composer) and "Other Models"
 # (named / API) — from the undocumented cursor.com/api/usage-summary endpoint
-# (the same one the Cursor dashboard itself calls).
+# (the same one the Cursor dashboard itself calls). A spending-page credit
+# grant, when the account has one, is read from GetClientVisibleCreditGrants
+# and shown as remaining dollars; an account with no grant shows nothing extra.
 [cursor]
 # Disabled by default — enable once you've signed in to the Cursor IDE at
 # least once (it needs no key from you, but it does need that one-time login
@@ -540,6 +572,12 @@ enabled = false
 # Run `ai-usagebar auth nous login`; logout removes only the Nous entry.
 [nous]
 enabled = false
+# Which number goes on the bar: the consumed percentage of the monthly
+# allocation ("percent", the default) or the credits still usable ("amount"),
+# the way the prepaid-balance vendors do. There is no tank to state — the plan's
+# monthly credits are the percentage's own denominator — and the percentage
+# keeps the meter, the severity colour and the detail line either way.
+# headline = "amount"
 
 # OpenCode Go — usage from /zen/go/v1/usage. Opt in only after exporting the
 # API key under this variable; the key itself is never written to this example.
@@ -574,3 +612,13 @@ enabled = false
 # Override the bl CLI's config directory (default ~/.bailian; the
 # BAILIAN_CONFIG_DIR env var does the same at runtime, and this wins).
 # config_dir = "/home/you/.bailian"
+
+# Devin CLI quota. This reuses the official CLI's existing credentials file
+# read-only: %APPDATA%/devin/credentials.toml on Windows, or
+# ${XDG_DATA_HOME:-~/.local/share}/devin/credentials.toml on Linux and macOS
+# (the CLI's documented paths; macOS is untested here). The token is held in
+# memory for the request only; no login, refresh, or credential write is
+# performed by ai-usagebar.
+[devin]
+enabled = false
+# credentials_path = "/home/you/.local/share/devin/credentials.toml"

@@ -15,7 +15,7 @@ import fcntl
 import time
 from datetime import datetime
 
-from tray_model import metric_display, metric_usage_label, is_not_connected, connection_help, metric_pace, meter_color, report_sections, tr, installed_binary
+from tray_model import metric_display, metric_usage_label, is_not_connected, connection_help, metric_pace, meter_color, report_sections, summary_metric, tr, installed_binary
 
 import gi
 gi.require_version('Gtk', '3.0')
@@ -563,10 +563,9 @@ class AIUsageTrayApp:
         entries = (data or {}).get("entries", [])
         summaries = []
         for entry in entries:
-            metrics = entry.get("metrics") or []
-            if not metrics:
+            metric = summary_metric(entry)
+            if metric is None:
                 continue
-            metric = max(metrics, key=lambda item: item.get("percent") or 0)
             name = entry.get("display_name") or entry.get("name", tr("Provider", "Provedor"))
             suffix = tr(" · stale", " · antigo") if entry.get("stale") else ""
             summaries.append(f"{name}: {metric_display(metric)}{suffix}")

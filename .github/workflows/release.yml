@@ -74,6 +74,96 @@ jobs:
             "$(grep -m1 'pkgver = ' packaging/aur/.SRCINFO | awk '{print $3}')" "$version"
           check ".SRCINFO-bin pkgver" \
             "$(grep -m1 'pkgver = ' packaging/aur/.SRCINFO-bin | awk '{print $3}')" "$version"
+
+          check_pkgbuild_checksum_parity() {
+            local file="$1"
+            (
+              unset "${!source@}" "${!sha256sums@}" 2>/dev/null || true
+              # shellcheck disable=SC1090
+              source "$file"
+              local sub_fail=0
+              local suffixes=()
+              for v in ${!source@}; do
+                suffixes+=("${v#source}")
+              done
+              for v in ${!sha256sums@}; do
+                local sfx="${v#sha256sums}"
+                local seen=0
+                if [ "${#suffixes[@]}" -gt 0 ]; then
+                  for s in "${suffixes[@]}"; do
+                    if [ "$s" = "$sfx" ]; then seen=1; break; fi
+                  done
+                fi
+                if [ "$seen" -eq 0 ]; then suffixes+=("$sfx"); fi
+              done
+              if [ "${#suffixes[@]}" -eq 0 ]; then
+                echo "::error::$file declares no source or sha256sums arrays"
+                exit 1
+              fi
+              for sfx in "${suffixes[@]}"; do
+                local src_var="source$sfx"
+                local sha_var="sha256sums$sfx"
+                local src_len=0
+                local sha_len=0
+                if declare -p "$src_var" &>/dev/null; then
+                  eval "src_len=\${#$src_var[@]}"
+                fi
+                if declare -p "$sha_var" &>/dev/null; then
+                  eval "sha_len=\${#$sha_var[@]}"
+                fi
+                if [ "$src_len" -ne "$sha_len" ]; then
+                  echo "::error::$file: $src_var ($src_len elements) and $sha_var ($sha_len elements) differ in length"
+                  sub_fail=1
+                fi
+              done
+              exit "$sub_fail"
+            ) || fail=1
+          }
+
+          check_srcinfo_checksum_parity() {
+            local file="$1"
+            (
+              local sub_fail=0
+              local keys
+              keys=$(grep -E "^[[:space:]]*(source|sha256sums)(_[a-zA-Z0-9_]+)?[[:space:]]*=" "$file" \
+                | awk -F"=" '{print $1}' | tr -d " \t" | sort -u)
+              local suffixes=()
+              for k in $keys; do
+                local sfx=""
+                if [[ "$k" =~ ^source(_.*)$ ]]; then
+                  sfx="${BASH_REMATCH[1]}"
+                elif [[ "$k" =~ ^sha256sums(_.*)$ ]]; then
+                  sfx="${BASH_REMATCH[1]}"
+                fi
+                local seen=0
+                if [ "${#suffixes[@]}" -gt 0 ]; then
+                  for s in "${suffixes[@]}"; do
+                    if [ "$s" = "$sfx" ]; then seen=1; break; fi
+                  done
+                fi
+                if [ "$seen" -eq 0 ]; then suffixes+=("$sfx"); fi
+              done
+              for sfx in "${suffixes[@]}"; do
+                local src_key="source$sfx"
+                local sha_key="sha256sums$sfx"
+                local src_count
+                src_count=$(grep -c -E "^[[:space:]]*$src_key[[:space:]]*=" "$file" || true)
+                local sha_count
+                sha_count=$(grep -c -E "^[[:space:]]*$sha_key[[:space:]]*=" "$file" || true)
+                if [ "$src_count" -ne "$sha_count" ]; then
+                  echo "::error::$file: $src_key ($src_count lines) and $sha_key ($sha_count lines) differ in count"
+                  sub_fail=1
+                fi
+              done
+              exit "$sub_fail"
+            ) || fail=1
+          }
+
+          check_pkgbuild_checksum_parity packaging/aur/PKGBUILD
+          check_pkgbuild_checksum_parity packaging/aur/PKGBUILD-bin
+          check_srcinfo_checksum_parity packaging/aur/.SRCINFO
+          check_srcinfo_checksum_parity packaging/aur/.SRCINFO-bin
+
           jq -e . packaging/scoop/ai-usagebar.json >/dev/null \
             || { echo "::error::packaging/scoop/ai-usagebar.json is not valid JSON"; fail=1; }
           check "Scoop manifest version" \
@@ -317,6 +407,10 @@ jobs:
             cp "$bins/$bin" "$bin-macos-${{ matrix.arch }}"
             sidecar "$bin-macos-${{ matrix.arch }}"
           done
+          python3 -m unittest discover -s macos -p 'test_package_app.py'
+          version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)
+          python3 macos/package-app.py "$bins" "$STAGE/AI Usage.app" "$version"
+          plutil -lint "$STAGE/AI Usage.app/Contents/Info.plist"
           cp LICENSE README.md config.example.toml "$STAGE/"
           tar czf ${{ matrix.artifact }}.tar.gz -C "$STAGE" .
           sidecar ${{ matrix.artifact }}.tar.gz
@@ -410,12 +504,15 @@ jobs:
             echo
             echo '```bash'
             echo "# Apple Silicon; use ai-usagebar-macos-x86_64.tar.gz on an Intel Mac"
-            echo "mkdir -p ~/.local/bin"
-            echo "curl -fsSL https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/ai-usagebar-macos-aarch64.tar.gz | tar xz -C ~/.local/bin ai-usagebar-tray ai-usagebar ai-usagebar-tui"
-            echo "~/.local/bin/ai-usagebar-tray"
+            echo "curl -fLO https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/ai-usagebar-macos-aarch64.tar.gz"
+            echo "tar xzf ai-usagebar-macos-aarch64.tar.gz './AI Usage.app'"
+            echo '# Quit an existing copy first; use Finder to replace it if already installed.'
+            echo 'mv "AI Usage.app" /Applications/'
+            echo 'open "/Applications/AI Usage.app"'
             echo '```'
             echo
             echo "The menu-bar tray updates itself from later releases (Settings → Updates). The bare *-macos-* assets are what it downloads; they are not needed by hand."
+            echo "Launch the .app so macOS and menu-bar managers can identify it. When migrating from a bare executable, quit it first and toggle Launch at Login off and on in the app to update the saved path."
             echo
             echo "## Checksums (SHA256)"
             echo '```'

@@ -306,6 +306,10 @@ vendor's response shape drifts:
 - `src/context/` — opt-in, bounded reader for local Claude Code JSONL
   transcripts. This format is best-effort and schema-tolerant; tests must use
   `scan_dir(&Path)` with a temp directory and never inspect a real user history.
+  `context/activity.rs` counts working/waiting sessions from each account's
+  `sessions/<pid>.json` (#356), read-only; tests seed a temp directory and pass
+  a fake `ProcessProbe`, never `SystemProbe`, and the report seam is
+  `attach_session_activity_with`, which also takes the live CLI label.
 - `src/tui/settings.rs` — Settings overlay (toml_edit-backed,
   auto-signals waybar after save)
 - `src/tui/panels.rs` — native ratatui per-vendor panels

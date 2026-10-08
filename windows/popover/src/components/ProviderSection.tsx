@@ -55,6 +55,7 @@ import {
   rowKey,
   sendCommand,
   usageGoal,
+  usageGoalPercent,
   visibleRowsFor,
 } from "../model.js";
 
@@ -382,6 +383,8 @@ function UsageMetricRow({ demand, layout, nowMs, onToggleShowAs, row }: MetricRo
   const tick = paceTickPercent(rowPace, layout.showAs);
   const goal = layout.usageGoal ? usageGoal(row, nowMs) : null;
   const goalLabel = goal ? (goal.estimated ? m.estimated_goal_now() : m.goal_now()) : "";
+  // Like the tick, the goal follows the headline's reading so the two numbers compare directly.
+  const goalPercent = usageGoalPercent(goal, layout.showAs) ?? 0;
   return (
     <div className="flex flex-col gap-[var(--row-inner)] px-[var(--card-pad)] py-[var(--pad-bar-row)]">
       <div className="flex items-center gap-[var(--gap-item)]">
@@ -439,7 +442,7 @@ function UsageMetricRow({ demand, layout, nowMs, onToggleShowAs, row }: MetricRo
         <div className="usage-goal mt-[var(--space-sm)]">
           <div className="flex items-center justify-between gap-[var(--gap-controls)] text-[length:var(--sz-badge)] text-label-2 tabular-nums">
             <span>{goalLabel}</span>
-            <strong className="font-semibold">{Math.round(goal.percent)}%</strong>
+            <strong className="font-semibold">{Math.round(goalPercent)}%</strong>
           </div>
           <div
             className="usage-goal-meter mt-[var(--space-2xs)]"
@@ -447,9 +450,9 @@ function UsageMetricRow({ demand, layout, nowMs, onToggleShowAs, row }: MetricRo
             aria-label={`${metricLabel(row.label)}: ${goalLabel}`}
             aria-valuemin={0}
             aria-valuemax={100}
-            aria-valuenow={Math.round(goal.percent)}
+            aria-valuenow={Math.round(goalPercent)}
           >
-            <span className="usage-goal-meter-fill" style={{ width: `${goal.percent}%` }} />
+            <span className="usage-goal-meter-fill" style={{ width: `${goalPercent}%` }} />
           </div>
         </div>
       ) : null}

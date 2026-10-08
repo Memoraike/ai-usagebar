@@ -545,6 +545,7 @@ mod tests {
                 is_free_tier: false,
                 limit: None,
                 limit_remaining: None,
+                recent_models: Vec::new(),
             }),
             stale: false,
             last_error: None,

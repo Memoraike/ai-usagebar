@@ -6,7 +6,7 @@ opt-in. The commented example shows the defaults and provider-specific
 settings.
 
 Both binaries accept `--config <PATH>` to use an alternate file instead of the
-default location (`%APPDATA%\ai-usagebar\config.toml` on Windows). The file
+default location (`%APPDATA%\ai-usagebar\config\config.toml` on Windows). The file
 must already exist; loads and the Settings overlay then read and write that
 file for the whole process, so a test config never touches the real one:
 
@@ -24,7 +24,7 @@ ai-usagebar-tui --config ./config.test.toml
 #                         # | zai | openrouter | deepseek | deepinfra | kimi | kilo | novita
 #                         # | moonshot | grok | supergrok | grokbot | antigravity | cursor
 #                         # | minimax | kiro | nous | opencode-go | commandcode
-#                         # | orcarouter | modelstudio
+#                         # | orcarouter | modelstudio | lyceum | devin
 
 [context]
 enabled = false           # opt in, then press c in ai-usagebar-tui
@@ -35,7 +35,10 @@ enabled = false           # opt in, then press c in ai-usagebar-tui
 # While enabled, `usage` (and the tray/Omarchy panels built on it) also shows
 # the most recent Claude Code sessions on the Claude entry as a "Sessions"
 # group: one row per session with its context health on the same severity
-# colors as quota meters, plus the model and last-active time.
+# colors as quota meters, plus the model and last-active time. Each Claude
+# account whose sessions are working or waiting on you also gets an "Activity"
+# row ("2 working · 1 waiting") and an `activity` field, read from the
+# `sessions/` directory in that account's config directory.
 
 # Quota-threshold desktop notifications. On by default at 97%: a window that
 # crosses the threshold raises one notification per crossing (Linux uses
@@ -134,6 +137,15 @@ api_key_env = "NOVITA_API_KEY"
 # display_limit = 200      # tank size in USD; see "Balance tanks" below
 # headline = "amount"      # "amount" | "percent"
 
+[lyceum]
+enabled = true              # disabled by default; enable once you add an API key
+api_key_env = "LYCEUM_API_KEY"
+# api_key = "..."           # inline fallback; chmod 600 the file if used
+# [[lyceum.accounts]]       # optional named API-key accounts
+# label = "work"
+# api_key_env = "LYCEUM_WORK_API_KEY"
+# api_key = "..."
+
 [orcarouter]
 enabled = true             # disabled by default; enable once you add an API key
 api_key_env = "ORCAROUTER_API_KEY"
@@ -228,12 +240,34 @@ enabled = false            # disabled by default; enable after `bl auth login --
 # read-only. The region×site pair recorded there picks the console gateway
 # (cn-beijing/ap-southeast-1 × domestic/international).
 # config_dir = "/home/you/.bailian"   # or set BAILIAN_CONFIG_DIR at runtime
+
+[devin]
+enabled = false            # disabled by default; enable after signing in with Devin CLI
+# Reuses the official Devin CLI credential file read-only. Defaults to
+# %APPDATA%/devin/credentials.toml on Windows, or
+# ${XDG_DATA_HOME:-~/.local/share}/devin/credentials.toml on Linux and macOS
+# (the CLI's documented paths; macOS is untested here).
+# An explicit credentials_path needs no home directory to resolve.
+# credentials_path = "/home/you/.local/share/devin/credentials.toml"
 ```
+
+Devin remains opt-in when its CLI login is present. First-run detection and
+`detect --all` do not enable it; set `enabled = true` explicitly to activate
+the provider.
+
+Devin reports daily and weekly remaining percentages, which ai-usagebar
+converts to consumed percentages for consistent meters. A window whose reset
+time arrives without a remaining percentage (the encoding omits zero values) is
+shown as fully used. Its optional
+`overageBalanceMicros` value is displayed as USD to six decimal places based on
+the tested account; that currency interpretation is not a verified universal
+contract. The existing CLI token is read only for the status request and cache
+identity. ai-usagebar does not sign in, refresh, or rewrite Devin credentials.
 
 For more than one OpenRouter key, see the
 [OpenRouter account guide](openrouter-accounts.md). The existing singular
 `[openrouter]` key remains the default account and needs no migration. Z.AI,
-DeepSeek, DeepInfra, Kilo, Novita, Moonshot, Grok, MiniMax, and OrcaRouter take the same
+DeepSeek, DeepInfra, Kilo, Novita, Moonshot, Grok, MiniMax, OrcaRouter, and Lyceum take the same
 `[[<vendor>.accounts]]` array and `show_default_account` switch — see the
 [API-key account guide](api-key-accounts.md).
 
@@ -318,6 +352,12 @@ Balance vendors default to `"amount"`; `[openrouter]`, which always has a
 denominator of its own, defaults to `"percent"`. Setting `display_limit` does
 not switch the headline by itself, and choosing `"percent"` with no limit from
 either source leaves the amount on the bar rather than inventing a percentage.
+
+`[nous]` takes `headline` as well, and needs no `display_limit`: its plan's
+monthly credits are already the percentage's denominator. `"amount"` puts the
+credits still usable on the bar — the Portal's total usable credits, falling
+back to top-up credits and then to subscription credits — and leaves the
+consumed percentage in the meter, the severity colour and the detail line.
 
 The Omarchy panel, the KDE plasmoid and the tray popover (Windows and macOS)
 read the metric's own `headline` field out of `usage --json` rather than

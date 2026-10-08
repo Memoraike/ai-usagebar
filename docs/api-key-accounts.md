@@ -19,6 +19,7 @@ The array works for these sections:
 | `[grok]` | Grok (xAI management key) |
 | `[minimax]` | MiniMax |
 | `[orcarouter]` | OrcaRouter |
+| `[lyceum]` | Lyceum |
 
 Kimi is not on the list: its fallback is the Kimi Code CLI's single OAuth
 login, not a second key. Claude and Codex have their own account arrays — see

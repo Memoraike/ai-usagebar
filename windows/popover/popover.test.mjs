@@ -34,6 +34,8 @@ import {
   hintPending,
   absorbPayload,
   setRowEnabled,
+  hiddenMetricKeys,
+  prefsForCard,
   moveRowToList,
   LAYOUT_KEY,
   normalizeLayout,
@@ -57,8 +59,10 @@ import {
   paceTickPercent,
   paceVisible,
   usageGoal,
+  usageGoalPercent,
   prettyMetricLabel,
   shortcutFromKeyEvent,
+  displayShortcut,
   defaultStars,
   toggleStar,
   metricRowKey,
@@ -86,6 +90,28 @@ import { measurePanelHeight } from './src/panel-size.js';
 
 const englishMessages = JSON.parse(readFileSync(new URL('./messages/en.json', import.meta.url), 'utf8'));
 
+{
+  const fixture = JSON.parse(readFileSync(new URL('../../tests/fixtures/grokbot_paced_report.json', import.meta.url), 'utf8'));
+  const now = Date.parse('2026-09-25T12:00:00Z');
+  const row = projectCards(parseHostPayload(fixture), now)[0].rows[0];
+  const projected = pace(row, now);
+  assert.equal(projected.elapsedPercent, 50);
+  assert.equal(projected.state, 'behind');
+  assert.match(paceText(projected, now), /Limit/);
+  assert.equal(pace({...row, window: undefined}, now), null);
+}
+
+{
+  const fixture = JSON.parse(readFileSync(new URL('../../tests/fixtures/cursor_paced_report.json', import.meta.url), 'utf8'));
+  const now = Date.parse('2026-09-25T12:00:00Z');
+  const [ahead, behind] = projectCards(parseHostPayload(fixture), now)[0].rows;
+  assert.equal(pace(ahead, now).elapsedPercent, 50);
+  assert.equal(pace(ahead, now).state, 'behind');
+  assert.equal(pace(behind, now).elapsedPercent, 50);
+  assert.notEqual(pace(behind, now).state, 'behind');
+  assert.equal(pace({...ahead, window: undefined}, now), null);
+}
+
 // The page declares an empty icon, so the WebView never asks the tray for /favicon.ico: the
 // custom protocol serves only the page, its script and its stylesheet, and the request logged
 // a 404 in the popover's console on every open.
@@ -98,8 +124,8 @@ const portugueseMessages = JSON.parse(readFileSync(new URL('./messages/pt-BR.jso
 assert.deepEqual(Object.keys(portugueseMessages).sort(), Object.keys(englishMessages).sort());
 assert.ok(Object.values(englishMessages).every((value) => typeof value === 'string' && value.trim()));
 assert.ok(Object.values(portugueseMessages).every((value) => typeof value === 'string' && value.trim()));
-assert.equal(englishMessages.menu_bar_shows_hint, "Both show the metrics you star in each provider.");
-assert.equal(portugueseMessages.menu_bar_shows_hint, "Os dois mostram as métricas marcadas com estrela em cada provedor.");
+assert.equal(englishMessages.menu_bar_shows_hint, "Chart and Logos show every provider's starred metrics. Quattro shows the selected provider's highest usage.");
+assert.equal(portugueseMessages.menu_bar_shows_hint, "Gráfico e Logotipos mostram as métricas marcadas de todos os provedores. Quattro mostra o maior uso do provedor selecionado.");
 for (const key of ['focused_provider', 'highest_consumption', 'usage_window']) {
   assert.equal(Object.hasOwn(englishMessages, key), false);
   assert.equal(Object.hasOwn(portugueseMessages, key), false);
@@ -124,7 +150,7 @@ const report = {
   menu_bar_show_all: false,
   menu_bar_hide_value: true,
   menu_bar_names: 'short',
-  menu_bar_chart: true,
+  menu_bar_look: 'quattro',
   accent: { light: '#123456', dark: '#ABCDEF' },
   primary: 'anthropic',
   entries: [
@@ -163,7 +189,20 @@ assert.equal(payload.startupEnabled, true);
 assert.equal(Object.hasOwn(payload, 'menuBarShowAll'), false);
 assert.equal(Object.hasOwn(payload, 'menuBarHideValue'), false);
 assert.equal(Object.hasOwn(payload, 'menuBarNames'), false);
-assert.equal(payload.menuBarChart, true);
+assert.equal(payload.menuBarLook, 'quattro');
+// ASSERT: an unknown or missing look reads as the default chart, never as a blank one.
+assert.equal(parseHostPayload({ menu_bar_look: 'sparkles' }).menuBarLook, 'chart');
+assert.equal(parseHostPayload({}).menuBarLook, 'chart');
+assert.equal(emptyPayload('').menuBarLook, 'chart');
+assert.equal(parseHostPayload({ menu_bar_look: 'logos' }).menuBarLook, 'logos');
+assert.equal(parseHostPayload({ menu_bar_look: 'quattro' }).menuBarLook, 'quattro');
+// The host only reports `quattro`; the 1.32.0 spelling is read on the Rust side, so `name` is unknown here.
+assert.equal(parseHostPayload({ menu_bar_look: 'name' }).menuBarLook, 'chart');
+// The Quattro look's short name is on unless the host says otherwise.
+assert.equal(parseHostPayload({}).menuBarShortName, true);
+assert.equal(emptyPayload('').menuBarShortName, true);
+assert.equal(parseHostPayload({ menu_bar_short_name: false }).menuBarShortName, false);
+assert.equal(parseHostPayload({ menu_bar_short_name: 'no' }).menuBarShortName, true);
 assert.deepEqual(payload.accent, { light: '#123456', dark: '#abcdef' });
 // ASSERT: malformed, partial, and non-object accent data cannot set either CSS color.
 assert.equal(parseHostPayload({ accent: { light: '#112233', dark: 'bad' } }).accent, null);
@@ -502,6 +541,12 @@ assert.equal(nextUpdateLabel({ nextRefreshAt: 120_000 }, 60_000, 'pt-BR'), 'Pró
 assert.equal(resetText({ resetAt: '2026-09-24T12:00:00Z' }, 'countdown', Date.parse('2026-09-24T11:00:00Z'), { locale: 'pt-BR' }), 'Redefine em 1h 0m');
 assert.match(formatResetExact(Date.parse('2026-09-24T12:00:00Z'), Date.parse('2026-09-24T11:00:00Z'), { locale: 'pt-BR', timeZone: 'UTC', timeFormat: '24' }), /^hoje às 12:00$/);
 assert.equal(updateStatusLabel({ update: null, updateCheckedAt: 0 }, 0, 'pt-BR'), 'Ainda não verificado');
+saveLayout(languageStore, { ...emptyLayout(), language: 'ko' });
+assert.equal(loadLayout(languageStore).language, 'ko');
+assert.equal(nextUpdateLabel({ nextRefreshAt: 120_000 }, 60_000, 'ko'), '1m 후 업데이트');
+assert.equal(resetText({ resetAt: '2026-09-24T12:00:00Z' }, 'countdown', Date.parse('2026-09-24T11:00:00Z'), { locale: 'ko' }), '1h 0m 후 초기화');
+assert.match(formatResetExact(Date.parse('2026-09-24T12:00:00Z'), Date.parse('2026-09-24T11:00:00Z'), { locale: 'ko', timeZone: 'UTC', timeFormat: '24' }), /^오늘 12:00$/);
+assert.equal(updateStatusLabel({ update: null, updateCheckedAt: 0 }, 0, 'ko'), '아직 확인 안 함');
 
 // --- resetTimes layout field ------------------------------------
 
@@ -714,6 +759,11 @@ assert.equal(resetAlternate(badStampRow, 'exact', resetNow, utc), '');
   assert.deepEqual(usageGoal(monthly, Date.parse('2026-03-31T12:00:00Z')), { percent: 100, estimated: true });
   assert.equal(usageGoal({ ...monthly, label: 'Weekly' }, end), null);
   assert.equal(usageGoal({ ...monthly, resetAt: 'bad' }, end), null);
+  // The goal reads like the meter: what should be spent in Used mode, what should remain in Left.
+  assert.equal(usageGoalPercent({ percent: 97, estimated: false }, 'used'), 97);
+  assert.equal(usageGoalPercent({ percent: 97, estimated: false }, 'left'), 3);
+  assert.equal(usageGoalPercent({ percent: 33, estimated: true }, 'left'), 67);
+  assert.equal(usageGoalPercent(null, 'left'), null);
 }
 
 // --- host payload: shortcut / updates / update / window_secs ------------------
@@ -969,6 +1019,39 @@ assert.equal(resetAlternate(badStampRow, 'exact', resetNow, utc), '');
   assert.equal(shortcutFromKeyEvent(null), null);
 }
 
+// --- displayShortcut -------------------------------------------------------------
+
+{
+  // macOS shows the canonical "Win"/"Alt" modifiers as "Cmd"/"Option"; the stored value is untouched.
+  assert.equal(displayShortcut('Win+U', 'macos'), 'Cmd+U');
+  assert.equal(displayShortcut('Alt+U', 'macos'), 'Option+U');
+  assert.equal(displayShortcut('Ctrl+Alt+Shift+Win+K', 'macos'), 'Ctrl+Option+Shift+Cmd+K');
+  assert.equal(displayShortcut('Win+U', 'windows'), 'Win+U');
+  assert.equal(displayShortcut('Win+U', ''), 'Win+U');
+  assert.equal(displayShortcut('', 'macos'), '');
+  assert.equal(displayShortcut(undefined, 'macos'), '');
+}
+
+// --- ShortcutRecorder wiring guard -----------------------------------------------
+// The macOS tray is a WKWebView, and WebKit does not focus a <button> when it is
+// clicked (WebKit bug 22261), so the recorder must capture the chord on `document`
+// while recording rather than on the button. There is no DOM runner here to catch a
+// regression to a button-local handler, so pin the wiring.
+{
+  const source = readFileSync(
+    new URL('./src/components/ShortcutRecorder.tsx', import.meta.url),
+    'utf8',
+  );
+  assert.ok(
+    source.includes('document.addEventListener("keydown"'),
+    'ShortcutRecorder must listen for keydown on document',
+  );
+  assert.ok(
+    !source.includes('onKeyDown={'),
+    'ShortcutRecorder must not put the recording handler on the button',
+  );
+}
+
 // --- update status helpers -------------------------------------------------------
 
 {
@@ -1089,6 +1172,8 @@ assert.equal(resetAlternate(badStampRow, 'exact', resetNow, utc), '');
   });
   const [usageCard] = projectCards(usageNamed, 0);
   assert.deepEqual(usageCard.rows.map((r) => r.label), ['Weekly', 'Grok Build', 'Grok Chat']);
+  // Ungrouped rows are quota windows the Native tab may headline.
+  assert.deepEqual(usageCard.rows.map((r) => r.grouped), [false, false, false]);
 
   // ASSERT: a plan equal to the title vanishes; a prefixed plan keeps its tail
   assert.equal(displayPlan(personal.title, personal.plan), '');
@@ -1287,6 +1372,8 @@ assert.equal(quotaAlternate(null, 'left'), '');
   assert.deepEqual(grok.rows.map((r) => [r.label, r.key]), [
     ['Grok Build (Breakdown)', 'metric:Grok Build (Breakdown)'],
   ]);
+  // A grouped row is marked, so the Native tab never headlines it over a quota window.
+  assert.equal(grok.rows[0].grouped, true);
 }
 
 // --- vendor warnings become card.warning, and errors carry an action ------------
@@ -1533,7 +1620,12 @@ assert.equal(resolvedTheme('system'), 'light');
     style: 'bars',
     stars,
     order: ['anthropic'],
+    show_as: 'left',
+    hidden_rows: {},
   });
+  // The menu bar follows the Used/Left reading, so the strip message carries it.
+  assert.equal(stripCommand({ ...seeded, showAs: 'used' }, cards).show_as, 'used');
+  assert.equal(stripCommand({ ...seeded, showAs: 'sideways' }, cards).show_as, 'left');
 }
 
 {
@@ -1553,6 +1645,37 @@ assert.equal(resolvedTheme('system'), 'light');
     },
   };
   assert.deepEqual(stripCommand(layout, cards).order, ['openai', 'anthropic']);
+}
+
+{
+  // A metric switched off in Customize does not count toward the macOS name chip's
+  // highest window: the strip message names it, under the key the host derives
+  // (src/tray/strip.rs metric_key). A hidden text row is not a metric and stays out.
+  const payload = parseHostPayload({
+    entries: [{
+      id: 'zai',
+      display_name: 'Z.AI',
+      sections: [
+        { type: 'metric', label: 'Session (5h)', percent: 0 },
+        { type: 'metric', label: 'Weekly', percent: 0 },
+        { type: 'metric', label: 'MCP tools (monthly)', percent: 18 },
+        { type: 'text', label: 'Plan', value: 'Pro' },
+      ],
+    }],
+  });
+  const cards = projectCards(payload, 0);
+  const zai = cards[0];
+  let prefs = setRowEnabled(prefsForCard(zai, emptyLayout()), 'metric:MCP tools (monthly)', false);
+  prefs = setRowEnabled(prefs, 'text:Plan', false);
+  const layout = { ...emptyLayout(), rows: { zai: prefs } };
+  assert.deepEqual(hiddenMetricKeys(zai, layout), ['metric:MCP tools (monthly)']);
+  assert.deepEqual(stripCommand(layout, cards).hidden_rows, { zai: ['metric:MCP tools (monthly)'] });
+  // Switched back on, nothing is hidden.
+  const shown = { ...layout, rows: { zai: setRowEnabled(prefs, 'metric:MCP tools (monthly)', true) } };
+  assert.deepEqual(hiddenMetricKeys(zai, shown), []);
+  assert.deepEqual(stripCommand(shown, cards).hidden_rows, {});
+  // hideExtras switches non-metric rows off by default; it never hides a metric.
+  assert.deepEqual(stripCommand({ ...emptyLayout(), hideExtras: true }, cards).hidden_rows, {});
 }
 
 {
@@ -1747,6 +1870,17 @@ assert.equal(resolvedTheme('system'), 'light');
     checkForUpdates: 'Verificar atualizações…',
     about: 'Sobre',
     quit: 'Sair',
+  });
+  assert.deepEqual(optionsMenuLabels('ko'), {
+    customize: '사용자화',
+    settings: '설정',
+    refresh: '새로 고침',
+    detect: '제공자 감지',
+    openTui: 'TUI 열기',
+    startAtLogin: '로그인 시 시작',
+    checkForUpdates: '업데이트 확인…',
+    about: '정보',
+    quit: '종료',
   });
   // Unknown locales resolve to English, like the `lang` helper.
   assert.deepEqual(optionsMenuLabels('de'), optionsMenuLabels('en'));

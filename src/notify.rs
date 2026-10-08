@@ -534,7 +534,7 @@ impl RefreshInput {
         now: DateTime<Utc>,
     ) -> Option<Self> {
         use crate::tui::app::{TabSource, TabState};
-        use crate::tui::panels::{Section, sections_with_metadata_for};
+        use crate::tui::panels::sections_with_metadata_for;
 
         let TabState::Ready(ready) = state else {
             return None;
@@ -548,18 +548,7 @@ impl RefreshInput {
         };
         // The tolerance only shapes pacing footnotes, which the notification
         // body never reads; any value behaves identically here.
-        let rows = sections_with_metadata_for(state, now, 0)
-            .into_iter()
-            .filter(|projected| projected.group.is_none())
-            .filter_map(|projected| match projected.section {
-                Section::Metric { label, pct, .. } => Some(MetricRow {
-                    window: label,
-                    percent: pct,
-                    reset_at: projected.reset_at,
-                }),
-                _ => None,
-            })
-            .collect();
+        let rows = metric_rows(sections_with_metadata_for(state, now, 0));
         let credits = ready
             .snapshot
             .reset_credits()
@@ -585,6 +574,50 @@ impl RefreshInput {
             credits,
         })
     }
+}
+
+/// The metric rows one refresh checks, each named by the window it measures.
+///
+/// Grouped sub-rows are skipped (see [`RefreshInput::from_tab`]). A label is
+/// normally unique within an entry, but Antigravity and MiniMax lay a
+/// `Session` and a `Weekly` heading over the same pool labels, so "Gemini"
+/// named two windows. Sharing one dedupe key, the row under the re-arm band
+/// cleared the record its namesake over the threshold had just written, and
+/// the same notification fired again on every refresh. Metrics under a heading
+/// always include it in their name ("Weekly · Gemini"), even if no other row
+/// currently has the same label: a missing sibling must not change a window's
+/// identity. Metrics without a heading keep their bare names.
+fn metric_rows(
+    sections: impl IntoIterator<Item = crate::tui::panels::SectionProjection>,
+) -> Vec<MetricRow> {
+    use crate::tui::panels::Section;
+
+    // A heading is a text row with no value; it covers the metrics below it
+    // until any other row except a spacer.
+    let mut heading: Option<String> = None;
+    let mut rows = Vec::new();
+    for projected in sections {
+        if projected.group.is_some() {
+            continue;
+        }
+        match projected.section {
+            Section::Text { label, value } if value.is_empty() => heading = Some(label),
+            Section::Metric { label, pct, .. } => {
+                let window = match &heading {
+                    Some(heading) => format!("{heading} · {label}"),
+                    None => label,
+                };
+                rows.push(MetricRow {
+                    window,
+                    percent: pct,
+                    reset_at: projected.reset_at,
+                });
+            }
+            Section::Spacer => {}
+            _ => heading = None,
+        }
+    }
+    rows
 }
 
 #[cfg(test)]
@@ -1240,6 +1273,209 @@ mod tests {
         // window and must not raise a second notification.
         assert_eq!(projected.rows.len(), 1, "{:?}", projected.rows);
         assert!(projected.credits.is_empty());
+    }
+
+    fn antigravity_ready(
+        session: i32,
+        third_party_session: i32,
+        weekly: i32,
+        third_party_weekly: i32,
+    ) -> crate::tui::app::TabState {
+        use crate::tui::app::{ReadyTab, TabState};
+        use crate::usage::{AntigravitySnapshot, AntigravitySource, UsageWindow, VendorSnapshot};
+
+        let window = |pct: i32, resets_at: DateTime<Utc>, hours: i64| {
+            Some(UsageWindow {
+                utilization_pct: pct,
+                resets_at: Some(resets_at),
+                window_duration: chrono::Duration::hours(hours),
+            })
+        };
+        TabState::Ready(Box::new(ReadyTab {
+            snapshot: VendorSnapshot::Antigravity(AntigravitySnapshot {
+                plan: "Google AI Pro".into(),
+                account: "acct:test".into(),
+                source: AntigravitySource::Local,
+                session: window(session, at(24, 2, 21), 5),
+                weekly: window(weekly, at(26, 1, 34), 168),
+                third_party_session: window(third_party_session, at(24, 2, 19), 5),
+                third_party_weekly: window(third_party_weekly, at(30, 19, 19), 168),
+            }),
+            stale: false,
+            last_error: None,
+            fetched_at: None,
+            display: Default::default(),
+        }))
+    }
+
+    /// Antigravity lays "Session" and "Weekly" headings over the same two
+    /// pool labels; each window needs its own name, or the four rows share
+    /// two dedupe keys.
+    #[test]
+    fn from_tab_names_repeated_labels_by_their_heading() {
+        use crate::tui::app::TabId;
+
+        let projected = RefreshInput::from_tab(
+            &TabId::vendor(crate::vendor::VendorId::Antigravity),
+            &antigravity_ready(3, 100, 98, 56),
+            at(23, 22, 0),
+        )
+        .expect("ready tab projects");
+        let windows: Vec<_> = projected
+            .rows
+            .iter()
+            .map(|row| row.window.as_str())
+            .collect();
+        assert_eq!(
+            windows,
+            [
+                "Session · Gemini",
+                "Session · Claude & GPT OSS",
+                "Weekly · Gemini",
+                "Weekly · Claude & GPT OSS",
+            ]
+        );
+    }
+
+    /// The reported bug: a weekly Gemini window at 98% beside a session one at
+    /// 3%, and a session Claude window at 100% beside a weekly one at 56%. Under
+    /// one key per label, the low twin cleared the record its high twin had
+    /// just written, so both notifications fired again on every refresh.
+    #[test]
+    fn a_window_whose_label_repeats_notifies_once() {
+        use crate::tui::app::TabId;
+
+        let tab = TabId::vendor(crate::vendor::VendorId::Antigravity);
+        let state = antigravity_ready(3, 100, 98, 56);
+        let mut notify_state = NotifyState::default();
+        let fired: Vec<Vec<String>> = (0..4)
+            .map(|refresh| {
+                let now = at(23, 22, 0) + chrono::Duration::minutes(5 * refresh);
+                let input = RefreshInput::from_tab(&tab, &state, now).expect("ready tab projects");
+                decide(&input, 97, &mut notify_state, now)
+                    .into_iter()
+                    .map(|notification| notification.title)
+                    .collect()
+            })
+            .collect();
+        assert_eq!(
+            fired[0],
+            [
+                "Antigravity — Session · Claude & GPT OSS at 100%",
+                "Antigravity — Weekly · Gemini at 98%",
+            ]
+        );
+        assert!(
+            fired[1..].iter().all(Vec::is_empty),
+            "later refreshes must stay quiet: {fired:?}"
+        );
+    }
+
+    /// A window's identity must not depend on whether its sibling arrived.
+    #[test]
+    fn a_window_keeps_its_key_when_its_sibling_disappears_or_returns() {
+        use crate::tui::app::{TabId, TabState};
+        use crate::usage::VendorSnapshot;
+
+        let tab = TabId::vendor(crate::vendor::VendorId::Antigravity);
+        for starts_with_session in [false, true] {
+            let mut notify_state = NotifyState::default();
+            // The unchanged weekly quota fires only once, regardless of
+            // which snapshot shape arrived first. A low reading while the
+            // session is absent must also re-arm that same weekly key.
+            let steps = [
+                (starts_with_session, 98, 1),
+                (!starts_with_session, 98, 0),
+                (starts_with_session, 98, 0),
+                (false, 20, 0),
+                (true, 98, 1),
+                (false, 98, 0),
+            ];
+            for (refresh, (has_session, weekly_pct, expected)) in steps.into_iter().enumerate() {
+                let mut state = antigravity_ready(3, 10, weekly_pct, 56);
+                let TabState::Ready(ready) = &mut state else {
+                    unreachable!();
+                };
+                let VendorSnapshot::Antigravity(snapshot) = &mut ready.snapshot else {
+                    unreachable!();
+                };
+                if !has_session {
+                    snapshot.session = None;
+                    snapshot.third_party_session = None;
+                }
+                let now = at(23, 22, 0) + chrono::Duration::minutes(5 * refresh as i64);
+                let input = RefreshInput::from_tab(&tab, &state, now).expect("ready tab projects");
+                let fired = decide(&input, 97, &mut notify_state, now);
+                assert_eq!(
+                    fired.len(),
+                    expected,
+                    "starts_with_session={starts_with_session}, refresh={refresh}: {fired:?}"
+                );
+                if let Some(notification) = fired.first() {
+                    assert_eq!(notification.key, "antigravity::Weekly · Gemini");
+                }
+            }
+        }
+    }
+
+    /// Heading context applies to unique labels too, survives spacers, and
+    /// ends at a non-heading row. Unscoped metrics keep their bare names.
+    #[test]
+    fn metric_names_follow_heading_scope_even_for_unique_labels() {
+        use crate::balance::MetricHeadline;
+        use crate::pacing::PaceSeverity;
+        use crate::tui::panels::{Section, SectionProjection};
+
+        let projection = |section| SectionProjection {
+            section,
+            reset_at: None,
+            window: None,
+            group: None,
+            headline: MetricHeadline::Percent,
+            used_cents: None,
+            limit_cents: None,
+        };
+        let metric = |label: &str, pct| {
+            projection(Section::Metric {
+                label: label.into(),
+                pct,
+                severity: PaceSeverity::Low,
+                value_label: format!("{pct}%"),
+                footnote: String::new(),
+            })
+        };
+        let heading = |label: &str| {
+            projection(Section::Text {
+                label: label.into(),
+                value: String::new(),
+            })
+        };
+        let rows = metric_rows([
+            metric("Unscoped", 20),
+            heading("Session"),
+            projection(Section::Spacer),
+            metric("General", 40),
+            metric("Video", 10),
+            projection(Section::Spacer),
+            heading("Weekly"),
+            metric("General", 60),
+            projection(Section::Text {
+                label: "Info".into(),
+                value: "Details".into(),
+            }),
+            metric("Other", 30),
+        ]);
+        let windows: Vec<_> = rows.iter().map(|row| row.window.as_str()).collect();
+        assert_eq!(
+            windows,
+            [
+                "Unscoped",
+                "Session · General",
+                "Session · Video",
+                "Weekly · General",
+                "Other",
+            ]
+        );
     }
 
     #[test]

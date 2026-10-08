@@ -7,8 +7,9 @@ export interface RowPrefs {
 }
 
 export type TimeFormat = "12" | "24" | "auto";
-export type Language = "en" | "pt-BR";
+export type Language = "en" | "pt-BR" | "ko";
 export type PopoverStyle = "classic" | "native";
+export type MenuBarLook = "chart" | "logos" | "quattro";
 
 export interface Layout {
   alwaysShowPace: boolean;
@@ -37,6 +38,9 @@ export interface MetricRow {
   detail: string;
   /** Which number the headline shows: the percentage, or `value`. */
   headline: "percent" | "value";
+  /** The row sits under a group heading (SuperGrok's product slices, Claude's
+   * CLI sessions) rather than being one of the provider's quota windows. */
+  grouped?: boolean;
   key?: string;
   kind: "metric";
   label: string;
@@ -244,7 +248,10 @@ export interface Payload {
   entries: Entry[];
   generatedAt: number;
   hostError: string;
-  menuBarChart: boolean;
+  /** macOS menu-bar look the host draws. */
+  menuBarLook: MenuBarLook;
+  /** Whether the Quattro look draws the short name beside the logo. */
+  menuBarShortName: boolean;
   notificationsEnabled: boolean;
   notificationsThreshold: number;
   /** Host OS: macos, windows, or linux. */

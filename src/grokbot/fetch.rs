@@ -283,7 +283,11 @@ async fn fetch_live(
         // the paired refresh token and retry exactly once.
         let refreshed = refresh(client, &endpoints.token, &refresh_token).await?;
         let persisted = PersistedOAuth {
-            fingerprint: super::creds::fingerprint_of(&refreshed.refresh_token),
+            // Scoped to the sign-in the app's file holds, which is what the
+            // next poll looks the pair up by. The app does not rewrite that
+            // file on a refresh, so a rotated token's own fingerprint would
+            // never be asked for again.
+            fingerprint: creds.fingerprint.clone(),
             access_token: refreshed.access_token,
             refresh_token: refreshed.refresh_token,
         };
@@ -453,7 +457,7 @@ mod tests {
         GrokbotCredentials {
             access_token: "at-stored".into(),
             refresh_token: "rt-stored".into(),
-            fingerprint: super::super::creds::fingerprint_of("rt-stored"),
+            fingerprint: crate::cache::fingerprint_of("rt-stored"),
         }
     }
 
@@ -569,15 +573,15 @@ mod tests {
         retried.assert_async().await;
         assert_eq!(out.snapshot.weekly_pct, 12);
 
-        // The rotated pair persisted to the vendor cache, scoped by the new
-        // refresh token's fingerprint — never back to the app's file.
+        // The rotated pair persisted to the vendor cache, scoped by the
+        // sign-in it was refreshed from, and never back to the app's file.
         let persisted: serde_json::Value =
             serde_json::from_slice(&std::fs::read(oauth_cache_path(&cache)).unwrap()).unwrap();
         assert_eq!(persisted["access_token"], "at-fresh");
         assert_eq!(persisted["refresh_token"], "rt-rotated");
         assert_eq!(
             persisted["fingerprint"],
-            super::super::creds::fingerprint_of("rt-rotated")
+            crate::cache::fingerprint_of("rt-stored")
         );
         #[cfg(unix)]
         {
@@ -588,6 +592,52 @@ mod tests {
                 .mode();
             assert_eq!(mode & 0o077, 0);
         }
+    }
+
+    /// The app does not rewrite its file on a refresh, so the poll after a
+    /// rotation still reads the old pair from it. It has to find the rotated
+    /// pair in the vendor cache, not try the expired access token and spend
+    /// the original refresh token again.
+    #[tokio::test]
+    async fn the_next_poll_reuses_a_rotated_pair() {
+        let mut server = mockito::Server::new_async().await;
+        let stale = usage_mock(&mut server, "at-stored")
+            .with_status(401)
+            .with_body(r#"{"error":"expired"}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let refresh = server
+            .mock("POST", "/oauth/token")
+            .with_status(200)
+            .with_body(r#"{"access_token":"at-fresh","refresh_token":"rt-rotated"}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let fresh = usage_mock(&mut server, "at-fresh")
+            .with_status(200)
+            .with_body(usage_json())
+            .expect(2)
+            .create_async()
+            .await;
+
+        let (_td, cache) = cache_fixture();
+        for _ in 0..2 {
+            let out = fetch_snapshot_with(
+                &reqwest::Client::new(),
+                &test_creds(),
+                &cache,
+                &test_endpoints(&server.url()),
+                Duration::ZERO,
+            )
+            .await
+            .unwrap();
+            assert_eq!(out.snapshot.weekly_pct, 12);
+        }
+
+        stale.assert_async().await;
+        refresh.assert_async().await;
+        fresh.assert_async().await;
     }
 
     #[tokio::test]
@@ -604,7 +654,7 @@ mod tests {
             &cache,
             &PersistedOAuth {
                 // Same sign-in as the app's file, so the rotation is honored.
-                fingerprint: super::super::creds::fingerprint_of("rt-stored"),
+                fingerprint: crate::cache::fingerprint_of("rt-stored"),
                 access_token: "at-fresh".into(),
                 refresh_token: "rt-stored".into(),
             },
@@ -638,7 +688,7 @@ mod tests {
         write_persisted_oauth(
             &cache,
             &PersistedOAuth {
-                fingerprint: super::super::creds::fingerprint_of("rt-someone-else"),
+                fingerprint: crate::cache::fingerprint_of("rt-someone-else"),
                 access_token: "at-stranger".into(),
                 refresh_token: "rt-stranger".into(),
             },

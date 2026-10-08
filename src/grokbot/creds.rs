@@ -36,10 +36,7 @@
 //! Error messages are fixed strings: every input here is a credential and
 //! must never end up in a tooltip or a log line.
 
-use std::fmt::Write as _;
 use std::path::Path;
-
-use sha2::{Digest, Sha256};
 
 use crate::error::{AppError, Result};
 
@@ -104,15 +101,6 @@ impl std::fmt::Debug for GrokbotCredentials {
             .field("fingerprint", &self.fingerprint)
             .finish()
     }
-}
-
-pub fn fingerprint_of(secret: &str) -> String {
-    let digest = Sha256::digest(secret.as_bytes());
-    let mut hex = String::with_capacity(16);
-    for byte in digest.iter().take(8) {
-        let _ = write!(hex, "{byte:02x}");
-    }
-    hex
 }
 
 /// The OSCrypt key for a known secret — the pure half of [`oscrypt_key`], so
@@ -299,7 +287,7 @@ fn active_entry(raw: &[u8]) -> Result<serde_json::Map<String, serde_json::Value>
 }
 
 fn credentials_of(access_token: String, refresh_token: String) -> GrokbotCredentials {
-    let fingerprint = fingerprint_of(&refresh_token);
+    let fingerprint = crate::cache::fingerprint_of(&refresh_token);
     GrokbotCredentials {
         access_token,
         refresh_token,
@@ -429,7 +417,7 @@ mod tests {
 
         assert_eq!(creds.access_token, "at-test");
         assert_eq!(creds.refresh_token, "rt-test");
-        assert_eq!(creds.fingerprint, fingerprint_of("rt-test"));
+        assert_eq!(creds.fingerprint, crate::cache::fingerprint_of("rt-test"));
         assert_eq!(creds.fingerprint.len(), 16);
         assert!(creds.fingerprint.chars().all(|c| c.is_ascii_hexdigit()));
     }
@@ -701,7 +689,10 @@ mod tests {
         let creds = read_at(&path, &OsCryptKey::Gcm(WINDOWS_KEY)).unwrap();
         assert_eq!(creds.access_token, "at-windows");
         assert_eq!(creds.refresh_token, "rt-windows");
-        assert_eq!(creds.fingerprint, fingerprint_of("rt-windows"));
+        assert_eq!(
+            creds.fingerprint,
+            crate::cache::fingerprint_of("rt-windows")
+        );
     }
 
     #[test]

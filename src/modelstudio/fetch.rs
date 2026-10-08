@@ -254,7 +254,7 @@ mod tests {
             access_token: "tok-test".into(),
             site,
             region,
-            fingerprint: super::super::creds::fingerprint_of("tok-test"),
+            fingerprint: crate::cache::fingerprint_of("tok-test"),
         }
     }
 

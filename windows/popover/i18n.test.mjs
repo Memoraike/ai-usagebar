@@ -14,13 +14,16 @@ const temporary = await mkdtemp(path.join(os.tmpdir(), 'ai-usagebar-paraglide-')
 const compiled = path.join(temporary, 'paraglide');
 const english = JSON.parse(await readFile(path.join(here, 'messages/en.json'), 'utf8'));
 const portuguese = JSON.parse(await readFile(path.join(here, 'messages/pt-BR.json'), 'utf8'));
+const korean = JSON.parse(await readFile(path.join(here, 'messages/ko.json'), 'utf8'));
 // The compiler's README records the absolute project path of whoever compiled it, so it differs
 // on every machine; `npm run i18n` deletes it and the comparison leaves it out.
 const MACHINE_SPECIFIC = new Set(['README.md']);
 
 assert.deepEqual(Object.keys(portuguese).sort(), Object.keys(english).sort(), 'English and Portuguese message catalogs must have matching keys.');
+assert.deepEqual(Object.keys(korean).sort(), Object.keys(english).sort(), 'English and Korean message catalogs must have matching keys.');
 assert.ok(Object.values(english).every((value) => typeof value === 'string' && value.trim()), 'English catalog messages must not be empty.');
 assert.ok(Object.values(portuguese).every((value) => typeof value === 'string' && value.trim()), 'Portuguese catalog messages must not be empty.');
+assert.ok(Object.values(korean).every((value) => typeof value === 'string' && value.trim()), 'Korean catalog messages must not be empty.');
 
 async function filesUnder(directory) {
   const files = new Map();
