@@ -56,6 +56,7 @@
 /** @typedef {{}} Couldnt_Check_For_Updates_TitleInputs */
 /** @typedef {{}} Couldnt_Update_TitleInputs */
 /** @typedef {{}} CountdownInputs */
+/** @typedef {{}} Credit_BalanceInputs */
 /** @typedef {{}} CreditsInputs */
 /** @typedef {{}} Current_UsageInputs */
 /** @typedef {{}} CustomizeInputs */
@@ -108,6 +109,8 @@
 /** @typedef {{}} Mcp_ToolsInputs */
 /** @typedef {{}} MenuInputs */
 /** @typedef {{}} Menu_BarInputs */
+/** @typedef {{}} Menu_Bar_Short_NameInputs */
+/** @typedef {{}} Menu_Bar_Short_Name_HintInputs */
 /** @typedef {{}} Menu_Bar_ShowsInputs */
 /** @typedef {{}} Menu_Bar_Shows_HintInputs */
 /** @typedef {{}} Metric_PluralInputs */
@@ -163,11 +166,13 @@
 /** @typedef {{}} ProviderInputs */
 /** @typedef {{}} Provider_Is_UnavailableInputs */
 /** @typedef {{}} ProvidersInputs */
+/** @typedef {{}} QuattroInputs */
 /** @typedef {{}} QuitInputs */
 /** @typedef {{}} Quota_AlertsInputs */
 /** @typedef {{}} Quota_Alerts_HintInputs */
 /** @typedef {{}} Rate_Limit_ResetsInputs */
 /** @typedef {{ version: NonNullable<unknown> }} Ready_To_InstallInputs */
+/** @typedef {{}} Recent_ModelsInputs */
 /** @typedef {{}} RefreshInputs */
 /** @typedef {{}} Refresh_EveryInputs */
 /** @typedef {{}} Refresh_Interval_HintInputs */
@@ -209,6 +214,7 @@
 /** @typedef {{}} SystemInputs */
 /** @typedef {{}} ThemeInputs */
 /** @typedef {{}} This_BuildInputs */
+/** @typedef {{}} TierInputs */
 /** @typedef {{}} Time_FormatInputs */
 /** @typedef {{}} Time_Format_HintInputs */
 /** @typedef {{ time: NonNullable<unknown> }} Today_AtInputs */
@@ -240,6 +246,7 @@
 /** @typedef {{}} Usage_And_Balance_HeadingInputs */
 /** @typedef {{}} Usage_And_Balance_SubtitleInputs */
 /** @typedef {{}} Usage_And_Balance_TitleInputs */
+/** @typedef {{}} Usage_By_PeriodInputs */
 /** @typedef {{}} Usage_DisplayInputs */
 /** @typedef {{}} Usage_GoalInputs */
 /** @typedef {{}} Usage_Goal_HintInputs */
@@ -482,6 +489,10 @@ export const countdown = /** @type {(inputs: CountdownInputs) => LocalizedString
 	return /** @type {LocalizedString} */ (`Countdown`)
 };
 
+export const credit_balance = /** @type {(inputs: Credit_BalanceInputs) => LocalizedString} */ () => {
+	return /** @type {LocalizedString} */ (`Credit balance`)
+};
+
 export const credits = /** @type {(inputs: CreditsInputs) => LocalizedString} */ () => {
 	return /** @type {LocalizedString} */ (`Credits`)
 };
@@ -690,12 +701,20 @@ export const menu_bar = /** @type {(inputs: Menu_BarInputs) => LocalizedString} 
 	return /** @type {LocalizedString} */ (`Menu Bar`)
 };
 
+export const menu_bar_short_name = /** @type {(inputs: Menu_Bar_Short_NameInputs) => LocalizedString} */ () => {
+	return /** @type {LocalizedString} */ (`Show Short Name`)
+};
+
+export const menu_bar_short_name_hint = /** @type {(inputs: Menu_Bar_Short_Name_HintInputs) => LocalizedString} */ () => {
+	return /** @type {LocalizedString} */ (`Beside the logo in the Quattro look. A provider without a logo always shows its name.`)
+};
+
 export const menu_bar_shows = /** @type {(inputs: Menu_Bar_ShowsInputs) => LocalizedString} */ () => {
 	return /** @type {LocalizedString} */ (`Menu Bar Shows`)
 };
 
 export const menu_bar_shows_hint = /** @type {(inputs: Menu_Bar_Shows_HintInputs) => LocalizedString} */ () => {
-	return /** @type {LocalizedString} */ (`Both show the metrics you star in each provider.`)
+	return /** @type {LocalizedString} */ (`Chart and Logos show every provider's starred metrics. Quattro shows the selected provider's highest usage.`)
 };
 
 export const metric_plural = /** @type {(inputs: Metric_PluralInputs) => LocalizedString} */ () => {
@@ -910,6 +929,10 @@ export const providers = /** @type {(inputs: ProvidersInputs) => LocalizedString
 	return /** @type {LocalizedString} */ (`Providers`)
 };
 
+export const quattro = /** @type {(inputs: QuattroInputs) => LocalizedString} */ () => {
+	return /** @type {LocalizedString} */ (`Quattro`)
+};
+
 export const quit = /** @type {(inputs: QuitInputs) => LocalizedString} */ () => {
 	return /** @type {LocalizedString} */ (`Quit`)
 };
@@ -928,6 +951,10 @@ export const rate_limit_resets = /** @type {(inputs: Rate_Limit_ResetsInputs) =>
 
 export const ready_to_install = /** @type {(inputs: Ready_To_InstallInputs) => LocalizedString} */ (i) => {
 	return /** @type {LocalizedString} */ (`AI Usage ${i?.version} is ready to install.`)
+};
+
+export const recent_models = /** @type {(inputs: Recent_ModelsInputs) => LocalizedString} */ () => {
+	return /** @type {LocalizedString} */ (`Recent models`)
 };
 
 export const refresh = /** @type {(inputs: RefreshInputs) => LocalizedString} */ () => {
@@ -1094,6 +1121,10 @@ export const this_build = /** @type {(inputs: This_BuildInputs) => LocalizedStri
 	return /** @type {LocalizedString} */ (`This build`)
 };
 
+export const tier = /** @type {(inputs: TierInputs) => LocalizedString} */ () => {
+	return /** @type {LocalizedString} */ (`Tier`)
+};
+
 export const time_format = /** @type {(inputs: Time_FormatInputs) => LocalizedString} */ () => {
 	return /** @type {LocalizedString} */ (`Time Format`)
 };
@@ -1216,6 +1247,10 @@ export const usage_and_balance_subtitle = /** @type {(inputs: Usage_And_Balance_
 
 export const usage_and_balance_title = /** @type {(inputs: Usage_And_Balance_TitleInputs) => LocalizedString} */ () => {
 	return /** @type {LocalizedString} */ (`Usage & Balance`)
+};
+
+export const usage_by_period = /** @type {(inputs: Usage_By_PeriodInputs) => LocalizedString} */ () => {
+	return /** @type {LocalizedString} */ (`Usage by period`)
 };
 
 export const usage_display = /** @type {(inputs: Usage_DisplayInputs) => LocalizedString} */ () => {

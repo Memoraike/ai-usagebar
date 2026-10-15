@@ -145,6 +145,7 @@ function normalizeSection(raw) {
         return {
             type: 'metric',
             label: safeText(raw.label, 120),
+            group: safeText(raw && raw.group, 80),
             value: safeText(raw.value, 40),
             percent: percent,
             detail: safeText(raw.detail, 400),
@@ -285,17 +286,30 @@ export function headline(entry) {
     if (!entry)
         return {text: '', percent: null, severity: 'low', label: ''};
     let best = null;
-    for (const s of entry.sections)
-        if (s.type === 'metric' && s.percent !== null && (!best || s.percent > best.percent))
-            best = s;
-    if (best) {
+    let grouped = null;
+    for (const s of entry.sections) {
+        if (s.type === 'metric' && s.percent !== null) {
+            // A grouped row sits under its own heading below the meters (the
+            // Claude entry's context sessions, SuperGrok's product slices).
+            // It is not a quota window, so it stands in only when the entry
+            // has nothing else.
+            if (s.group) {
+                if (!grouped || s.percent > grouped.percent)
+                    grouped = s;
+            } else if (!best || s.percent > best.percent) {
+                best = s;
+            }
+        }
+    }
+    const chosen = best || grouped;
+    if (chosen) {
         // An older report omits the field; a metric is a percentage by default.
-        const showsValue = best.headline === 'value' && best.value !== '';
+        const showsValue = chosen.headline === 'value' && chosen.value !== '';
         return {
-            text: showsValue ? best.value : `${best.percent}%`,
-            percent: best.percent,
-            severity: best.severity,
-            label: best.label,
+            text: showsValue ? chosen.value : `${chosen.percent}%`,
+            percent: chosen.percent,
+            severity: chosen.severity,
+            label: chosen.label,
         };
     }
     for (const s of entry.sections)
@@ -332,18 +346,29 @@ export function panelCells(entry, options) {
         return [];
     if (entry.status === 'error')
         return [{label: '', text: '⚠', severity: 'critical', percent: null}];
-    const cells = [];
+    // The same partition headline() applies: a grouped row sits under its own
+    // heading below the meters and is not a quota window, so it stands in only
+    // when the entry has nothing else.
+    const metrics = [];
+    const grouped = [];
     for (const s of entry.sections) {
-        if (s.type !== 'metric' || cells.length >= max)
+        if (s.type !== 'metric')
             continue;
-        cells.push({
+        if (s.group)
+            grouped.push(s);
+        else
+            metrics.push(s);
+    }
+    const chosen = metrics.length ? metrics : grouped;
+    return chosen.slice(0, max).map(s => {
+        const showsValue = s.headline === 'value' && s.value !== '';
+        return {
             label: shortLabel(s.label),
-            text: s.percent === null ? s.value : `${s.percent}%`,
+            text: showsValue ? s.value : (s.percent === null ? s.value : `${s.percent}%`),
             severity: s.severity,
             percent: s.percent,
-        });
-    }
-    return cells;
+        };
+    });
 }
 
 // The card view (viewMode "VendorCards") projects one card per entry the
@@ -371,11 +396,23 @@ export function cardState(entry) {
 export function cardFor(entry) {
     if (!entry)
         return null;
-    let worst = -1;
-    let accent = 'low';
+    // The same partition headline() and panelCells() apply: a grouped row sits
+    // under its own heading below the meters and is not a quota window, so it
+    // colours the card only when the entry has nothing else.
+    const metrics = [];
+    const grouped = [];
     for (const s of entry.sections) {
         if (s.type !== 'metric')
             continue;
+        if (s.group)
+            grouped.push(s);
+        else
+            metrics.push(s);
+    }
+    let worst = -1;
+    let accent = 'low';
+    const chosen = metrics.length ? metrics : grouped;
+    for (const s of chosen) {
         const rank = severityRank(s.severity);
         if (rank > worst) {
             worst = rank;
@@ -391,15 +428,18 @@ export function cardFor(entry) {
         // An errored vendor outranks whatever its last good numbers said.
         accent: state === 'error' ? 'critical' : accent,
         error: state === 'error' ? errorMessage(entry.error) : '',
-        windows: entry.sections.filter(s => s.type === 'metric').map(s => ({
-            label: s.label,
-            window: shortLabel(s.label),
-            percent: s.percent,
-            value: s.percent === null ? s.value : `${s.percent}%`,
-            severity: s.severity,
-            resetAt: s.resetAt,
-            detail: metricDetail(s),
-        })),
+        windows: entry.sections.filter(s => s.type === 'metric').map(s => {
+            const showsValue = s.headline === 'value' && s.value !== '';
+            return {
+                label: s.label,
+                window: shortLabel(s.label),
+                percent: s.percent,
+                value: showsValue ? s.value : (s.percent === null ? s.value : `${s.percent}%`),
+                severity: s.severity,
+                resetAt: s.resetAt,
+                detail: metricDetail(s),
+            };
+        }),
         blocks: entry.sections.filter(s => s.type === 'block'),
     };
 }

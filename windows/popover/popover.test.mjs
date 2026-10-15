@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import {
   accountSwitchFor,
+  desktopPreparation,
   formatDuration,
   nextUpdateLabel,
   parseHostPayload,
@@ -34,6 +35,8 @@ import {
   hintPending,
   absorbPayload,
   setRowEnabled,
+  hiddenMetricKeys,
+  prefsForCard,
   moveRowToList,
   LAYOUT_KEY,
   normalizeLayout,
@@ -57,8 +60,10 @@ import {
   paceTickPercent,
   paceVisible,
   usageGoal,
+  usageGoalPercent,
   prettyMetricLabel,
   shortcutFromKeyEvent,
+  displayShortcut,
   defaultStars,
   toggleStar,
   metricRowKey,
@@ -86,6 +91,28 @@ import { measurePanelHeight } from './src/panel-size.js';
 
 const englishMessages = JSON.parse(readFileSync(new URL('./messages/en.json', import.meta.url), 'utf8'));
 
+{
+  const fixture = JSON.parse(readFileSync(new URL('../../tests/fixtures/grokbot_paced_report.json', import.meta.url), 'utf8'));
+  const now = Date.parse('2026-09-25T12:00:00Z');
+  const row = projectCards(parseHostPayload(fixture), now)[0].rows[0];
+  const projected = pace(row, now);
+  assert.equal(projected.elapsedPercent, 50);
+  assert.equal(projected.state, 'behind');
+  assert.match(paceText(projected, now), /Limit/);
+  assert.equal(pace({...row, window: undefined}, now), null);
+}
+
+{
+  const fixture = JSON.parse(readFileSync(new URL('../../tests/fixtures/cursor_paced_report.json', import.meta.url), 'utf8'));
+  const now = Date.parse('2026-09-25T12:00:00Z');
+  const [ahead, behind] = projectCards(parseHostPayload(fixture), now)[0].rows;
+  assert.equal(pace(ahead, now).elapsedPercent, 50);
+  assert.equal(pace(ahead, now).state, 'behind');
+  assert.equal(pace(behind, now).elapsedPercent, 50);
+  assert.notEqual(pace(behind, now).state, 'behind');
+  assert.equal(pace({...ahead, window: undefined}, now), null);
+}
+
 // The page declares an empty icon, so the WebView never asks the tray for /favicon.ico: the
 // custom protocol serves only the page, its script and its stylesheet, and the request logged
 // a 404 in the popover's console on every open.
@@ -98,8 +125,8 @@ const portugueseMessages = JSON.parse(readFileSync(new URL('./messages/pt-BR.jso
 assert.deepEqual(Object.keys(portugueseMessages).sort(), Object.keys(englishMessages).sort());
 assert.ok(Object.values(englishMessages).every((value) => typeof value === 'string' && value.trim()));
 assert.ok(Object.values(portugueseMessages).every((value) => typeof value === 'string' && value.trim()));
-assert.equal(englishMessages.menu_bar_shows_hint, "Both show the metrics you star in each provider.");
-assert.equal(portugueseMessages.menu_bar_shows_hint, "Os dois mostram as métricas marcadas com estrela em cada provedor.");
+assert.equal(englishMessages.menu_bar_shows_hint, "Chart and Logos show every provider's starred metrics. Quattro shows the selected provider's highest usage.");
+assert.equal(portugueseMessages.menu_bar_shows_hint, "Gráfico e Logotipos mostram as métricas marcadas de todos os provedores. Quattro mostra o maior uso do provedor selecionado.");
 for (const key of ['focused_provider', 'highest_consumption', 'usage_window']) {
   assert.equal(Object.hasOwn(englishMessages, key), false);
   assert.equal(Object.hasOwn(portugueseMessages, key), false);
@@ -124,7 +151,7 @@ const report = {
   menu_bar_show_all: false,
   menu_bar_hide_value: true,
   menu_bar_names: 'short',
-  menu_bar_chart: true,
+  menu_bar_look: 'quattro',
   accent: { light: '#123456', dark: '#ABCDEF' },
   primary: 'anthropic',
   entries: [
@@ -163,7 +190,20 @@ assert.equal(payload.startupEnabled, true);
 assert.equal(Object.hasOwn(payload, 'menuBarShowAll'), false);
 assert.equal(Object.hasOwn(payload, 'menuBarHideValue'), false);
 assert.equal(Object.hasOwn(payload, 'menuBarNames'), false);
-assert.equal(payload.menuBarChart, true);
+assert.equal(payload.menuBarLook, 'quattro');
+// ASSERT: an unknown or missing look reads as the default chart, never as a blank one.
+assert.equal(parseHostPayload({ menu_bar_look: 'sparkles' }).menuBarLook, 'chart');
+assert.equal(parseHostPayload({}).menuBarLook, 'chart');
+assert.equal(emptyPayload('').menuBarLook, 'chart');
+assert.equal(parseHostPayload({ menu_bar_look: 'logos' }).menuBarLook, 'logos');
+assert.equal(parseHostPayload({ menu_bar_look: 'quattro' }).menuBarLook, 'quattro');
+// The host only reports `quattro`; the 1.32.0 spelling is read on the Rust side, so `name` is unknown here.
+assert.equal(parseHostPayload({ menu_bar_look: 'name' }).menuBarLook, 'chart');
+// The Quattro look's short name is on unless the host says otherwise.
+assert.equal(parseHostPayload({}).menuBarShortName, true);
+assert.equal(emptyPayload('').menuBarShortName, true);
+assert.equal(parseHostPayload({ menu_bar_short_name: false }).menuBarShortName, false);
+assert.equal(parseHostPayload({ menu_bar_short_name: 'no' }).menuBarShortName, true);
 assert.deepEqual(payload.accent, { light: '#123456', dark: '#abcdef' });
 // ASSERT: malformed, partial, and non-object accent data cannot set either CSS color.
 assert.equal(parseHostPayload({ accent: { light: '#112233', dark: 'bad' } }).accent, null);
@@ -502,6 +542,18 @@ assert.equal(nextUpdateLabel({ nextRefreshAt: 120_000 }, 60_000, 'pt-BR'), 'Pró
 assert.equal(resetText({ resetAt: '2026-09-24T12:00:00Z' }, 'countdown', Date.parse('2026-09-24T11:00:00Z'), { locale: 'pt-BR' }), 'Redefine em 1h 0m');
 assert.match(formatResetExact(Date.parse('2026-09-24T12:00:00Z'), Date.parse('2026-09-24T11:00:00Z'), { locale: 'pt-BR', timeZone: 'UTC', timeFormat: '24' }), /^hoje às 12:00$/);
 assert.equal(updateStatusLabel({ update: null, updateCheckedAt: 0 }, 0, 'pt-BR'), 'Ainda não verificado');
+saveLayout(languageStore, { ...emptyLayout(), language: 'ko' });
+assert.equal(loadLayout(languageStore).language, 'ko');
+assert.equal(nextUpdateLabel({ nextRefreshAt: 120_000 }, 60_000, 'ko'), '1m 후 업데이트');
+assert.equal(resetText({ resetAt: '2026-09-24T12:00:00Z' }, 'countdown', Date.parse('2026-09-24T11:00:00Z'), { locale: 'ko' }), '1h 0m 후 초기화');
+assert.match(formatResetExact(Date.parse('2026-09-24T12:00:00Z'), Date.parse('2026-09-24T11:00:00Z'), { locale: 'ko', timeZone: 'UTC', timeFormat: '24' }), /^오늘 12:00$/);
+assert.equal(updateStatusLabel({ update: null, updateCheckedAt: 0 }, 0, 'ko'), '아직 확인 안 함');
+saveLayout(languageStore, { ...emptyLayout(), language: 'es' });
+assert.equal(loadLayout(languageStore).language, 'es');
+assert.equal(nextUpdateLabel({ nextRefreshAt: 120_000 }, 60_000, 'es'), 'Próxima actualización en 1m');
+assert.equal(resetText({ resetAt: '2026-09-24T12:00:00Z' }, 'countdown', Date.parse('2026-09-24T11:00:00Z'), { locale: 'es' }), 'Se reinicia en 1h 0m');
+assert.match(formatResetExact(Date.parse('2026-09-24T12:00:00Z'), Date.parse('2026-09-24T11:00:00Z'), { locale: 'es', timeZone: 'UTC', timeFormat: '24' }), /^hoy a las 12:00$/);
+assert.equal(updateStatusLabel({ update: null, updateCheckedAt: 0 }, 0, 'es'), 'Aún sin comprobar');
 
 // --- resetTimes layout field ------------------------------------
 
@@ -581,7 +633,10 @@ assert.equal(meterColor(NaN), 'blue');
   assert.equal(verdict(6, early), 'calm'); // ~126%, 1.2 pp
   assert.equal(verdict(7, early), 'calm'); // ~147%, 2.2 pp
   assert.equal(verdict(9, early), 'over'); // ~189%, 4.2 pp
-  assert.equal(verdict(10, early), 'critical'); // ~210%, 5.2 pp
+  assert.equal(verdict(10, early), 'over'); // ~210%, 5.2 pp: early in week with 90% left is over pace, not critical
+  assert.equal(color(10, early), 'yellow');
+  assert.equal(verdict(55, early), 'critical'); // heavy burn (>50% spent in 8h) is critical
+  assert.equal(color(55, early), 'red');
   assert.equal(color(7, early), 'blue');
   // Past 130% but only 3-5 points over the tick is a look, not a run-out.
   assert.equal(verdict(8, early), 'over'); // ~168%, 3.2 pp
@@ -714,6 +769,11 @@ assert.equal(resetAlternate(badStampRow, 'exact', resetNow, utc), '');
   assert.deepEqual(usageGoal(monthly, Date.parse('2026-03-31T12:00:00Z')), { percent: 100, estimated: true });
   assert.equal(usageGoal({ ...monthly, label: 'Weekly' }, end), null);
   assert.equal(usageGoal({ ...monthly, resetAt: 'bad' }, end), null);
+  // The goal reads like the meter: what should be spent in Used mode, what should remain in Left.
+  assert.equal(usageGoalPercent({ percent: 97, estimated: false }, 'used'), 97);
+  assert.equal(usageGoalPercent({ percent: 97, estimated: false }, 'left'), 3);
+  assert.equal(usageGoalPercent({ percent: 33, estimated: true }, 'left'), 67);
+  assert.equal(usageGoalPercent(null, 'left'), null);
 }
 
 // --- host payload: shortcut / updates / update / window_secs ------------------
@@ -871,8 +931,7 @@ assert.equal(resetAlternate(badStampRow, 'exact', resetNow, utc), '');
   // a spent meter (100%, "Limit reached") has no pace at all: no tick, no text, not visible
   const spent = pace(row(100, 2 * 3600_000), now);
   assert.equal(spent, null);
-  assert.equal(paceTickPercent(spent, 'used'), null);
-  assert.equal(paceTickPercent(spent, 'left'), null);
+  assert.equal(paceTickPercent(spent), null);
   assert.equal(paceText(spent, now), '');
   assert.equal(paceVisible(spent, { alwaysShowPace: true }), false);
   assert.equal(pace(row(100.5, 2 * 3600_000), now), null); // past the limit is still spent
@@ -880,24 +939,20 @@ assert.equal(resetAlternate(badStampRow, 'exact', resetNow, utc), '');
   const almostSpent = pace(row(99, 2 * 3600_000), now);
   assert.equal(almostSpent.state, 'behind');
   assert.equal(almostSpent.elapsedPercent, 40);
-  assert.equal(paceTickPercent(almostSpent, 'used'), 40);
-  assert.equal(paceTickPercent(almostSpent, 'left'), 60);
+  assert.equal(paceTickPercent(almostSpent), 40);
   // behind without a run-out instant has no text: the flame alone
   const noRunOut = { state: 'behind', sparePercent: -100, projectedPercent: 200, runsOutMs: null, elapsedPercent: 40 };
   assert.equal(paceText(noRunOut, now), '');
   assert.equal(paceText(noRunOut, now, { resetTimes: 'exact', timeZone: 'UTC' }), '');
 
-  // ASSERT: the tick follows the meter's reading — elapsed in Used mode, remaining in Left mode
-  assert.equal(paceTickPercent(behind, 'used'), 40);
-  assert.equal(paceTickPercent(behind, 'left'), 60);
-  assert.equal(paceTickPercent(ahead, 'used'), 50);
-  assert.equal(paceTickPercent(ahead, undefined), 50);
-  assert.equal(paceTickPercent({ ...ahead, elapsedPercent: 250 }, 'used'), 100);
-  assert.equal(paceTickPercent({ ...ahead, elapsedPercent: 250 }, 'left'), 0);
-  assert.equal(paceTickPercent({ ...ahead, elapsedPercent: -5 }, 'used'), 0);
-  assert.equal(paceTickPercent({ ...ahead, elapsedPercent: -5 }, 'left'), 100);
-  assert.equal(paceTickPercent({ ...ahead, elapsedPercent: NaN }, 'used'), 0);
-  assert.equal(paceTickPercent(null, 'used'), null);
+  // ASSERT: the tick sits in the meter's space, which always fills with the
+  // consumed share — the Used/Left toggle reads the headline, never the ink
+  assert.equal(paceTickPercent(behind), 40);
+  assert.equal(paceTickPercent(ahead), 50);
+  assert.equal(paceTickPercent({ ...ahead, elapsedPercent: 250 }), 100);
+  assert.equal(paceTickPercent({ ...ahead, elapsedPercent: -5 }), 0);
+  assert.equal(paceTickPercent({ ...ahead, elapsedPercent: NaN }), 0);
+  assert.equal(paceTickPercent(null), null);
 
   // ASSERT: no signal → null
   assert.equal(pace(row(50, 30_000), now), null); // 30s in: under the 1% / 60s floor
@@ -967,6 +1022,39 @@ assert.equal(resetAlternate(badStampRow, 'exact', resetNow, utc), '');
   assert.equal(shortcutFromKeyEvent(press('', { ctrl: true }, '')), null);
   assert.equal(shortcutFromKeyEvent(press('toString', { ctrl: true }, '')), null);
   assert.equal(shortcutFromKeyEvent(null), null);
+}
+
+// --- displayShortcut -------------------------------------------------------------
+
+{
+  // macOS shows the canonical "Win"/"Alt" modifiers as "Cmd"/"Option"; the stored value is untouched.
+  assert.equal(displayShortcut('Win+U', 'macos'), 'Cmd+U');
+  assert.equal(displayShortcut('Alt+U', 'macos'), 'Option+U');
+  assert.equal(displayShortcut('Ctrl+Alt+Shift+Win+K', 'macos'), 'Ctrl+Option+Shift+Cmd+K');
+  assert.equal(displayShortcut('Win+U', 'windows'), 'Win+U');
+  assert.equal(displayShortcut('Win+U', ''), 'Win+U');
+  assert.equal(displayShortcut('', 'macos'), '');
+  assert.equal(displayShortcut(undefined, 'macos'), '');
+}
+
+// --- ShortcutRecorder wiring guard -----------------------------------------------
+// The macOS tray is a WKWebView, and WebKit does not focus a <button> when it is
+// clicked (WebKit bug 22261), so the recorder must capture the chord on `document`
+// while recording rather than on the button. There is no DOM runner here to catch a
+// regression to a button-local handler, so pin the wiring.
+{
+  const source = readFileSync(
+    new URL('./src/components/ShortcutRecorder.tsx', import.meta.url),
+    'utf8',
+  );
+  assert.ok(
+    source.includes('document.addEventListener("keydown"'),
+    'ShortcutRecorder must listen for keydown on document',
+  );
+  assert.ok(
+    !source.includes('onKeyDown={'),
+    'ShortcutRecorder must not put the recording handler on the button',
+  );
 }
 
 // --- update status helpers -------------------------------------------------------
@@ -1089,6 +1177,8 @@ assert.equal(resetAlternate(badStampRow, 'exact', resetNow, utc), '');
   });
   const [usageCard] = projectCards(usageNamed, 0);
   assert.deepEqual(usageCard.rows.map((r) => r.label), ['Weekly', 'Grok Build', 'Grok Chat']);
+  // Ungrouped rows are quota windows the Native tab may headline.
+  assert.deepEqual(usageCard.rows.map((r) => r.grouped), [false, false, false]);
 
   // ASSERT: a plan equal to the title vanishes; a prefixed plan keeps its tail
   assert.equal(displayPlan(personal.title, personal.plan), '');
@@ -1287,6 +1377,8 @@ assert.equal(quotaAlternate(null, 'left'), '');
   assert.deepEqual(grok.rows.map((r) => [r.label, r.key]), [
     ['Grok Build (Breakdown)', 'metric:Grok Build (Breakdown)'],
   ]);
+  // A grouped row is marked, so the Native tab never headlines it over a quota window.
+  assert.equal(grok.rows[0].grouped, true);
 }
 
 // --- vendor warnings become card.warning, and errors carry an action ------------
@@ -1533,7 +1625,12 @@ assert.equal(resolvedTheme('system'), 'light');
     style: 'bars',
     stars,
     order: ['anthropic'],
+    show_as: 'left',
+    hidden_rows: {},
   });
+  // The menu bar follows the Used/Left reading, so the strip message carries it.
+  assert.equal(stripCommand({ ...seeded, showAs: 'used' }, cards).show_as, 'used');
+  assert.equal(stripCommand({ ...seeded, showAs: 'sideways' }, cards).show_as, 'left');
 }
 
 {
@@ -1553,6 +1650,37 @@ assert.equal(resolvedTheme('system'), 'light');
     },
   };
   assert.deepEqual(stripCommand(layout, cards).order, ['openai', 'anthropic']);
+}
+
+{
+  // A metric switched off in Customize does not count toward the macOS name chip's
+  // highest window: the strip message names it, under the key the host derives
+  // (src/tray/strip.rs metric_key). A hidden text row is not a metric and stays out.
+  const payload = parseHostPayload({
+    entries: [{
+      id: 'zai',
+      display_name: 'Z.AI',
+      sections: [
+        { type: 'metric', label: 'Session (5h)', percent: 0 },
+        { type: 'metric', label: 'Weekly', percent: 0 },
+        { type: 'metric', label: 'MCP tools (monthly)', percent: 18 },
+        { type: 'text', label: 'Plan', value: 'Pro' },
+      ],
+    }],
+  });
+  const cards = projectCards(payload, 0);
+  const zai = cards[0];
+  let prefs = setRowEnabled(prefsForCard(zai, emptyLayout()), 'metric:MCP tools (monthly)', false);
+  prefs = setRowEnabled(prefs, 'text:Plan', false);
+  const layout = { ...emptyLayout(), rows: { zai: prefs } };
+  assert.deepEqual(hiddenMetricKeys(zai, layout), ['metric:MCP tools (monthly)']);
+  assert.deepEqual(stripCommand(layout, cards).hidden_rows, { zai: ['metric:MCP tools (monthly)'] });
+  // Switched back on, nothing is hidden.
+  const shown = { ...layout, rows: { zai: setRowEnabled(prefs, 'metric:MCP tools (monthly)', true) } };
+  assert.deepEqual(hiddenMetricKeys(zai, shown), []);
+  assert.deepEqual(stripCommand(shown, cards).hidden_rows, {});
+  // hideExtras switches non-metric rows off by default; it never hides a metric.
+  assert.deepEqual(stripCommand({ ...emptyLayout(), hideExtras: true }, cards).hidden_rows, {});
 }
 
 {
@@ -1662,6 +1790,30 @@ assert.equal(resolvedTheme('system'), 'light');
   assert.deepEqual(parseHostPayload(JSON.stringify({ entries: [] })).accounts, {});
 }
 
+// A Claude card the CLI does not know falls back to the Claude Desktop login
+// of the same label, whose switch moves the app alone and asks twice; a label
+// the CLI knows keeps the CLI switch.
+{
+  const payload = parseHostPayload(JSON.stringify({
+    entries: [],
+    accounts: {
+      anthropic: { active: 'work', labels: ['work'] },
+      'claude-desktop': { active: 'home', labels: ['home', 'work', 'club'], target: 'club', switching: true },
+    },
+  }));
+  assert.equal(accountSwitchFor('anthropic@work', payload.accounts).vendor, 'anthropic');
+  assert.equal(accountSwitchFor('anthropic@work', payload.accounts).desktop, false);
+  const home = accountSwitchFor('anthropic@home', payload.accounts);
+  assert.equal(home.vendor, 'claude-desktop');
+  assert.equal(home.desktop, true);
+  assert.equal(home.active, true);
+  const club = accountSwitchFor('anthropic@club', payload.accounts);
+  assert.equal(club.switching, true);
+  assert.equal(accountSwitchFor('anthropic@other', payload.accounts), null);
+  assert.equal(accountSwitchFor('openai@home', payload.accounts), null);
+  assert.equal(accountSwitchFor('claude-desktop@home', payload.accounts), null);
+}
+
 // Every card that renders keeps its switch control: as many accounts as there
 // are cards, and a label longer than a card id matched through the id's cut.
 {
@@ -1748,6 +1900,28 @@ assert.equal(resolvedTheme('system'), 'light');
     about: 'Sobre',
     quit: 'Sair',
   });
+  assert.deepEqual(optionsMenuLabels('ko'), {
+    customize: '사용자화',
+    settings: '설정',
+    refresh: '새로 고침',
+    detect: '제공자 감지',
+    openTui: 'TUI 열기',
+    startAtLogin: '로그인 시 시작',
+    checkForUpdates: '업데이트 확인…',
+    about: '정보',
+    quit: '종료',
+  });
+  assert.deepEqual(optionsMenuLabels('es'), {
+    customize: 'Personalizar',
+    settings: 'Ajustes',
+    refresh: 'Actualizar',
+    detect: 'Detectar proveedores',
+    openTui: 'Abrir TUI',
+    startAtLogin: 'Abrir al iniciar sesión',
+    checkForUpdates: 'Buscar actualizaciones…',
+    about: 'Acerca de',
+    quit: 'Salir',
+  });
   // Unknown locales resolve to English, like the `lang` helper.
   assert.deepEqual(optionsMenuLabels('de'), optionsMenuLabels('en'));
 
@@ -1766,3 +1940,37 @@ assert.equal(resolvedTheme('system'), 'light');
 }
 
 console.log('ok');
+
+// Manual preparation belongs only to inactive Desktop cards. Fresh server
+// windows suppress repeated messages even while tiny usage rounds to 0%.
+{
+  const now = Date.parse('2026-10-10T14:00:01Z');
+  const card = { stale: false, errorTitle: '', rows: [
+    { kind: 'metric', window: 18000, usedPercent: 0, resetAt: '' },
+    { kind: 'metric', window: 604800, usedPercent: 20, resetAt: '' },
+  ] };
+  const account = { vendor: 'claude-desktop', label: 'two', active: false, prepareEnabled: true, busy: false };
+  assert.equal(desktopPreparation(card, { ...account, active: true }, now), null);
+  assert.equal(desktopPreparation(card, { ...account, vendor: 'anthropic' }, now), null);
+  assert.equal(desktopPreparation(card, { ...account, prepareEnabled: false }, now), null);
+  assert.equal(desktopPreparation(card, account, now).label, 'Prepare');
+  assert.equal(desktopPreparation(card, account, now).disabled, false);
+  assert.equal(desktopPreparation(card, { ...account, busy: true }, now).disabled, true);
+  assert.equal(desktopPreparation(card, { ...account, preparing: true }, now).label, 'Preparing…');
+  const running = { ...card, rows: [{ ...card.rows[0], resetAt: '2026-10-10T19:00:00Z' }, card.rows[1]] };
+  assert.equal(desktopPreparation(running, account, now).label, 'Ready');
+  assert.equal(desktopPreparation(running, account, now).disabled, true);
+  const exhausted = { ...running, rows: [{ ...running.rows[0], usedPercent: 100 }, card.rows[1]] };
+  assert.equal(desktopPreparation(exhausted, { ...account, preparedReset: '2026-10-10T19:00:00Z' }, now).label, 'Prepare');
+  assert.equal(desktopPreparation(exhausted, account, now).disabled, true);
+  assert.equal(desktopPreparation({ ...card, stale: true }, account, now).disabled, true);
+  assert.equal(desktopPreparation({ ...card, errorTitle: 'Offline' }, account, now).disabled, true);
+  assert.equal(desktopPreparation({ ...card, rows: [card.rows[0], { ...card.rows[1], usedPercent: 100 }] }, account, now).disabled, true);
+  assert.equal(desktopPreparation(card, { ...account, prepareError: 'Proxy unavailable' }, now).hint, 'Proxy unavailable');
+  const payload = parseHostPayload({ accounts: { 'claude-desktop': {
+    active: 'one', labels: ['one', 'two'], prepare_enabled: true, prepare_target: 'two', preparing: true,
+  } } });
+  assert.equal(accountSwitchFor('anthropic@two', payload.accounts).preparing, true);
+  assert.equal(accountSwitchFor('anthropic@one', payload.accounts).busy, true);
+  assert.equal(accountSwitchFor('anthropic@one', payload.accounts).active, true);
+}

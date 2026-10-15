@@ -1432,12 +1432,17 @@ enum LoginOutcome {
     NotFound,
 }
 
-fn login_claude_account(account_dir: &Path) -> LoginOutcome {
+fn claude_login_command(account_dir: &Path) -> std::process::Command {
     let mut command = std::process::Command::new("claude");
     command.env("CLAUDE_CONFIG_DIR", account_dir);
     for var in crate::vendor::vendor_secret_env_vars_to_remove(&[]) {
         command.env_remove(var);
     }
+    command
+}
+
+fn login_claude_account(account_dir: &Path) -> LoginOutcome {
+    let mut command = claude_login_command(account_dir);
 
     match command.status() {
         Ok(status) if status.success() => LoginOutcome::Ok,
@@ -1467,7 +1472,9 @@ fn register_at(config_path: &Path, label: &str, home: Option<&Path>) -> Result<R
         toml_edit::DocumentMut::new()
     } else {
         original.parse().map_err(|error: toml_edit::TomlError| {
-            AppError::Other(format!("config.toml is not valid TOML: {error}"))
+            let summary =
+                crate::config::toml_error_summary(&original, error.span(), error.message());
+            AppError::Other(format!("config.toml is not valid TOML: {summary}"))
         })?
     };
 
@@ -1666,8 +1673,7 @@ fn add_codex(label: &str, login: bool, adopt: bool) -> i32 {
     }
     println!("Opening `codex login` for {shown:?}; your default Codex login is untouched.");
     println!();
-    let mut command = std::process::Command::new("codex");
-    command.arg("login").env("CODEX_HOME", &codex_home);
+    let mut command = codex_login_command(&codex_home);
     match command.status() {
         Ok(status) if status.success() => {
             let _ = restamp_config(&registration.config_path);
@@ -1693,6 +1699,15 @@ fn add_codex(label: &str, login: bool, adopt: bool) -> i32 {
     }
 }
 
+fn codex_login_command(codex_home: &Path) -> std::process::Command {
+    let mut command = std::process::Command::new("codex");
+    command.arg("login").env("CODEX_HOME", codex_home);
+    for var in crate::vendor::vendor_secret_env_vars_to_remove(&[]) {
+        command.env_remove(var);
+    }
+    command
+}
+
 fn register_codex_at(config_path: &Path, label: &str, home: &Path) -> Result<RegisteredCodex> {
     let original = match std::fs::read_to_string(config_path) {
         Ok(contents) => contents,
@@ -1703,7 +1718,9 @@ fn register_codex_at(config_path: &Path, label: &str, home: &Path) -> Result<Reg
         toml_edit::DocumentMut::new()
     } else {
         original.parse().map_err(|error: toml_edit::TomlError| {
-            AppError::Other(format!("config.toml is not valid TOML: {error}"))
+            let summary =
+                crate::config::toml_error_summary(&original, error.span(), error.message());
+            AppError::Other(format!("config.toml is not valid TOML: {summary}"))
         })?
     };
     let existing = if config_path.exists() {
@@ -2363,5 +2380,66 @@ mod tests {
     fn printable_renders_an_error_as_one_terminal_safe_line() {
         let error = AppError::Other("bad \x1b[2Kpath\nRESTORED: 0 files\u{202e}".to_string());
         assert_eq!(printable(&error), "bad [2Kpath RESTORED: 0 files");
+    }
+
+    #[test]
+    fn codex_login_command_scrubs_vendor_secret_env_vars() {
+        let home = Path::new("/tmp/codex-home");
+        let command = codex_login_command(home);
+        assert_eq!(command.get_program(), "codex");
+        let args: Vec<_> = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(args, vec!["login"]);
+        let configured: BTreeMap<_, _> = command
+            .get_envs()
+            .map(|(k, v)| {
+                (
+                    k.to_string_lossy().into_owned(),
+                    v.map(|s| s.to_string_lossy().into_owned()),
+                )
+            })
+            .collect();
+        assert_eq!(
+            configured.get("CODEX_HOME").and_then(|v| v.as_deref()),
+            Some(home.to_str().unwrap())
+        );
+        for var in crate::vendor::vendor_secret_env_vars_to_remove(&[]) {
+            assert_eq!(
+                configured.get(var),
+                Some(&None),
+                "expected {var} to be scrubbed from codex login command"
+            );
+        }
+    }
+
+    #[test]
+    fn claude_login_command_scrubs_vendor_secret_env_vars() {
+        let dir = Path::new("/tmp/claude-dir");
+        let command = claude_login_command(dir);
+        assert_eq!(command.get_program(), "claude");
+        let configured: BTreeMap<_, _> = command
+            .get_envs()
+            .map(|(k, v)| {
+                (
+                    k.to_string_lossy().into_owned(),
+                    v.map(|s| s.to_string_lossy().into_owned()),
+                )
+            })
+            .collect();
+        assert_eq!(
+            configured
+                .get("CLAUDE_CONFIG_DIR")
+                .and_then(|v| v.as_deref()),
+            Some(dir.to_str().unwrap())
+        );
+        for var in crate::vendor::vendor_secret_env_vars_to_remove(&[]) {
+            assert_eq!(
+                configured.get(var),
+                Some(&None),
+                "expected {var} to be scrubbed from claude login command"
+            );
+        }
     }
 }

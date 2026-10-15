@@ -20,7 +20,10 @@ use ratatui_bubbletea_theme::BubbleTheme;
 
 use crate::balance::{self, DisplayPrefs, MetricHeadline};
 use crate::countdown;
-use crate::format::{clamp_pct, local_time_hms, money, reset_credit_lines, usd};
+use crate::format::{
+    clamp_pct, cursor_credit_label, cursor_credit_meter, local_time_hms, money, reset_credit_lines,
+    usd,
+};
 use crate::pacing::{self, PaceSeverity};
 use crate::pango::severity_for;
 use crate::theme::Theme;
@@ -134,11 +137,18 @@ impl SectionBuilder {
     }
 
     /// A metric whose vendor chose which of its two numbers goes on the bar.
-    /// Only a prepaid-balance vendor needs this; everything else is a
-    /// percentage and uses [`SectionBuilder::push_metric`].
-    fn push_metric_with_headline(&mut self, section: Section, headline: MetricHeadline) {
+    /// Only a prepaid-balance vendor (and Nous Research, whose credits are a
+    /// balance too) needs this; everything else is a percentage and uses
+    /// [`SectionBuilder::push_metric`].
+    fn push_metric_with_headline(
+        &mut self,
+        section: Section,
+        reset_at: Option<DateTime<Utc>>,
+        headline: MetricHeadline,
+    ) {
         assert!(matches!(section, Section::Metric { .. }));
         let mut row = Self::projection(section);
+        row.reset_at = reset_at;
         row.headline = headline;
         self.0.push(row);
     }
@@ -245,6 +255,7 @@ fn push_balance_headline(
             value_label,
             footnote,
         },
+        None,
         headline,
     );
 }
@@ -288,6 +299,16 @@ pub fn compact_cells(snapshot: &VendorSnapshot) -> (String, Vec<(String, PaceSev
             }
             if cells.is_empty() {
                 cells.push(("—".into(), PaceSeverity::Low));
+            }
+            (s.plan.clone(), cells)
+        }
+        VendorSnapshot::MuseCode(s) => {
+            let mut cells = Vec::new();
+            if let Some(window) = &s.session {
+                cells.push(pct("S", window.utilization_pct));
+            }
+            if let Some(window) = &s.weekly {
+                cells.push(pct("W", window.utilization_pct));
             }
             (s.plan.clone(), cells)
         }
@@ -335,6 +356,10 @@ pub fn compact_cells(snapshot: &VendorSnapshot) -> (String, Vec<(String, PaceSev
         }
         VendorSnapshot::Kilo(s) => (String::new(), vec![usd_cell(s.balance)]),
         VendorSnapshot::Novita(s) => (String::new(), vec![usd_cell(s.available)]),
+        VendorSnapshot::Lyceum(s) => (
+            String::new(),
+            vec![(usd(s.available_credits), PaceSeverity::Low)],
+        ),
         VendorSnapshot::Moonshot(s) => (String::new(), vec![money_cell(s.available, &s.currency)]),
         VendorSnapshot::Grok(s) => (String::new(), vec![usd_cell(s.balance)]),
         VendorSnapshot::SuperGrok(s) => (s.plan.clone(), vec![pct(s.period.short(), s.weekly_pct)]),
@@ -349,16 +374,35 @@ pub fn compact_cells(snapshot: &VendorSnapshot) -> (String, Vec<(String, PaceSev
         }
         VendorSnapshot::ModelStudio(s) => {
             // Absent windows drop their cell — no-data is not 0%.
-            let cells = [("5h", s.session.as_ref()), ("wk", s.weekly.as_ref())]
-                .into_iter()
-                .filter_map(|(label, window)| window.map(|w| pct(label, w.utilization_pct)))
-                .collect::<Vec<_>>();
+            let cells = [
+                ("5h", s.session.as_ref()),
+                ("wk", s.weekly.as_ref()),
+                ("mo", s.monthly.as_ref()),
+            ]
+            .into_iter()
+            .filter_map(|(label, window)| window.map(|w| pct(label, w.utilization_pct)))
+            .collect::<Vec<_>>();
             (
                 crate::vendor::VendorId::ModelStudio
                     .display_name()
                     .to_string(),
                 cells,
             )
+        }
+        VendorSnapshot::Devin(s) => {
+            let mut cells = [("D", s.daily.as_ref()), ("W", s.weekly.as_ref())]
+                .into_iter()
+                .filter_map(|(label, window)| window.map(|w| pct(label, w.utilization_pct)))
+                .collect::<Vec<_>>();
+            if let Some(balance) = s.overage_balance_micros {
+                cells.push((
+                    crate::usage::fmt_minor(balance, crate::devin::vendor::BALANCE_DECIMALS, None),
+                    PaceSeverity::Low,
+                ));
+            }
+            // The caller prints the vendor name; an empty plan label keeps it
+            // from appearing twice (Lyceum does the same).
+            (String::new(), cells)
         }
         VendorSnapshot::Antigravity(s) => (
             s.plan.clone(),
@@ -399,6 +443,14 @@ pub fn compact_cells(snapshot: &VendorSnapshot) -> (String, Vec<(String, PaceSev
             .filter_map(|(label, window)| window.map(|window| pct(label, window.pct())))
             .collect();
             (s.plan.clone().unwrap_or_default(), cells)
+        }
+        VendorSnapshot::Cline(s) => {
+            let cells = s
+                .windows()
+                .into_iter()
+                .filter_map(|(label, window)| window.map(|window| pct(label, window.pct())))
+                .collect();
+            (s.plan.clone().unwrap_or_else(|| "Cline".into()), cells)
         }
         VendorSnapshot::OpenCodeGo(s) => {
             let cells = [
@@ -492,6 +544,12 @@ pub fn headline_pct(snapshot: &VendorSnapshot) -> Option<i32> {
             let worst = s.worst_pct();
             (s.five_hour.is_some() || s.weekly.is_some()).then_some(worst)
         }
+        VendorSnapshot::Cline(s) => s.worst_pct(),
+        VendorSnapshot::MuseCode(s) => [s.session.as_ref(), s.weekly.as_ref()]
+            .into_iter()
+            .flatten()
+            .map(|window| window.utilization_pct)
+            .max(),
         VendorSnapshot::OpenCodeGo(s) => [
             s.rolling
                 .as_ref()
@@ -508,11 +566,20 @@ pub fn headline_pct(snapshot: &VendorSnapshot) -> Option<i32> {
         .max(),
         VendorSnapshot::SuperGrok(s) => Some(s.weekly_pct),
         VendorSnapshot::Grokbot(s) => s.has_included_allowance.then_some(s.weekly_pct),
-        VendorSnapshot::ModelStudio(s) => [s.session.as_ref(), s.weekly.as_ref()]
-            .into_iter()
-            .flatten()
-            .map(|w| w.utilization_pct)
-            .max(),
+        VendorSnapshot::ModelStudio(s) => {
+            [s.session.as_ref(), s.weekly.as_ref(), s.monthly.as_ref()]
+                .into_iter()
+                .flatten()
+                .map(|w| w.utilization_pct)
+                .max()
+        }
+        VendorSnapshot::Devin(s) => [
+            s.daily.as_ref().map(|window| window.utilization_pct),
+            s.weekly.as_ref().map(|window| window.utilization_pct),
+        ]
+        .into_iter()
+        .flatten()
+        .max(),
         VendorSnapshot::Ollama(s) => [
             s.session.as_ref().map(|w| w.utilization_pct),
             s.weekly.as_ref().map(|w| w.utilization_pct),
@@ -528,6 +595,7 @@ pub fn headline_pct(snapshot: &VendorSnapshot) -> Option<i32> {
         | VendorSnapshot::Deepinfra(_)
         | VendorSnapshot::Kilo(_)
         | VendorSnapshot::Novita(_)
+        | VendorSnapshot::Lyceum(_)
         | VendorSnapshot::Moonshot(_)
         | VendorSnapshot::Grok(_) => None,
     }
@@ -595,20 +663,24 @@ pub(crate) fn sections_with_metadata_for(
                 VendorSnapshot::Kimi(s) => kimi_sections(s, now, pace_tolerance),
                 VendorSnapshot::Kilo(s) => kilo_sections(s, prefs),
                 VendorSnapshot::Novita(s) => novita_sections(s, prefs),
+                VendorSnapshot::Lyceum(s) => lyceum_sections(s),
                 VendorSnapshot::Moonshot(s) => moonshot_sections(s, prefs),
                 VendorSnapshot::Grok(s) => grok_sections(s, prefs),
-                VendorSnapshot::SuperGrok(s) => supergrok_sections(s, now),
-                VendorSnapshot::Grokbot(s) => grokbot_sections(s, now),
+                VendorSnapshot::SuperGrok(s) => supergrok_sections(s, now, pace_tolerance),
+                VendorSnapshot::Grokbot(s) => grokbot_sections(s, now, pace_tolerance),
                 VendorSnapshot::ModelStudio(s) => modelstudio_sections(s, now, pace_tolerance),
+                VendorSnapshot::Devin(s) => devin_sections(s, now, pace_tolerance),
+                VendorSnapshot::MuseCode(s) => muse_sections(s, now, pace_tolerance),
                 VendorSnapshot::Antigravity(s) => antigravity_sections(s, now),
-                VendorSnapshot::Cursor(s) => cursor_sections(s, now),
+                VendorSnapshot::Cursor(s) => cursor_sections(s, now, pace_tolerance),
                 VendorSnapshot::Minimax(s) => minimax_sections(s, now, pace_tolerance),
                 VendorSnapshot::Kiro(s) => kiro_sections(s, now),
-                VendorSnapshot::NousResearch(s) => nous_sections(s, now),
+                VendorSnapshot::NousResearch(s) => nous_sections(s, now, prefs),
                 VendorSnapshot::OpenCodeGo(s) => opencode_go_sections(s, now, pace_tolerance),
                 VendorSnapshot::CommandCode(s) => commandcode_sections(s, now),
                 VendorSnapshot::Ollama(s) => ollama_sections(s, now, pace_tolerance),
                 VendorSnapshot::Custom(s) => custom_sections(s),
+                VendorSnapshot::Cline(s) => cline_sections(s, now),
             };
             // Inject the (already-absolute) fetched-at instant into the title
             // row, right-aligned. Pre-snapshotted in app::refresh_one so it
@@ -974,6 +1046,7 @@ fn openrouter_sections(
                 usd(s.total_credits)
             ),
         },
+        None,
         balance::resolve_headline(prefs.headline, denominator),
     );
     v.push(Section::Spacer);
@@ -1000,6 +1073,13 @@ fn openrouter_sections(
             "paid tier".into()
         }],
     });
+    if !s.recent_models.is_empty() {
+        v.push(Section::Spacer);
+        v.push(Section::Block {
+            label: "Recent models".into(),
+            body: s.recent_models.clone(),
+        });
+    }
     v
 }
 
@@ -1121,7 +1201,32 @@ fn push_cursor_pool(v: &mut SectionBuilder, section: Section, s: &crate::usage::
     }
 }
 
-fn cursor_sections(s: &crate::usage::CursorSnapshot, now: DateTime<Utc>) -> SectionBuilder {
+/// A pool's footnote, with how far through the billing cycle we are and the
+/// point delta when the cycle's length is exact. Both pools share the cycle,
+/// so only the delta differs between them. An unstated cycle adds nothing: no
+/// estimate is better than one paced against a guessed month.
+fn cursor_pool_footnote(
+    base: String,
+    pct: i32,
+    s: &crate::usage::CursorSnapshot,
+    now: DateTime<Utc>,
+    tol: u32,
+) -> String {
+    let Some(window) = s.cycle_window() else {
+        return base;
+    };
+    let pace = pacing::calc(pct, s.reset_at, now, window, tol);
+    format!(
+        "{base} · {}% elapsed · {}",
+        pace.elapsed_pct, pace.point_label
+    )
+}
+
+fn cursor_sections(
+    s: &crate::usage::CursorSnapshot,
+    now: DateTime<Utc>,
+    tol: u32,
+) -> SectionBuilder {
     let mut v = SectionBuilder::new(vec![Section::Title {
         left: format!("Cursor {}", s.plan),
         right: None,
@@ -1142,7 +1247,7 @@ fn cursor_sections(s: &crate::usage::CursorSnapshot, now: DateTime<Utc>) -> Sect
                 pct: s.auto_pct.clamp(0, 100) as u16,
                 severity: severity_for(s.auto_pct),
                 value_label: format!("{}%", s.auto_pct),
-                footnote: "Auto + Composer".into(),
+                footnote: cursor_pool_footnote("Auto + Composer".into(), s.auto_pct, s, now, tol),
             },
             s,
         );
@@ -1154,9 +1259,15 @@ fn cursor_sections(s: &crate::usage::CursorSnapshot, now: DateTime<Utc>) -> Sect
                 pct: s.api_pct.clamp(0, 100) as u16,
                 severity: severity_for(s.api_pct),
                 value_label: format!("{}%", s.api_pct),
-                footnote: format!(
-                    "Named / API models · on-demand {}",
-                    if s.on_demand_enabled { "on" } else { "off" }
+                footnote: cursor_pool_footnote(
+                    format!(
+                        "Named / API models · on-demand {}",
+                        if s.on_demand_enabled { "on" } else { "off" }
+                    ),
+                    s.api_pct,
+                    s,
+                    now,
+                    tol,
                 ),
             },
             s,
@@ -1166,6 +1277,31 @@ fn cursor_sections(s: &crate::usage::CursorSnapshot, now: DateTime<Utc>) -> Sect
             v.push_on_demand(used, s.on_demand_limit_cents);
         }
     }
+    for grant in &s.credits {
+        let name = cursor_credit_label(&crate::display::sanitize_untrusted_line(
+            grant.display_name.trim(),
+        ));
+        let (pct, value, footnote) = cursor_credit_meter(
+            grant.remaining_cents,
+            grant.total_cents,
+            grant.expires_at,
+            now,
+        );
+        v.push(Section::Spacer);
+        // Same shape as On-Demand: remaining dollars on the row, a bar for
+        // how much of the grant is already spent, expiry in the caption.
+        v.push_metric_with_headline(
+            Section::Metric {
+                label: name,
+                pct,
+                severity: severity_for(i32::from(pct)),
+                value_label: value,
+                footnote,
+            },
+            None,
+            MetricHeadline::Value,
+        );
+    }
     v.push(Section::Spacer);
     v.push(Section::Text {
         label: "Resets".into(),
@@ -1174,22 +1310,47 @@ fn cursor_sections(s: &crate::usage::CursorSnapshot, now: DateTime<Utc>) -> Sect
     v
 }
 
-fn nous_sections(s: &crate::nous::types::AccountSnapshot, now: DateTime<Utc>) -> SectionBuilder {
+fn nous_sections(
+    s: &crate::nous::types::AccountSnapshot,
+    now: DateTime<Utc>,
+    prefs: DisplayPrefs,
+) -> SectionBuilder {
     let mut sections = SectionBuilder::new(vec![Section::Title {
         left: "Nous Research".into(),
         right: None,
     }]);
     if let Some(value) = s.usage_percent() {
         let pct = clamp_pct(value);
-        sections.push_metric(
+        // `[nous] headline = "amount"` puts the credits still usable on the
+        // bar, the way the prepaid-balance vendors do. The consumed percentage
+        // keeps the meter, the severity and the detail line, so a spent
+        // allocation still reads critical while the balance stays visible.
+        let balance = s
+            .total_usable_credits
+            .or(s.purchased_credits_remaining)
+            .or(s.credits_remaining);
+        let headline = match (prefs.headline, balance) {
+            (crate::balance::Headline::Amount, Some(_)) => MetricHeadline::Value,
+            _ => MetricHeadline::Percent,
+        };
+        let (label, value_label, footnote) = match headline {
+            MetricHeadline::Value => (
+                "Credits remaining".into(),
+                format!("{:.2}", balance.unwrap_or_default()),
+                "usable now".into(),
+            ),
+            MetricHeadline::Percent => ("Usage".into(), format!("{pct}%"), "current period".into()),
+        };
+        sections.push_metric_with_headline(
             Section::Metric {
-                label: "Usage".into(),
+                label,
                 pct,
                 severity: severity_for(i32::from(pct)),
-                value_label: format!("{pct}%"),
-                footnote: "current period".into(),
+                value_label,
+                footnote,
             },
             s.current_period_end,
+            headline,
         );
     }
     sections.push(Section::Spacer);
@@ -1260,6 +1421,58 @@ fn commandcode_sections(
         sections.push(Section::Text {
             label: "Credits".into(),
             value: usd(credits.remaining()),
+        });
+    }
+    sections
+}
+
+/// Cline shows one bar per ClinePass limit. The reset row counts down to the
+/// reset time Cline reports; a limit with no open window has none ("—").
+fn cline_sections(s: &crate::cline::types::Snapshot, now: DateTime<Utc>) -> SectionBuilder {
+    let mut sections = SectionBuilder::new(vec![Section::Title {
+        left: s.plan.clone().unwrap_or_else(|| "Cline".into()),
+        right: None,
+    }]);
+    let mut any = false;
+    for (label, window) in [
+        ("5 hours", s.five_hour.as_ref()),
+        ("Weekly", s.seven_day.as_ref()),
+        ("Monthly", s.thirty_day.as_ref()),
+    ] {
+        let Some(window) = window else {
+            continue;
+        };
+        any = true;
+        let pct = window.pct();
+        sections.push_metric(
+            Section::Metric {
+                label: label.into(),
+                pct: pct.clamp(0, 100) as u16,
+                severity: severity_for(pct),
+                value_label: format!("{pct}%"),
+                footnote: String::new(),
+            },
+            window.resets_at(),
+        );
+        sections.push(Section::Text {
+            label: "Resets in".into(),
+            value: window
+                .resets_at()
+                .map(|at| countdown::format(Some(at), now))
+                .unwrap_or_else(|| "—".into()),
+        });
+    }
+    if !any {
+        sections.push(Section::Text {
+            label: "Quota".into(),
+            value: "this plan has no ClinePass quota".into(),
+        });
+    }
+    if let Some(period_end) = s.period_end {
+        sections.push(Section::Spacer);
+        sections.push(Section::Text {
+            label: "Renews".into(),
+            value: period_end.format("%Y-%m-%d").to_string(),
         });
     }
     sections
@@ -1443,6 +1656,24 @@ fn novita_sections(s: &crate::usage::NovitaSnapshot, prefs: DisplayPrefs) -> Sec
     v
 }
 
+fn lyceum_sections(s: &crate::usage::LyceumSnapshot) -> SectionBuilder {
+    SectionBuilder::new(vec![
+        Section::Title {
+            left: crate::vendor::VendorId::Lyceum.display_name().into(),
+            right: None,
+        },
+        Section::Spacer,
+        Section::Text {
+            label: "Available balance".into(),
+            value: usd(s.available_credits),
+        },
+        Section::Text {
+            label: "Amount used".into(),
+            value: usd(s.used_credits),
+        },
+    ])
+}
+
 fn moonshot_sections(s: &crate::usage::MoonshotSnapshot, prefs: DisplayPrefs) -> SectionBuilder {
     let cur = &s.currency;
     let fmt = |v: f64| money(v, cur);
@@ -1532,7 +1763,11 @@ fn custom_sections(s: &crate::custom::types::CustomSnapshot) -> SectionBuilder {
     v
 }
 
-fn supergrok_sections(s: &crate::usage::SuperGrokSnapshot, now: DateTime<Utc>) -> SectionBuilder {
+fn supergrok_sections(
+    s: &crate::usage::SuperGrokSnapshot,
+    now: DateTime<Utc>,
+    tol: u32,
+) -> SectionBuilder {
     let pct = s.weekly_pct;
     let mut v = SectionBuilder::new(vec![
         Section::Title {
@@ -1541,12 +1776,28 @@ fn supergrok_sections(s: &crate::usage::SuperGrokSnapshot, now: DateTime<Utc>) -
         },
         Section::Spacer,
     ]);
+    // The reset line `push_window` and Grok Bot print under their meters. Pace
+    // needs the exact window length, which only the weekly period has (see
+    // below).
+    let footnote = match (s.period, s.reset_at) {
+        (crate::usage::SuperGrokPeriod::Weekly, Some(_)) => {
+            let pace = pacing::calc(pct, s.reset_at, now, chrono::Duration::days(7), tol);
+            format!(
+                "Resets in {} · {}% elapsed · {}",
+                countdown::format(s.reset_at, now),
+                pace.elapsed_pct,
+                pace.point_label
+            )
+        }
+        (_, Some(_)) => format!("Resets in {}", countdown::format(s.reset_at, now)),
+        (_, None) => String::new(),
+    };
     let metric = Section::Metric {
         label: format!("{} usage", s.period.label()),
         pct: pct.clamp(0, 100) as u16,
         severity: severity_for(pct),
         value_label: format!("{pct}%"),
-        footnote: String::new(),
+        footnote,
     };
     // Only the weekly period has an exact length; a month varies and an
     // unknown period says nothing, so neither can be paced.
@@ -1607,6 +1858,19 @@ fn ollama_sections(
     push_top_models(&mut v, &s.session_models, "Top models (5h)");
     push_top_models(&mut v, &s.weekly_models, "Top models (weekly)");
     push_top_models(&mut v, &s.monthly_models, "Top models (monthly)");
+    if let Some(credits) = &s.credits {
+        let mut body = vec![format!(
+            "{} remaining of {}",
+            credits.balance, credits.allowance
+        )];
+        if let Some(purchased) = &credits.purchased {
+            body.push(format!("Purchased credits: {purchased}"));
+        }
+        v.push(Section::Block {
+            label: "Credits".into(),
+            body,
+        });
+    }
     if let Some(cost) = &s.activity_cost {
         v.push(Section::Spacer);
         v.push(Section::Block {
@@ -1806,7 +2070,11 @@ fn kimi_sections(s: &crate::usage::KimiSnapshot, now: DateTime<Utc>, tol: u32) -
 /// window length when both period instants were reported, so the report
 /// carries exact `window_secs` — or the no-included-allowance state, which is
 /// a text row, never a 0% meter.
-fn grokbot_sections(s: &crate::usage::GrokbotSnapshot, now: DateTime<Utc>) -> SectionBuilder {
+fn grokbot_sections(
+    s: &crate::usage::GrokbotSnapshot,
+    now: DateTime<Utc>,
+    tol: u32,
+) -> SectionBuilder {
     let mut v = SectionBuilder::new(vec![Section::Title {
         left: s.display_plan().to_string(),
         right: None,
@@ -1819,12 +2087,24 @@ fn grokbot_sections(s: &crate::usage::GrokbotSnapshot, now: DateTime<Utc>) -> Se
         });
         return v;
     }
+    let footnote = match s.window {
+        Some(window) if window.num_seconds() > 0 && s.reset_at.is_some() => {
+            let pace = pacing::calc(s.weekly_pct, s.reset_at, now, window, tol);
+            format!(
+                "Resets in {} · {}% elapsed · {}",
+                countdown::format(s.reset_at, now),
+                pace.elapsed_pct,
+                pace.point_label
+            )
+        }
+        _ => format!("Resets in {}", countdown::format(s.reset_at, now)),
+    };
     let metric = Section::Metric {
         label: "Weekly".into(),
         pct: s.weekly_pct.clamp(0, 100) as u16,
         severity: severity_for(s.weekly_pct),
         value_label: format!("{}%", s.weekly_pct),
-        footnote: format!("Resets in {}", countdown::format(s.reset_at, now)),
+        footnote,
     };
     match s.window {
         Some(window) => v.push_metric_in_window(metric, s.reset_at, window),
@@ -1842,10 +2122,12 @@ fn grokbot_sections(s: &crate::usage::GrokbotSnapshot, now: DateTime<Utc>) -> Se
     v
 }
 
-/// Model Studio Token Plan: a 5h and a weekly window, each of which the
-/// console account may not report. Present windows ride the shared
+/// Model Studio Token Plan: a 5h, a weekly and a monthly window, each of
+/// which the console account may not report. Present windows ride the shared
 /// `push_window`; an absent one is no-data (possibly unlimited), drawn as a
-/// text row — never a 0% meter.
+/// text row — never a 0% meter. The monthly window rides `push_metric`,
+/// without a declared window length: the cycle is plan-dependent (28–31
+/// days), so a frontend must not pace against a guessed denominator.
 fn modelstudio_sections(
     s: &crate::usage::ModelStudioSnapshot,
     now: DateTime<Utc>,
@@ -1862,13 +2144,85 @@ fn modelstudio_sections(
     if let Some(weekly) = s.weekly.as_ref() {
         push_window(&mut v, "Token Plan 7d", weekly, now, tol, true);
     }
-    if s.session.is_none() && s.weekly.is_none() {
+    if let Some(monthly) = s.monthly.as_ref() {
+        if s.session.is_some() || s.weekly.is_some() {
+            v.push(Section::Spacer);
+        }
+        let reset_text = countdown::format(monthly.resets_at, now);
+        v.push_metric(
+            Section::Metric {
+                label: "Token Plan 30d".into(),
+                pct: monthly.utilization_pct.clamp(0, 100) as u16,
+                severity: severity_for(monthly.utilization_pct),
+                value_label: format!("{}%", monthly.utilization_pct),
+                footnote: format!("Resets in {reset_text}"),
+            },
+            monthly.resets_at,
+        );
+    }
+    if s.session.is_none() && s.weekly.is_none() && s.monthly.is_none() {
         v.push(Section::Text {
             label: "Usage".into(),
             value: "no usage windows reported".into(),
         });
     }
     v
+}
+
+fn muse_sections(
+    s: &crate::usage::MuseSnapshot,
+    now: DateTime<Utc>,
+    tolerance: u32,
+) -> SectionBuilder {
+    let mut sections = SectionBuilder::new(vec![Section::Title {
+        left: s.plan.clone(),
+        right: None,
+    }]);
+    if let Some(window) = &s.session {
+        push_window(&mut sections, "Session quota", window, now, tolerance, true);
+    }
+    if let Some(window) = &s.weekly {
+        push_window(&mut sections, "Weekly quota", window, now, tolerance, true);
+    }
+    sections
+}
+
+fn devin_sections(
+    snapshot: &crate::usage::DevinSnapshot,
+    now: DateTime<Utc>,
+    tol: u32,
+) -> SectionBuilder {
+    let mut sections = SectionBuilder::new(vec![Section::Title {
+        left: crate::vendor::VendorId::Devin.display_name().into(),
+        right: None,
+    }]);
+    if let Some(daily) = snapshot.daily.as_ref() {
+        push_window(&mut sections, "Daily quota", daily, now, tol, true);
+    }
+    if let Some(weekly) = snapshot.weekly.as_ref() {
+        push_window(&mut sections, "Weekly quota", weekly, now, tol, true);
+    }
+    if snapshot.daily.is_none()
+        && snapshot.weekly.is_none()
+        && snapshot.overage_balance_micros.is_none()
+    {
+        sections.push(Section::Text {
+            label: "Usage".into(),
+            value: "no quota fields reported".into(),
+        });
+    }
+    if let Some(balance) = snapshot.overage_balance_micros {
+        sections.push(Section::Spacer);
+        sections.push(Section::Text {
+            label: "Overage balance".into(),
+            value: crate::usage::fmt_minor(balance, crate::devin::vendor::BALANCE_DECIMALS, None),
+        });
+        sections.push(Section::Text {
+            label: "Balance note".into(),
+            value: "Microunit-to-USD display matches the tested account; currency contract is unverified.".into(),
+        });
+    }
+    sections
 }
 
 fn push_window(
@@ -2126,6 +2480,28 @@ mod tests {
         Utc.with_ymd_and_hms(2026, 5, 23, 12, 0, 0).unwrap()
     }
 
+    #[test]
+    fn lyceum_panel_shows_usd_balance_without_a_quota_percentage() {
+        let snapshot = VendorSnapshot::Lyceum(crate::usage::LyceumSnapshot {
+            available_credits: 42.5,
+            used_credits: 7.5,
+            total_credits_used: 7.5,
+            remaining_credits: 42.5,
+            monthly_free_credits: 0.0,
+            purchased_credits: 50.0,
+        });
+        let sections = sections_for(&ready(snapshot.clone()), now(), 5);
+        assert!(sections.iter().any(|section| matches!(section, Section::Text { label, value } if label == "Available balance" && value == "$42.50")));
+        assert!(
+            !sections
+                .iter()
+                .any(|section| matches!(section, Section::Metric { .. }))
+        );
+        assert_eq!(headline_pct(&snapshot), None);
+        let (_, cells) = compact_cells(&snapshot);
+        assert_eq!(cells[0].0, "$42.50");
+    }
+
     fn ready(snapshot: VendorSnapshot) -> TabState {
         ready_with(snapshot, DisplayPrefs::default())
     }
@@ -2160,6 +2536,54 @@ mod tests {
         let metric = metrics.next().expect("one metric row");
         assert!(metrics.next().is_none(), "expected exactly one metric row");
         metric
+    }
+
+    fn nous_snapshot() -> crate::nous::types::AccountSnapshot {
+        crate::nous::types::AccountSnapshot {
+            plan: Some("Ultra".into()),
+            tier: Some(9),
+            monthly_credits: Some(220.0),
+            credits_remaining: Some(0.0),
+            purchased_credits_remaining: Some(12.93),
+            total_usable_credits: Some(12.93),
+            rollover_credits: Some(10.0),
+            current_period_end: None,
+        }
+    }
+
+    /// `[nous] headline = "amount"` moves the credits still usable onto the
+    /// bar; the plan-usage percentage keeps the meter and the detail line.
+    #[test]
+    fn nous_bar_headline_can_be_the_credits_balance() {
+        let percent = sections_with_metadata_for(
+            &ready(VendorSnapshot::NousResearch(nous_snapshot())),
+            now(),
+            5,
+        );
+        let metric = only_metric(&percent);
+        assert_eq!(metric.headline, MetricHeadline::Percent);
+        match &metric.section {
+            Section::Metric { value_label, .. } => assert_eq!(value_label, "100%"),
+            _ => unreachable!(),
+        }
+
+        let prefs = DisplayPrefs::balance(None, crate::balance::Headline::Amount);
+        let balance = sections_with_metadata_for(
+            &ready_with(VendorSnapshot::NousResearch(nous_snapshot()), prefs),
+            now(),
+            5,
+        );
+        let metric = only_metric(&balance);
+        assert_eq!(metric.headline, MetricHeadline::Value);
+        match &metric.section {
+            Section::Metric {
+                pct, value_label, ..
+            } => {
+                assert_eq!(*pct, 100);
+                assert_eq!(value_label, "12.93");
+            }
+            _ => unreachable!(),
+        }
     }
 
     /// Only a rolling window has a length a frontend can pace against. The
@@ -2243,6 +2667,44 @@ mod tests {
             pools.iter().all(|p| p.reset_at.is_some()),
             "the reset time still travels with the row"
         );
+    }
+
+    #[test]
+    fn cursor_pool_footnotes_pace_each_pool_against_an_exact_billing_cycle() {
+        let snap = crate::usage::CursorSnapshot {
+            auto_pct: 70,
+            api_pct: 30,
+            reset_at: Some(now() + chrono::Duration::days(5)),
+            cycle_start: Some(now() - chrono::Duration::days(5)),
+            ..cursor_snap()
+        };
+        let sections = sections_for(&ready(VendorSnapshot::Cursor(snap)), now(), 5);
+        let footnotes: Vec<&str> = sections
+            .iter()
+            .filter_map(|section| match section {
+                Section::Metric { footnote, .. } => Some(footnote.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            footnotes,
+            [
+                "Auto + Composer · 50% elapsed · 20pts ahead",
+                "Named / API models · on-demand off · 50% elapsed · 20pts under",
+            ]
+        );
+    }
+
+    #[test]
+    fn cursor_pool_footnotes_skip_the_pace_when_the_cycle_is_not_exact() {
+        // No `billingCycleStart`: the footnotes stay what they were, as the
+        // window stays absent from the report.
+        let sections = sections_for(&ready(VendorSnapshot::Cursor(cursor_snap())), now(), 5);
+        for section in &sections {
+            if let Section::Metric { footnote, .. } = section {
+                assert!(!footnote.contains("elapsed"), "{footnote}");
+            }
+        }
     }
 
     #[test]
@@ -2392,7 +2854,7 @@ mod tests {
             })
             .expect("uncapped extra usage must still render a section");
         assert_eq!(extra.0, 0);
-        // Non-vacuous currency pin: fmt_dollars would say "$141.57" here.
+        // Non-vacuous currency pin: a bare `$` formatter would say "$141.57" here.
         assert_eq!(extra.1, "R$141.57");
         assert!(
             !extra.1.contains(" of "),
@@ -2441,6 +2903,7 @@ mod tests {
             is_free_tier: false,
             limit: None,
             limit_remaining: None,
+            recent_models: Vec::new(),
         };
         let sections = sections_for(&ready(VendorSnapshot::Openrouter(snap)), now(), 5);
         assert!(matches!(sections[0], Section::Title { .. }));
@@ -2453,6 +2916,44 @@ mod tests {
             sections
                 .iter()
                 .any(|s| matches!(s, Section::Block { label, .. } if label == "Usage by period"))
+        );
+    }
+
+    #[test]
+    fn openrouter_recent_models_block_renders_only_when_present() {
+        let snap = |recent_models: Vec<String>| OpenRouterSnapshot {
+            label: "OR".into(),
+            total_credits: 100.0,
+            total_usage: 25.0,
+            usage_daily: 1.0,
+            usage_weekly: 5.0,
+            usage_monthly: 25.0,
+            is_free_tier: false,
+            limit: None,
+            limit_remaining: None,
+            recent_models,
+        };
+        let models = vec!["gpt-5-codex ($1.25 · 42 reqs)".to_string()];
+        let sections = sections_for(
+            &ready(VendorSnapshot::Openrouter(snap(models.clone()))),
+            now(),
+            5,
+        );
+        let block = sections.iter().find_map(|s| match s {
+            Section::Block { label, body } if label == "Recent models" => Some(body),
+            _ => None,
+        });
+        assert_eq!(block, Some(&models));
+
+        let sections = sections_for(
+            &ready(VendorSnapshot::Openrouter(snap(Vec::new()))),
+            now(),
+            5,
+        );
+        assert!(
+            !sections
+                .iter()
+                .any(|s| matches!(s, Section::Block { label, .. } if label == "Recent models"))
         );
     }
 
@@ -2471,6 +2972,7 @@ mod tests {
             is_free_tier: false,
             limit: None,
             limit_remaining: None,
+            recent_models: Vec::new(),
         };
         let sections = sections_for(&ready(VendorSnapshot::Openrouter(snap.clone())), now(), 5);
         let metric = sections
@@ -2904,6 +3406,91 @@ mod tests {
         assert_eq!(build.window, None);
     }
 
+    /// The overall meter names its reset the way Grok Bot's does, so the TUI,
+    /// `usage --json` and the Omarchy panel, which all read this footnote, do
+    /// not show a bare percentage.
+    #[test]
+    fn supergrok_weekly_usage_row_carries_the_countdown_and_pace() {
+        use crate::usage::SuperGrokPeriod;
+
+        let sections =
+            sections_with_metadata_for(&ready(supergrok(SuperGrokPeriod::Weekly)), now(), 5);
+        let Section::Metric { footnote, .. } = &only_metric(&sections).section else {
+            unreachable!()
+        };
+        // Two of seven days left is 71% elapsed; 40% used is 31 points under.
+        assert_eq!(footnote, "Resets in 2d 0h · 71% elapsed · 31pts under");
+    }
+
+    /// A month varies and an unknown period says nothing, so neither can be
+    /// paced: the countdown stands alone.
+    #[test]
+    fn supergrok_monthly_and_unknown_usage_rows_carry_the_countdown_alone() {
+        use crate::usage::SuperGrokPeriod;
+
+        for period in [SuperGrokPeriod::Monthly, SuperGrokPeriod::Unknown] {
+            let sections = sections_with_metadata_for(&ready(supergrok(period)), now(), 5);
+            let Section::Metric { footnote, .. } = &only_metric(&sections).section else {
+                unreachable!()
+            };
+            assert_eq!(footnote, "Resets in 2d 0h", "{period:?}");
+        }
+    }
+
+    /// With no reset reported there is nothing to count down to, so the row
+    /// carries no footnote rather than a "Resets in" line with a placeholder.
+    #[test]
+    fn supergrok_usage_row_without_a_reset_has_no_footnote() {
+        let now = now();
+        let snap = crate::usage::SuperGrokSnapshot {
+            plan: "SuperGrok".into(),
+            account: "scope".into(),
+            weekly_pct: 40,
+            period: crate::usage::SuperGrokPeriod::Weekly,
+            reset_at: None,
+            prepaid_balance: None,
+            reset_credits: ResetCredits::default(),
+            products: Vec::new(),
+        };
+        let projected = sections_with_metadata_for(&ready(VendorSnapshot::SuperGrok(snap)), now, 5);
+        let Section::Metric { footnote, .. } = &only_metric(&projected).section else {
+            unreachable!()
+        };
+        assert_eq!(footnote, "");
+    }
+
+    /// Product slices share the overall pool's window, so only the overall
+    /// meter carries the reset line.
+    #[test]
+    fn supergrok_product_slices_keep_an_empty_footnote() {
+        let now = now();
+        let snap = crate::usage::SuperGrokSnapshot {
+            plan: "SuperGrok".into(),
+            account: "scope".into(),
+            weekly_pct: 90,
+            period: crate::usage::SuperGrokPeriod::Weekly,
+            reset_at: Some(now + chrono::Duration::days(3)),
+            prepaid_balance: None,
+            reset_credits: ResetCredits::default(),
+            products: vec![crate::usage::SuperGrokProduct {
+                label: "Grok Build".into(),
+                percent: 87,
+            }],
+        };
+        let projected = sections_with_metadata_for(&ready(VendorSnapshot::SuperGrok(snap)), now, 5);
+        let footnotes: Vec<&str> = projected
+            .iter()
+            .filter_map(|p| match &p.section {
+                Section::Metric { footnote, .. } => Some(footnote.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            footnotes,
+            ["Resets in 3d 0h · 57% elapsed · 33pts ahead", ""]
+        );
+    }
+
     #[test]
     fn kimi_sections_include_weekly_and_window_with_used_over_limit() {
         let now = now();
@@ -3086,6 +3673,7 @@ mod tests {
             on_demand_limit_cents: None,
             reset_at: Some(now() + chrono::Duration::days(9)),
             cycle_start: None,
+            credits: Vec::new(),
         }
     }
 
@@ -3176,6 +3764,27 @@ mod tests {
         assert!(sections.iter().any(|s| matches!(
             s,
             Section::Text { label, value } if label == "Resets" && value.contains("9d")
+        )));
+    }
+
+    #[test]
+    fn cursor_credit_grant_is_a_meter_like_on_demand() {
+        let mut snapshot = cursor_snap();
+        snapshot.credits.push(crate::usage::CursorCreditGrant {
+            remaining_cents: 2100,
+            total_cents: 2500,
+            expires_at: Some(now() + chrono::Duration::days(30)),
+            display_name: "Power user grant".into(),
+        });
+        let sections = sections_for(&ready(VendorSnapshot::Cursor(snapshot)), now(), 5);
+        assert!(sections.iter().any(|section| matches!(
+            section,
+            Section::Metric { label, pct, value_label, footnote, .. }
+                if label == "Credits"
+                    && *pct == 16
+                    && value_label == "$21.00"
+                    && footnote.contains("$4.00 of $25.00 used (16%)")
+                    && footnote.contains("30d 0h")
         )));
     }
 
@@ -3307,8 +3916,43 @@ mod tests {
         assert_eq!(value_label, "42%");
         assert!(footnote.contains("Resets in"), "{footnote}");
         // The honest derived window, so a frontend paces against 7d exactly.
+        assert!(footnote.contains("42% elapsed · on track"), "{footnote}");
         assert_eq!(metric.window, Some(chrono::Duration::days(7)));
         assert_eq!(metric.reset_at, grokbot_snap().reset_at);
+    }
+
+    #[test]
+    fn grokbot_pacing_details_use_variable_periods_and_skip_missing_bounds() {
+        for (reset_at, window, expected) in [
+            (
+                Some(now() + chrono::Duration::days(5)),
+                Some(chrono::Duration::days(10)),
+                Some("50% elapsed · 8pts under"),
+            ),
+            (None, Some(chrono::Duration::days(10)), None),
+            (Some(now() + chrono::Duration::days(5)), None, None),
+            (
+                Some(now() + chrono::Duration::days(5)),
+                Some(chrono::Duration::zero()),
+                None,
+            ),
+        ] {
+            let snap = crate::usage::GrokbotSnapshot {
+                reset_at,
+                window,
+                ..grokbot_snap()
+            };
+            let sections =
+                sections_with_metadata_for(&ready(VendorSnapshot::Grokbot(snap)), now(), 5);
+            let Section::Metric { footnote, .. } = &only_metric(&sections).section else {
+                panic!("expected a weekly metric");
+            };
+            if let Some(expected) = expected {
+                assert!(footnote.contains(expected), "{footnote}");
+            } else {
+                assert!(!footnote.contains("elapsed"), "{footnote}");
+            }
+        }
     }
 
     #[test]
@@ -3401,6 +4045,7 @@ mod tests {
                 resets_at: Some(now() + chrono::Duration::days(3)),
                 window_duration: chrono::Duration::days(7),
             }),
+            monthly: None,
         }
     }
 
@@ -3457,6 +4102,7 @@ mod tests {
         let snap = crate::usage::ModelStudioSnapshot {
             session: None,
             weekly: None,
+            monthly: None,
         };
         let sections = sections_for(&ready(VendorSnapshot::ModelStudio(snap.clone())), now(), 5);
         assert!(
@@ -3480,11 +4126,147 @@ mod tests {
         let snap = crate::usage::ModelStudioSnapshot {
             session: None,
             weekly: modelstudio_snap().weekly,
+            monthly: None,
         };
         let (_, cells) = compact_cells(&VendorSnapshot::ModelStudio(snap.clone()));
         assert_eq!(cells.len(), 1);
         assert!(cells[0].0.contains("74%"), "{cells:?}");
         assert_eq!(headline_pct(&VendorSnapshot::ModelStudio(snap)), Some(74));
+    }
+
+    /// The monthly window — the individual Token Plan's only reported window —
+    /// gets its own meter with the exact reset, but no declared window length
+    /// (the cycle is plan-dependent), so no frontend paces against a guessed
+    /// denominator.
+    #[test]
+    fn modelstudio_monthly_only_renders_a_meter_with_reset_and_no_window_length() {
+        let snap = crate::usage::ModelStudioSnapshot {
+            session: None,
+            weekly: None,
+            monthly: Some(crate::usage::UsageWindow {
+                utilization_pct: 100,
+                resets_at: Some(now() + chrono::Duration::days(21)),
+                window_duration: chrono::Duration::days(30),
+            }),
+        };
+        let sections =
+            sections_with_metadata_for(&ready(VendorSnapshot::ModelStudio(snap.clone())), now(), 5);
+        let metrics: Vec<_> = sections
+            .iter()
+            .filter_map(|projected| match &projected.section {
+                Section::Metric { label, .. } => Some(label.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(metrics, vec!["Token Plan 30d".to_string()]);
+        let metric = sections
+            .iter()
+            .find(|p| matches!(p.section, Section::Metric { .. }))
+            .unwrap();
+        assert_eq!(
+            metric.reset_at,
+            Some(now() + chrono::Duration::days(21)),
+            "the exact reset travels with the row"
+        );
+        assert_eq!(
+            metric.window, None,
+            "a plan-dependent monthly cycle declares no window length"
+        );
+        assert_eq!(headline_pct(&VendorSnapshot::ModelStudio(snap)), Some(100));
+
+        // The absent 5h/weekly windows stay text rows, never zero meters.
+        let (_, cells) = compact_cells(&crate::usage::VendorSnapshot::ModelStudio(
+            crate::usage::ModelStudioSnapshot {
+                session: None,
+                weekly: None,
+                monthly: Some(crate::usage::UsageWindow {
+                    utilization_pct: 100,
+                    resets_at: Some(now() + chrono::Duration::days(21)),
+                    window_duration: chrono::Duration::days(30),
+                }),
+            },
+        ));
+        assert_eq!(cells.len(), 1, "{cells:?}");
+    }
+
+    #[test]
+    fn devin_daily_and_weekly_windows_keep_reset_metadata_and_no_fake_session() {
+        let daily_reset = now() + chrono::Duration::hours(4);
+        let weekly_reset = now() + chrono::Duration::days(2);
+        let snapshot = crate::usage::DevinSnapshot {
+            daily: Some(UsageWindow {
+                utilization_pct: 35,
+                resets_at: Some(daily_reset),
+                window_duration: chrono::Duration::days(1),
+            }),
+            weekly: Some(UsageWindow {
+                utilization_pct: 72,
+                resets_at: Some(weekly_reset),
+                window_duration: chrono::Duration::days(7),
+            }),
+            overage_balance_micros: Some(9_168_615),
+        };
+        let vendor = VendorSnapshot::Devin(snapshot.clone());
+        let sections = sections_with_metadata_for(&ready(vendor.clone()), now(), 5);
+        let metrics: Vec<_> = sections
+            .iter()
+            .filter_map(|projection| match &projection.section {
+                Section::Metric {
+                    label, value_label, ..
+                } => Some((
+                    label.as_str(),
+                    value_label.as_str(),
+                    projection.reset_at,
+                    projection.window,
+                )),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(metrics.len(), 2);
+        assert_eq!(
+            metrics[0],
+            (
+                "Daily quota",
+                "35%",
+                Some(daily_reset),
+                Some(chrono::Duration::days(1))
+            )
+        );
+        assert_eq!(
+            metrics[1],
+            (
+                "Weekly quota",
+                "72%",
+                Some(weekly_reset),
+                Some(chrono::Duration::days(7))
+            )
+        );
+        assert_eq!(headline_pct(&vendor), Some(72));
+        let (plan, cells) = compact_cells(&vendor);
+        assert_eq!(plan, "", "the caller prints the vendor name");
+        assert_eq!(cells.len(), 3, "daily, weekly and text balance only");
+        assert_eq!(cells[2].0, "$9.168615");
+
+        let no_data = VendorSnapshot::Devin(crate::usage::DevinSnapshot {
+            daily: None,
+            weekly: None,
+            overage_balance_micros: None,
+        });
+        let sections = sections_for(&ready(no_data.clone()), now(), 5);
+        assert!(sections.iter().any(|section| matches!(
+            section,
+            Section::Text { value, .. } if value == "no quota fields reported"
+        )));
+        assert_eq!(headline_pct(&no_data), None);
+        assert!(compact_cells(&no_data).1.is_empty());
+
+        let balance_only = VendorSnapshot::Devin(crate::usage::DevinSnapshot {
+            daily: None,
+            weekly: None,
+            overage_balance_micros: Some(1),
+        });
+        assert_eq!(headline_pct(&balance_only), None);
+        assert_eq!(compact_cells(&balance_only).1.len(), 1);
     }
 
     #[test]
@@ -3890,6 +4672,7 @@ mod tests {
             is_free_tier: false,
             limit: None,
             limit_remaining: None,
+            recent_models: Vec::new(),
         });
         // A wildly different tank size changes nothing: 25 of 100 is 25%.
         // `[openrouter]` carries no `display_limit`, so this can only arrive
@@ -3918,6 +4701,7 @@ mod tests {
             is_free_tier: false,
             limit: None,
             limit_remaining: None,
+            recent_models: Vec::new(),
         });
         let sections = sections_with_metadata_for(
             &ready_with(
@@ -3957,6 +4741,7 @@ mod tests {
             is_free_tier: true,
             limit: None,
             limit_remaining: None,
+            recent_models: Vec::new(),
         });
         for prefs in [
             DisplayPrefs::default(),
@@ -3991,6 +4776,7 @@ mod tests {
             is_free_tier: false,
             limit: Some(50.0),
             limit_remaining: Some(50.0),
+            recent_models: Vec::new(),
         });
         let prefs = DisplayPrefs::balance(Some(200.0), crate::balance::Headline::Percent);
         let sections = sections_with_metadata_for(&ready_with(snapshot, prefs), now(), 5);
@@ -4007,6 +4793,43 @@ mod tests {
             }
             _ => unreachable!(),
         }
+    }
+
+    /// Muse's generic report carries both windows' absolute reset metadata.
+    #[test]
+    fn muse_windows_keep_their_reset_and_duration_in_the_report_projection() {
+        let at = now();
+        let snapshot = crate::usage::MuseSnapshot {
+            plan: "Muse Code Power Usage".into(),
+            session: Some(crate::usage::UsageWindow {
+                utilization_pct: 38,
+                resets_at: Some(at + chrono::Duration::hours(3)),
+                window_duration: chrono::Duration::hours(5),
+            }),
+            weekly: Some(crate::usage::UsageWindow {
+                utilization_pct: 34,
+                resets_at: Some(at + chrono::Duration::days(4)),
+                window_duration: chrono::Duration::days(7),
+            }),
+        };
+        let vendor = VendorSnapshot::MuseCode(snapshot.clone());
+        assert_eq!(headline_pct(&vendor), Some(38));
+        let sections = sections_with_metadata_for(&ready(vendor), at, 5);
+        let metrics = sections
+            .iter()
+            .filter(|section| matches!(section.section, Section::Metric { .. }))
+            .collect::<Vec<_>>();
+        assert_eq!(metrics.len(), 2);
+        assert_eq!(
+            metrics[0].reset_at,
+            snapshot.session.as_ref().unwrap().resets_at
+        );
+        assert_eq!(metrics[0].window, Some(chrono::Duration::hours(5)));
+        assert_eq!(
+            metrics[1].reset_at,
+            snapshot.weekly.as_ref().unwrap().resets_at
+        );
+        assert_eq!(metrics[1].window, Some(chrono::Duration::days(7)));
     }
 
     /// Nothing else moved: a quota vendor's metrics stay percentages.

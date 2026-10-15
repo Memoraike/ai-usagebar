@@ -13,10 +13,7 @@
 //! Error messages are fixed strings: every input here is a credential and
 //! must never end up in a tooltip or a log line.
 
-use std::fmt::Write as _;
 use std::path::Path;
-
-use sha2::{Digest, Sha256};
 
 use crate::error::{AppError, Result};
 
@@ -33,15 +30,6 @@ pub struct Credentials {
     /// vendor cache to this login, so a re-login never gets the previous
     /// session's figures — the kiro/minimax/grokbot treatment.
     pub fingerprint: String,
-}
-
-pub fn fingerprint_of(secret: &str) -> String {
-    let digest = Sha256::digest(secret.as_bytes());
-    let mut hex = String::with_capacity(16);
-    for byte in digest.iter().take(8) {
-        let _ = write!(hex, "{byte:02x}");
-    }
-    hex
 }
 
 #[derive(serde::Deserialize)]
@@ -79,7 +67,7 @@ fn parse(raw: &[u8]) -> Result<Credentials> {
         .filter(|token| !token.trim().is_empty())
         .ok_or_else(malformed)?;
     Ok(Credentials {
-        fingerprint: fingerprint_of(&access_token),
+        fingerprint: crate::cache::fingerprint_of(&access_token),
         site: ConsoleSite::parse(file.console_site.as_deref().unwrap_or("domestic")),
         region: ConsoleRegion::parse(file.console_region.as_deref().unwrap_or("cn-beijing")),
         access_token,
@@ -123,7 +111,7 @@ mod tests {
         assert_eq!(creds.access_token, "tok-1");
         assert_eq!(creds.site, ConsoleSite::International);
         assert_eq!(creds.region, ConsoleRegion::ApSoutheast1);
-        assert_eq!(creds.fingerprint, fingerprint_of("tok-1"));
+        assert_eq!(creds.fingerprint, crate::cache::fingerprint_of("tok-1"));
         assert_eq!(creds.fingerprint.len(), 16);
         assert!(creds.fingerprint.chars().all(|c| c.is_ascii_hexdigit()));
     }

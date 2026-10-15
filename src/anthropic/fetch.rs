@@ -177,6 +177,20 @@ pub async fn fetch_snapshot(
     // switch wait on the network once refresh/write-back is complete.
     drop(credential_lock);
 
+    // A blank access token is a signed-out credentials file, never a rate
+    // limit: sending `Authorization: Bearer ` would earn a 401/429, and the
+    // 429 variant would arm the backoff so the card stays wrong after
+    // re-login. Checked after any refresh so a blank-access/live-refresh
+    // shape self-repairs first.
+    if creds.claude_ai_oauth.access_token.trim().is_empty() {
+        return crate::outcome::fallback(
+            cache,
+            None,
+            AppError::Credentials("no access token; run `claude` to log in".into()),
+            |bytes| parse_payload(bytes, plan_label),
+        );
+    }
+
     // Fetch usage.
     match tokio::time::timeout(
         HTTP_TIMEOUT,
@@ -618,6 +632,62 @@ mod tests {
         );
         refresh.assert_async().await; // refresh endpoint was never called
         usage.assert_async().await; // usage endpoint was still called
+    }
+
+    #[tokio::test]
+    async fn a_blank_access_token_is_a_credentials_error_not_a_rate_limit() {
+        // Signed-out credentials file: `.expect(0)` on every endpoint is the
+        // assertion — a blank Bearer must never reach the network, where it
+        // would earn a 401/429 and the 429 variant would arm the backoff.
+        let mut server = mockito::Server::new_async().await;
+        let refresh = server
+            .mock("POST", "/v1/oauth/token")
+            .expect(0)
+            .create_async()
+            .await;
+        let usage = server
+            .mock("GET", "/api/oauth/usage")
+            .expect(0)
+            .create_async()
+            .await;
+
+        let (_td, cache) = cache_fixture();
+        let mut f = NamedTempFile::new().unwrap();
+        f.write_all(
+            br#"{"claudeAiOauth":{
+                "accessToken":"","refreshToken":"",
+                "expiresAt":0,
+                "subscriptionType":"max","rateLimitTier":"default_claude_max_5x"
+            }}"#,
+        )
+        .unwrap();
+        f.flush().unwrap();
+
+        let client = reqwest::Client::new();
+        let endpoints = Endpoints {
+            usage: format!("{}/api/oauth/usage", server.url()),
+            token: format!("{}/v1/oauth/token", server.url()),
+        };
+        let err = fetch_snapshot(
+            &client,
+            &creds::CredsTarget::Explicit(f.path().to_path_buf()),
+            &cache,
+            &endpoints,
+            Duration::from_secs(0),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            matches!(err, AppError::Credentials(ref msg) if msg.contains("run `claude`")),
+            "blank access token must be a credentials error with the login hint, got {err:?}"
+        );
+        assert!(
+            cache.backoff_remaining().is_none(),
+            "a signed-out file must never arm the 429 backoff"
+        );
+        refresh.assert_async().await;
+        usage.assert_async().await;
     }
 
     #[tokio::test]

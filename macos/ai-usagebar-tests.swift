@@ -218,6 +218,21 @@ func testParserBalances() {
         (0...max).map { set[$0] ?? "" }
     }
 
+    let grokbot = snapshot(FORMAT, vendor: "grokbot",
+                          fields: fields(through: 16, set: [0: "Cursor Ultra", 3: "70", 4: "5d 0h", 14: "50", 16: "gbt"]))
+    assertEqual(grokbot?.weekly?.pct, 70, "grokbot weekly usage")
+    assertEqual(grokbot?.weekly?.elapsed, 50, "grokbot elapsed alias drives the marker")
+    assertNil(grokbot?.session, "grokbot does not fabricate a session")
+    let grokbotMissingReset = snapshot(FORMAT, vendor: "grokbot",
+                                     fields: fields(through: 16, set: [3: "70", 4: "—", 14: "0", 16: "gbt"]))
+    assertNil(grokbotMissingReset?.weekly?.elapsed, "grokbot missing reset has no marker")
+    let grokbotMissingPeriod = snapshot(FORMAT, vendor: "grokbot",
+                                      fields: fields(through: 16, set: [3: "70", 4: "5d 0h", 16: "gbt"]))
+    assertNil(grokbotMissingPeriod?.weekly?.elapsed, "grokbot missing period has no marker")
+    let grokbotNoAllowance = snapshot(FORMAT, vendor: "grokbot",
+                                    fields: fields(through: 16, set: [0: "Grok Bot Plan", 16: "gbt"]))
+    assertNil(grokbotNoAllowance?.weekly, "grokbot no allowance has no weekly meter")
+
     // OpenRouter: balance at 17, vendor_short "opr".
     let opr = snapshot(FORMAT, vendor: "openrouter",
                        fields: fields(through: 17, set: [16: "opr", 17: "$12.34"]))
@@ -243,6 +258,18 @@ func testParserBalances() {
     let moon = snapshot(FORMAT, vendor: "moonshot",
                         fields: fields(through: 21, set: [21: "¥42.00"]))
     assertEqual(moon?.creditBalance, "¥42.00", "moonshot balance via km_balance")
+
+    // Lyceum: balance at 52 (appended after oll_monthly, keeping indices stable).
+    let lyc = snapshot(FORMAT, vendor: "lyceum",
+                       fields: fields(through: 52, set: [52: "$7.77"]))
+    assertEqual(lyc?.creditBalance, "$7.77", "lyceum balance via lyceum_balance")
+    assertEqual(lyc?.hasUsageWindows, false, "lyceum suppresses 5h/7d windows")
+
+    // DeepInfra: balance at 53 (appended after lyceum_balance, keeping indices stable).
+    let dif = snapshot(FORMAT, vendor: "deepinfra",
+                       fields: fields(through: 53, set: [53: "$15.50"]))
+    assertEqual(dif?.creditBalance, "$15.50", "deepinfra balance via dif_balance")
+    assertEqual(dif?.hasUsageWindows, false, "deepinfra suppresses 5h/7d windows")
     assertEqual(moon?.hasUsageWindows, false, "moonshot suppresses 5h/7d windows")
 
     // Grok: balance at 22.
@@ -291,6 +318,23 @@ func testParserBalances() {
     assertEqual(cur?.weeklyLabel, "Other Models", "cursor relabels the weekly bar")
     assertEqual(cur?.sessionTag, "auto", "cursor session tag")
     assertEqual(cur?.weeklyTag, "premium", "cursor weekly tag")
+
+    // Both pools share the billing cycle, so the one elapsed share the widget
+    // prints on the session and weekly aliases places both pace markers. A
+    // cycle of unknown length prints no elapsed and draws no marker.
+    let curPaced = snapshot(FORMAT, vendor: "cursor",
+                            fields: fields(through: 16, set: [
+                               0: "Cursor Ultra", 1: "70", 2: "5d 0h", 3: "30", 4: "5d 0h",
+                               13: "50", 14: "50", 16: "cur"
+                            ]))
+    assertEqual(curPaced?.session?.elapsed, 50, "cursor Cursor Models marker follows the cycle")
+    assertEqual(curPaced?.weekly?.elapsed, 50, "cursor Other Models marker follows the cycle")
+    let curUnstated = snapshot(FORMAT, vendor: "cursor",
+                               fields: fields(through: 16, set: [
+                                  0: "Cursor Ultra", 1: "70", 2: "5d 0h", 3: "30", 4: "5d 0h", 16: "cur"
+                               ]))
+    assertNil(curUnstated?.session?.elapsed, "cursor with no exact cycle has no session marker")
+    assertNil(curUnstated?.weekly?.elapsed, "cursor with no exact cycle has no weekly marker")
 
     // Antigravity has two independent model pools, each with a 5h and weekly
     // window. The fourth window reuses `extra_pct`, but it is not a spend bar:
@@ -467,6 +511,33 @@ func testParserBalances() {
     assertEqual(ollama?.weekly?.pct, 23, "ollama weekly pct")
     assertEqual(ollama?.weeklyLabel, "Weekly", "ollama weekly label")
     assertEqual(ollama?.weekly?.elapsed, 45, "ollama weekly elapsed")
+    assertNil(ollama?.sonnet, "session/weekly ollama has no monthly bar")
+
+    // Monthly-only shape: session/weekly placeholders stay empty (not "0"),
+    // monthly rides the primary bar. A present window at 0% used is still 0.
+    let ollamaMonthly = snapshot(FORMAT, vendor: "ollama",
+                                 fields: fields(through: 51, set: [
+                                    0: "pro", 16: "oll", 50: "42", 51: "—"
+                                 ]))
+    assertEqual(ollamaMonthly?.hasUsageWindows, true, "ollama monthly shows a window")
+    assertEqual(ollamaMonthly?.session?.pct, 42, "ollama monthly pct on the primary bar")
+    assertEqual(ollamaMonthly?.sessionLabel, "Monthly", "ollama monthly label")
+    assertEqual(ollamaMonthly?.sessionTag, "mo", "ollama monthly tag")
+    assertNil(ollamaMonthly?.weekly, "ollama monthly suppresses fake 5h/7d")
+    assertNil(ollamaMonthly?.sonnet, "ollama monthly is not a third-slot bar")
+
+    let ollamaMonthlyZero = snapshot(FORMAT, vendor: "ollama",
+                                     fields: fields(through: 51, set: [
+                                        0: "pro", 16: "oll", 50: "0"
+                                     ]))
+    assertEqual(ollamaMonthlyZero?.session?.pct, 0, "present 0% monthly is real usage")
+    assertEqual(ollamaMonthlyZero?.sessionLabel, "Monthly", "zero monthly keeps the label")
+    assertNil(ollamaMonthlyZero?.weekly, "zero monthly still has no 5h/7d")
+
+    let ollamaEmpty = snapshot(FORMAT, vendor: "ollama",
+                               fields: fields(through: 16, set: [0: "pro", 16: "oll"]))
+    assertNil(ollamaEmpty?.session, "omitted windows are not 0% session")
+    assertNil(ollamaEmpty?.weekly, "omitted windows are not 0% weekly")
 
     let sgk = snapshot(FORMAT, vendor: "supergrok",
                        fields: fields(through: 40, set: [
@@ -497,6 +568,73 @@ func testParserBalances() {
     assertEqual(kiro?.sessionLabel, "Credits", "kiro session label")
     assertEqual(kiro?.sessionTag, "cr", "kiro session tag")
     assertNil(kiro?.weekly, "kiro suppresses duplicate weekly window")
+
+    // Devin: daily quota at 54-56 (empty session alias on 1, 2, 13), weekly at 3, 4, 14.
+    let dvn = snapshot(FORMAT, vendor: "devin",
+                       fields: fields(through: 56, set: [
+                          0: "Devin", 3: "31", 4: "2d", 14: "40", 16: "dvn",
+                          54: "15", 55: "2h", 56: "25"
+                       ]))
+    assertEqual(dvn?.hasUsageWindows, true, "devin shows windows")
+    assertNil(dvn?.creditBalance, "devin has no balance-only creditBalance")
+    assertEqual(dvn?.session?.pct, 15, "devin daily pct mapped to session window")
+    assertEqual(dvn?.session?.reset, "2h", "devin daily reset")
+    assertEqual(dvn?.session?.elapsed, 25, "devin daily elapsed")
+    assertEqual(dvn?.sessionLabel, "Daily", "devin session label is Daily")
+    assertEqual(dvn?.sessionTag, "1d", "devin session tag is 1d")
+    assertEqual(dvn?.weekly?.pct, 31, "devin weekly pct")
+    assertEqual(dvn?.weekly?.reset, "2d", "devin weekly reset")
+    assertEqual(dvn?.weekly?.elapsed, 40, "devin weekly elapsed")
+    assertEqual(dvn?.weeklyLabel, "Weekly", "devin weekly label is Weekly")
+    assertEqual(dvn?.weeklyTag, "7d", "devin weekly tag is 7d")
+
+    let dvnOldBinary = snapshot(FORMAT, vendor: "devin",
+                                fields: fields(through: 16, set: [
+                                   0: "Devin", 3: "31", 4: "2d", 14: "40", 16: "dvn"
+                                ]))
+    assertEqual(dvnOldBinary?.hasUsageWindows, true, "devin old binary shows windows")
+    assertNil(dvnOldBinary?.session, "devin old binary has no daily window")
+    assertEqual(dvnOldBinary?.weekly?.pct, 31, "devin old binary still parses weekly window")
+
+    // Cline: 5h quota at 57-58, 7d at 59-60, 30d at 61-62.
+    let cln = snapshot(FORMAT, vendor: "cline",
+                       fields: fields(through: 62, set: [
+                          0: "ClinePass Tier 2", 1: "10", 2: "3h", 3: "40", 4: "4d", 16: "cln",
+                          57: "10", 58: "3h", 59: "40", 60: "4d", 61: "70", 62: "25d"
+                       ]))
+    assertEqual(cln?.hasUsageWindows, true, "cline shows windows")
+    assertNil(cln?.creditBalance, "cline has no balance-only creditBalance")
+    assertEqual(cln?.session?.pct, 10, "cline 5h pct")
+    assertEqual(cln?.session?.reset, "3h", "cline 5h reset")
+    assertEqual(cln?.sessionLabel, "5 hours", "cline session label is 5 hours")
+    assertEqual(cln?.sessionTag, "5h", "cline session tag is 5h")
+    assertEqual(cln?.weekly?.pct, 40, "cline 7d pct")
+    assertEqual(cln?.weekly?.reset, "4d", "cline 7d reset")
+    assertEqual(cln?.weeklyLabel, "Weekly", "cline weekly label is Weekly")
+    assertEqual(cln?.weeklyTag, "7d", "cline weekly tag is 7d")
+    assertEqual(cln?.sonnet?.pct, 70, "cline 30d pct mapped to third window")
+    assertEqual(cln?.sonnet?.reset, "25d", "cline 30d reset")
+    assertEqual(cln?.sonnetLabel, "Monthly", "cline sonnet label is Monthly")
+
+    let clnOldBinary = snapshot(FORMAT, vendor: "cline",
+                                fields: fields(through: 16, set: [
+                                   0: "ClinePass", 1: "15", 2: "2h", 3: "35", 4: "5d", 16: "cln"
+                                ]))
+    assertEqual(clnOldBinary?.hasUsageWindows, true, "cline old binary shows windows")
+    assertEqual(clnOldBinary?.session?.pct, 15, "cline old binary falls back to session slot")
+    assertEqual(clnOldBinary?.sessionLabel, "5 hours", "cline old binary keeps 5 hours label")
+    assertEqual(clnOldBinary?.weekly?.pct, 35, "cline old binary falls back to weekly slot")
+    assertEqual(clnOldBinary?.weeklyLabel, "Weekly", "cline old binary keeps Weekly label")
+    assertNil(clnOldBinary?.sonnet, "cline old binary has no monthly window")
+
+    let clnNoQuota = snapshot(FORMAT, vendor: "cline",
+                              fields: fields(through: 62, set: [
+                                 0: "Free", 16: "cln",
+                                 57: "—", 58: "—", 59: "—", 60: "—", 61: "—", 62: "—"
+                              ]))
+    assertNil(clnNoQuota?.session, "cline unquoted session is nil")
+    assertNil(clnNoQuota?.weekly, "cline unquoted weekly is nil")
+    assertNil(clnNoQuota?.sonnet, "cline unquoted monthly is nil")
 }
 
 // ─── Run ─────────────────────────────────────────────────────────────────
@@ -704,6 +842,19 @@ func testCompactToggle() {
                 "past the threshold → %-text regardless")
     assertEqual(overviewUsesBars(count: 4, barsMax: 4, compact: false), true,
                 "boundary: exactly barsMax still draws bars")
+}
+
+func testMenuLabelWidth() {
+    print("menuLabelWidth")
+    assertEqual(menuLabelWidth([]), 12, "no labels keeps the 12-column floor")
+    assertEqual(menuLabelWidth(["Session", "Weekly"]), 12, "short labels keep the floor")
+    // Cursor's pools: the 13-char label sets the column for the 12-char one.
+    assertEqual(menuLabelWidth(["Cursor Models", "Other Models"]), 14,
+                "a longer label widens the column for its siblings, plus one space")
+    assertEqual(menuLabelWidth(["Other Models"]), 13, "a 12-char label still keeps a gap")
+    assertEqual(rightAligned("49%", width: 4), " 49%", "a shorter value is padded on the left")
+    assertEqual(rightAligned("100%", width: 4), "100%", "the widest value is untouched")
+    assertEqual(rightAligned("1000%", width: 4), "1000%", "a wider value is never cut")
 }
 
 func testShortReset() {
@@ -1021,6 +1172,58 @@ func testVendorCatalogLifecycle() {
     assertEqual(refreshInvoked, true, "catalog arrival executes refresh when idle")
 }
 
+func testCopilotAccounts() {
+    let config = """
+    [[copilot.accounts]]
+    label = "work"
+    user = "octocat-work"
+    [[openai.accounts]]
+    label = "codex"
+    codex_auth_path = "/fixture/codex/auth.json"
+    [[copilot.accounts]]
+    label = 'personal'
+    user = "octocat"
+    """
+    let labels = accountLabels(inTOML: config, vendor: "copilot")
+    assertEqual(labels, ["work", "personal"],
+                "Copilot labels keep config order and exclude other providers")
+
+    func catalog(enabled: Bool, configured: Bool) -> [VendorCatalogEntry] {
+        [VendorCatalogEntry(id: "copilot", name: "Copilot", shortName: "cop", kind: "oauth",
+            enabled: enabled, configured: configured, needsCredential: true, env: "",
+            login: "gh auth login")]
+    }
+    let ready = catalog(enabled: true, configured: true)
+
+    // Named accounts follow the default entry, in order.
+    let entries = vendorEntries(active: "overview", catalog: ready,
+                                copilotLabels: { labels })
+    assertEqual(entries.map { $0.id }, ["copilot", "copilot@work", "copilot@personal"],
+                "selector lists the active gh account and every named one")
+    assertEqual(entries.map { $0.name }, ["Copilot", "Copilot · work", "Copilot · personal"],
+                "account names come from the catalog name")
+
+    // No accounts: unchanged single entry, exactly as before #378.
+    assertEqual(vendorEntries(active: "overview", catalog: ready, copilotLabels: { [] })
+                    .map { $0.id },
+                ["copilot"], "with no accounts the entry list is unchanged")
+
+    // A disabled provider contributes nothing, accounts or not.
+    assertEqual(vendorEntries(active: "copilot@work", catalog: catalog(enabled: false,
+                                                                      configured: true),
+                              copilotLabels: { labels }).count,
+                0, "disabled Copilot exposes no accounts")
+
+    // Rust's `--account` mapping: the label, not the gh login, reaches argv.
+    assertEqual(vendorArgs(for: "copilot@work"), ["--vendor", "copilot", "--account", "work"],
+                "the pseudo-id selects the label; Rust maps it to the gh login")
+
+    assertEqual(preferenceVendorIds(catalog: ready, claude: [], apiKeyAccounts: [:],
+                                    codex: [], copilot: labels),
+                ["copilot", "copilot@work", "copilot@personal"],
+                "Preferences includes every named Copilot account")
+}
+
 func testCodexAccounts() {
     let config = """
     [[openai.accounts]]
@@ -1091,6 +1294,10 @@ func testApiKeyAccounts() {
                 "Preferences includes named API-key accounts")
     assertEqual(accountLabels(inTOML: "[[kilo.accounts]]\nlabel = \"team\"\n", vendor: "kilo"), ["team"],
                 "any vendor's array is parsed")
+    assertEqual(API_KEY_ACCOUNT_VENDORS.contains("deepinfra"), true,
+                "deepinfra is in API_KEY_ACCOUNT_VENDORS")
+    assertEqual(API_KEY_ACCOUNT_VENDORS.count, 11,
+                "eleven API-key account vendors match Rust Config::API_KEY_ACCOUNT_VENDORS")
 }
 
 func testEnableVendorCommand() {
@@ -1132,6 +1339,7 @@ func testDisabledVendorPreferences() {
 @main
 struct TestRunner {
     static func main() {
+        testCopilotAccounts()
         testCodexAccounts()
         testApiKeyAccounts()
         testEnableVendorCommand()
@@ -1144,6 +1352,7 @@ struct TestRunner {
         testClaudeAccounts()
         testDesktopAccounts()
         testCompactToggle()
+        testMenuLabelWidth()
         testShortReset()
         testResetSeconds()
         testResetClockLabel()

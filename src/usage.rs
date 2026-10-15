@@ -62,19 +62,6 @@ pub struct UsageWindow {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Cents(pub i64);
 
-impl Cents {
-    /// Format as `[-]$D.CC`. Negative values render `-$D.CC` (not `$-D.CC`),
-    /// matching claudebar's `_fmt_dollars` (claudebar:532-537).
-    pub fn fmt_dollars(self) -> String {
-        let (sign, abs) = if self.0 < 0 {
-            ("-", -self.0)
-        } else {
-            ("", self.0)
-        };
-        format!("{sign}${}.{:02}", abs / 100, abs % 100)
-    }
-}
-
 /// Anthropic-specific snapshot — three rolling windows plus optional
 /// pay-as-you-go credit balance.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -248,6 +235,24 @@ impl DeepInfraSnapshot {
     }
 }
 
+/// One promo balance from Cursor's spending page
+/// (`GetClientVisibleCreditGrants`). Amounts are USD cents.
+/// `remaining_cents` is the figure to the left of the slash (`$21/$25`).
+///
+/// The grant may cover only one product (Cloud Agents, Bugbot, a single
+/// model). `display_name` is that product title when Cursor sent one. The
+/// row still says "Credits" when the name is not a title Cursor shows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CursorCreditGrant {
+    pub remaining_cents: i64,
+    pub total_cents: i64,
+    /// When the grant lapses. `None` when the payload has no expiry — some
+    /// account credits never do.
+    pub expires_at: Option<DateTime<Utc>>,
+    /// Vendor label. Empty when the grant has none.
+    pub display_name: String,
+}
+
 /// Cursor — the two included-usage pools the dashboard shows, from the
 /// undocumented `cursor.com/api/usage-summary` endpoint (the same one the
 /// dashboard's own frontend calls), authenticated with the session token the
@@ -260,6 +265,10 @@ impl DeepInfraSnapshot {
 /// (rounded from the wire floats) to match the dashboard and every other
 /// vendor's integer-percent convention; they can exceed 100 when a pool is over
 /// its included allowance.
+///
+/// [`CursorSnapshot::credits`] is a second, best-effort call
+/// (`GetClientVisibleCreditGrants`). An empty list means the account has no
+/// visible grant, or that call failed; either way the pools above still stand.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CursorSnapshot {
     /// Membership label, title-cased from `membershipType` (e.g. "Ultra").
@@ -287,6 +296,9 @@ pub struct CursorSnapshot {
     /// sends it. With `reset_at` it gives the exact window length the pace
     /// projection needs; absent, no window length is reported at all.
     pub cycle_start: Option<DateTime<Utc>>,
+    /// Spending-page credit grants, soonest expiry first. Empty when the
+    /// account has none or the grant call did not succeed.
+    pub credits: Vec<CursorCreditGrant>,
 }
 
 impl CursorSnapshot {
@@ -438,10 +450,14 @@ pub enum VendorSnapshot {
     Ollama(OllamaSnapshot),
     OrcaRouter(OrcaRouterSnapshot),
     ModelStudio(ModelStudioSnapshot),
+    Lyceum(LyceumSnapshot),
+    Devin(DevinSnapshot),
+    MuseCode(MuseSnapshot),
     /// A `[[custom]]` provider. Which one is not in the snapshot: the caller
     /// that fetched it holds the `CustomProviderConfig`, and the cache
     /// directory is keyed by its `id`.
     Custom(crate::custom::types::CustomSnapshot),
+    Cline(crate::cline::types::Snapshot),
 }
 
 impl VendorSnapshot {
@@ -591,6 +607,18 @@ pub struct NovitaSnapshot {
 }
 
 impl Eq for NovitaSnapshot {}
+
+/// Lyceum's platform credit balance is denominated in USD, not a percentage quota.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct LyceumSnapshot {
+    pub available_credits: f64,
+    pub used_credits: f64,
+    pub total_credits_used: f64,
+    pub remaining_credits: f64,
+    pub monthly_free_credits: f64,
+    pub purchased_credits: f64,
+}
+impl Eq for LyceumSnapshot {}
 
 /// Moonshot / Kimi — account balance from `/v1/users/me/balance`. Currency is
 /// USD (`api.moonshot.ai`) or CNY (`api.moonshot.cn`); there's no currency
@@ -867,10 +895,9 @@ pub struct ZaiSnapshot {
     pub mcp: Option<UsageWindow>,
 }
 
-/// Ollama Cloud — the session and weekly usage windows served by
-/// `ollama.com/api/usage`, plus a per-model breakdown. The response also
-/// carries an `activity.cost` string for the current period; we keep it raw
-/// (it is already dollar-formatted upstream) and let the renderer place it.
+/// Ollama Cloud — credit balances or legacy quota windows from
+/// `ollama.com/api/balance`. Older cached `/api/usage` payloads can also
+/// carry per-model counts and activity cost.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OllamaSnapshot {
     /// Display label, taken from the `[ollama] plan` config field. The API
@@ -899,6 +926,16 @@ pub struct OllamaSnapshot {
     /// `activity.period.type` (`"last_4_weeks"` and friends). A short
     /// human-readable label the renderer can show next to the cost.
     pub activity_period: Option<String>,
+    /// Monthly included credits and optional purchased credits, formatted
+    /// through the shared money formatter for all desktop surfaces.
+    pub credits: Option<OllamaCredits>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OllamaCredits {
+    pub balance: String,
+    pub allowance: String,
+    pub purchased: Option<String>,
 }
 
 /// One row of `OllamaSnapshot::{session,weekly}_models`. The API carries the
@@ -923,6 +960,7 @@ pub struct OpenRouterSnapshot {
     pub is_free_tier: bool,
     pub limit: Option<f64>,
     pub limit_remaining: Option<f64>,
+    pub recent_models: Vec<String>,
 }
 
 impl Eq for OpenRouterSnapshot {}
@@ -999,8 +1037,8 @@ impl OrcaRouterSnapshot {
     }
 }
 
-/// Alibaba Cloud Model Studio Token Plan — a 5-hour and a weekly ratio
-/// window, either of which the console account may not report. An absent
+/// Alibaba Cloud Model Studio Token Plan — a 5-hour, a weekly and a monthly
+/// ratio window, any of which the console account may not report. An absent
 /// window is no-data (possibly unlimited), never 0%.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelStudioSnapshot {
@@ -1008,6 +1046,31 @@ pub struct ModelStudioSnapshot {
     pub session: Option<UsageWindow>,
     /// Weekly window. `None` when `per1WeekPercentage` was absent.
     pub weekly: Option<UsageWindow>,
+    /// Monthly window. `None` when `per1MonthPercentage` was absent. The
+    /// reset is exact; the cycle length is plan-dependent, so no exact
+    /// window duration is declared for it (same rule as Ollama's calendar
+    /// month) and pacing is omitted wherever it would guess a denominator.
+    pub monthly: Option<UsageWindow>,
+}
+
+/// Muse Code subscription windows. Missing observations stay absent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MuseSnapshot {
+    pub plan: String,
+    pub session: Option<UsageWindow>,
+    pub weekly: Option<UsageWindow>,
+}
+
+/// Devin CLI quota snapshot. The CLI reports remaining percentages, while
+/// renderers and report consumers use consumed percentages consistently.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DevinSnapshot {
+    pub daily: Option<UsageWindow>,
+    pub weekly: Option<UsageWindow>,
+    /// Exact value from the CLI's overageBalanceMicros field. Its USD meaning
+    /// is empirically observed for the tested account, not a universal API
+    /// contract; only renderers perform that display conversion.
+    pub overage_balance_micros: Option<i64>,
 }
 
 /// Worst-of severity class for the Waybar bar text color. Mirrors
@@ -1084,7 +1147,7 @@ mod tests {
         assert_eq!(fmt_minor(14157, 2, Some("USD")), "$141.57");
         // Zero-exponent currency: no decimal point, no /100.
         assert_eq!(fmt_minor(500, 0, Some("JPY")), "¥500");
-        // Sign precedes the symbol, matching `fmt_dollars`.
+        // Sign precedes the symbol, as `format::money` spells it.
         assert_eq!(fmt_minor(-150, 2, Some("BRL")), "-R$1.50");
         // Unknown code stays truthful as a suffix rather than guessing a symbol.
         assert_eq!(fmt_minor(1234, 2, Some("CHF")), "12.34 CHF");
@@ -1109,21 +1172,6 @@ mod tests {
         };
         assert_eq!(capped.fmt_spent(), "$2.50");
         assert_eq!(capped.fmt_limit().as_deref(), Some("$50.00"));
-    }
-
-    #[test]
-    fn cents_format_positive() {
-        assert_eq!(Cents(0).fmt_dollars(), "$0.00");
-        assert_eq!(Cents(50).fmt_dollars(), "$0.50");
-        assert_eq!(Cents(250).fmt_dollars(), "$2.50");
-        assert_eq!(Cents(5000).fmt_dollars(), "$50.00");
-    }
-
-    #[test]
-    fn cents_format_negative_uses_leading_sign() {
-        // claudebar bug-fix: never "$-1.-50" — sign goes before the dollar sign.
-        assert_eq!(Cents(-150).fmt_dollars(), "-$1.50");
-        assert_eq!(Cents(-1).fmt_dollars(), "-$0.01");
     }
 
     #[test]

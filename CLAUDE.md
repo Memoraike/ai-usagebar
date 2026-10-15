@@ -131,9 +131,15 @@ When cutting a new version (patch, minor, or major):
     checkouts under `/tmp` (prune with `git worktree remove --force` +
     `git worktree prune`) and their `CARGO_TARGET_DIR` side directories
     (`/tmp/opencode/*-tgt`), which each hold a full dependency build.
+    Two more leftovers the batch workflow creates: the local `pr-*` branches
+    fetched per audited PR (`git branch | grep '^  pr-' | xargs git branch -D`
+    — fetched refs, not work) and any `node_modules/` a verification lane
+    installed inside the checkout (`git status --ignored --short | grep '^!!'`
+    — a stray one has broken `omarchy plugin validate` twice).
     The next `make test` pays a full rebuild for the reclaimed space —
     that trade is correct exactly once per release, and leaving the trash
-    in place has exhausted disk storage before.
+    in place has exhausted disk storage before. Shared caches
+    (`~/.cargo/registry`, `~/.npm`) are not part of this.
 
 **Anything skipping any of 1–10 is an incomplete release.** Tags are
 immutable; do **not** force-move a tag once it's pushed. Cut a new
@@ -195,6 +201,24 @@ patch version instead.
   already. Build report metrics through
   `SectionBuilder::push_metric` so the absolute reset travels with its row;
   never recreate a per-vendor metric-order table in `report.rs`.
+- **Vendor registration includes the macOS mirror.** A vendor's custom
+  placeholders must be appended (never inserted — the Swift side reads fields
+  by index, so those are stable contracts) to the `FORMAT` string in
+  `macos/ai-usagebar-menubar.swift`, with their dispatch case. Three vendors
+  shipped without their slot before this was guarded (#372 was the third).
+  Every `VendorId` is classified in `macos_mirror` in `src/guard.rs`, as
+  either `Slot(token)` — it has its own field in the mirror — or
+  `Generic(tokens)` — the bar renders it from the generic `session_*`/
+  `weekly_*` placeholders, which are named so the claim is checkable. **The
+  match is exhaustive, so a new vendor does not compile until it is
+  classified**; that is the point, because the hand-written token list this
+  replaced could only catch a token that was listed *and* missing, and a
+  vendor absent from both it and the mirror passed in silence. Claimed tokens
+  are also checked against the placeholders Rust emits, so renaming one side
+  fails instead of leaving both sides agreeing about nothing. The mirror is a
+  deliberate subset — Rust emits ~289 placeholders and the bar asks for ~57 —
+  so which figures appear is a product decision; making the decision is not
+  optional.
 - **Tests are hermetic.** A `#[test]`/`#[tokio::test]` must never read or
   write a real `$HOME`/`$XDG` path (config, cache, creds, Omarchy theme)
   or branch on an ambient env var — the AUR `check()` runs `cargo test`
@@ -306,6 +330,12 @@ vendor's response shape drifts:
 - `src/context/` — opt-in, bounded reader for local Claude Code JSONL
   transcripts. This format is best-effort and schema-tolerant; tests must use
   `scan_dir(&Path)` with a temp directory and never inspect a real user history.
+  `context/activity.rs` counts working/waiting sessions from each account's
+  `sessions/<pid>.json` (#356), read-only; tests seed a temp directory and pass
+  a fake `ProcessProbe`, never `SystemProbe`, and the report seam is
+  `attach_session_activity_with`, which also takes the live CLI label. It is
+  the only reader of those files: the Waybar tooltip and `usage --json` both
+  find the directory through `CredsTarget::config_dir`.
 - `src/tui/settings.rs` — Settings overlay (toml_edit-backed,
   auto-signals waybar after save)
 - `src/tui/panels.rs` — native ratatui per-vendor panels
@@ -318,6 +348,11 @@ vendor's response shape drifts:
   own Node contract tests. `gnome-extension/report-model.js` projects
   `usage --json` for the provider submenus; the top bar still uses the format
   string.
+- `claude-code-mod/` — Claude Code mod (function hooks, TypeScript): `/claude-account`
+  switches the Claude Desktop account through `account switch --desktop`, handed
+  to `launchctl submit` so it outlives Claude.app. Reads `account status --json`
+  and `usage --json` only; tests mock `$.process`. Checked with
+  `claude plugin validate|test claude-code-mod`, not by `make test`.
 - `kde-plasmoid/` — KDE Plasma 6 plasmoid (KPackage). Vendor selection is
   per applet instance via KConfigXT. Its single `usage --json` request omits
   `--vendor`; selection happens client-side, so it never reads

@@ -35,11 +35,22 @@ pub struct Probes<'a> {
     /// which is why it is injected and asked only once Claude's credential
     /// file has already been ruled out.
     pub keychain_has_claude: &'a dyn Fn() -> bool,
+    /// Whether the macOS login Keychain holds Claude Code's OAuth blob for a
+    /// specific account's `CLAUDE_CONFIG_DIR`. Always `false` off macOS;
+    /// consulted only once the account's credentials file is ruled out.
+    pub keychain_has_claude_for: &'a dyn Fn(&Path) -> bool,
     /// Whether one of Command Code's auth files holds a live credential. Its
     /// search list includes pi's shared keystore, which exists whenever the
     /// user signed pi into any provider, so existence alone cannot mean
     /// "signed in" the way the provider-owned files above can.
     pub commandcode_signed_in: &'a dyn Fn(&[PathBuf]) -> bool,
+    /// Whether one of OpenCode Go's auth files holds a live key. Existence
+    /// alone cannot mean "signed in" either: the CLI's `auth.json` holds every
+    /// provider the user has connected, and only the `opencode` entry with a
+    /// key-bearing type is the account this endpoint accepts.
+    pub opencode_go_signed_in: &'a dyn Fn(&[PathBuf]) -> bool,
+    /// Whether one of Cline's auth files holds a live credential.
+    pub cline_signed_in: &'a dyn Fn(&[PathBuf]) -> bool,
 }
 
 /// One provider's row in the catalog.
@@ -75,10 +86,21 @@ pub fn statuses(cfg: &Config) -> Vec<VendorStatus> {
         env_set: &|name| std::env::var_os(name).is_some_and(|value| !value.is_empty()),
         exists: &|path| path.exists(),
         keychain_has_claude: &keychain_has_claude,
+        keychain_has_claude_for: &keychain_has_claude_for,
         commandcode_signed_in: &|paths| {
             paths
                 .iter()
                 .any(|path| crate::commandcode::creds::read_from(path).is_some())
+        },
+        opencode_go_signed_in: &|paths| {
+            paths
+                .iter()
+                .any(|path| crate::opencode_go::creds::read_key_from(path).is_some())
+        },
+        cline_signed_in: &|paths| {
+            paths
+                .iter()
+                .any(|path| crate::cline::creds::read_from(path).is_some())
         },
     };
     statuses_with(cfg, &probes)
@@ -121,15 +143,41 @@ fn credential_present(cfg: &Config, id: VendorId, probes: &Probes) -> bool {
     if cfg.inline_api_key(id).is_some() {
         return true;
     }
+    if cfg.api_key_accounts(id).is_some_and(|accounts| {
+        accounts.iter().any(|account| {
+            account
+                .api_key_env
+                .as_deref()
+                .filter(|name| !name.is_empty())
+                .is_some_and(|name| (probes.env_set)(name))
+                || account.api_key.as_deref().is_some_and(|k| !k.is_empty())
+        })
+    }) {
+        return true;
+    }
     match id {
         // A Keychain-only login is what Claude Code leaves on macOS when no
         // `.credentials.json` was written, so the file alone would report a
         // signed-in user as unconfigured.
         VendorId::Anthropic => {
-            any_exists(probes, [crate::anthropic::creds::default_path()])
-                || (probes.keychain_has_claude)()
+            let default_or_explicit = any_exists(probes, [anthropic_credentials_path(cfg)]);
+            let keychain =
+                cfg.anthropic.credentials_path.is_none() && (probes.keychain_has_claude)();
+            default_or_explicit
+                || keychain
+                || cfg.anthropic.all_accounts().iter().any(|account| {
+                    (probes.exists)(&account.credentials_path)
+                        || (probes.keychain_has_claude_for)(&account.config_dir())
+                })
         }
-        VendorId::Openai => any_exists(probes, [crate::openai::creds::default_path()]),
+        VendorId::Openai => {
+            any_exists(probes, [cfg.openai.resolve_auth_path(None)])
+                || cfg
+                    .openai
+                    .accounts
+                    .iter()
+                    .any(|account| (probes.exists)(&account.codex_auth_path))
+        }
         VendorId::Copilot => {
             any_exists(probes, [crate::copilot::credentials::default_hosts_path()])
         }
@@ -137,6 +185,20 @@ fn credential_present(cfg: &Config, id: VendorId, probes: &Probes) -> bool {
             match crate::commandcode::creds::effective_paths(cfg.commandcode.auth_paths.as_deref())
             {
                 Ok(paths) => (probes.commandcode_signed_in)(&paths),
+                Err(_) => false,
+            }
+        }
+        VendorId::Cline => {
+            let paths = match cfg.cline.auth_paths.as_deref() {
+                Some(paths) if !paths.is_empty() => paths.to_vec(),
+                _ => crate::cline::creds::default_paths().unwrap_or_default(),
+            };
+            (probes.cline_signed_in)(&paths)
+        }
+        VendorId::OpenCodeGo => {
+            match crate::opencode_go::creds::effective_paths(cfg.opencode_go.auth_paths.as_deref())
+            {
+                Ok(paths) => (probes.opencode_go_signed_in)(&paths),
                 Err(_) => false,
             }
         }
@@ -176,6 +238,8 @@ fn credential_present(cfg: &Config, id: VendorId, probes: &Probes) -> bool {
         VendorId::ModelStudio => {
             any_exists(probes, [crate::modelstudio::config_path(&cfg.modelstudio)])
         }
+        VendorId::Devin => any_exists(probes, [crate::devin::credentials_path(&cfg.devin)]),
+        VendorId::MuseCode => any_exists(probes, [crate::muse::creds::path(&cfg.muse)]),
         // Nothing to check: handled by `needs_credential`, never reached.
         VendorId::Antigravity => true,
         // Key-only providers: the environment and inline checks above are the
@@ -190,9 +254,16 @@ fn credential_present(cfg: &Config, id: VendorId, probes: &Probes) -> bool {
         | VendorId::Moonshot
         | VendorId::Grok
         | VendorId::Minimax
-        | VendorId::OpenCodeGo
         | VendorId::Ollama
-        | VendorId::OrcaRouter => false,
+        | VendorId::OrcaRouter
+        | VendorId::Lyceum => false,
+    }
+}
+
+fn anthropic_credentials_path(cfg: &Config) -> crate::error::Result<PathBuf> {
+    match &cfg.anthropic.credentials_path {
+        Some(path) => Ok(path.clone()),
+        None => crate::anthropic::creds::default_path(),
     }
 }
 
@@ -222,6 +293,19 @@ fn keychain_has_claude() -> bool {
 
 #[cfg(not(target_os = "macos"))]
 fn keychain_has_claude() -> bool {
+    false
+}
+
+#[cfg(target_os = "macos")]
+fn keychain_has_claude_for(config_dir: &Path) -> bool {
+    matches!(
+        crate::anthropic::keychain::read_raw_for(config_dir),
+        Ok(Some(_))
+    )
+}
+
+#[cfg(not(target_os = "macos"))]
+fn keychain_has_claude_for(_config_dir: &Path) -> bool {
     false
 }
 
@@ -270,11 +354,25 @@ mod tests {
         exists: &'a dyn Fn(&Path) -> bool,
         commandcode_signed_in: &'a dyn Fn(&[PathBuf]) -> bool,
     ) -> Probes<'a> {
+        probes_full(env, exists, commandcode_signed_in, &|_| false)
+    }
+
+    /// [`probes`] with the OpenCode Go file probe supplied, for the tests
+    /// that exercise the CLI credential path.
+    fn probes_full<'a>(
+        env: &'a dyn Fn(&str) -> bool,
+        exists: &'a dyn Fn(&Path) -> bool,
+        commandcode_signed_in: &'a dyn Fn(&[PathBuf]) -> bool,
+        opencode_go_signed_in: &'a dyn Fn(&[PathBuf]) -> bool,
+    ) -> Probes<'a> {
         Probes {
             env_set: env,
             exists,
             keychain_has_claude: &|| false,
+            keychain_has_claude_for: &|_| false,
             commandcode_signed_in,
+            opencode_go_signed_in,
+            cline_signed_in: &|_| false,
         }
     }
 
@@ -345,6 +443,35 @@ mod tests {
         assert!(!row(&rows, "zai").configured);
     }
 
+    #[test]
+    fn a_named_api_key_account_counts_as_configured() {
+        let mut cfg = Config::default();
+        cfg.openrouter.accounts.push(crate::config::ApiKeyAccount {
+            label: "work".into(),
+            api_key_env: None,
+            api_key: Some("sk-named".into()),
+            management_api_key_env: None,
+        });
+        let rows = statuses_with(&cfg, &bare());
+        assert!(row(&rows, "openrouter").configured);
+        assert!(!row(&rows, "deepseek").configured);
+    }
+
+    #[test]
+    fn a_named_api_key_account_with_env_counts_as_configured() {
+        let mut cfg = Config::default();
+        cfg.deepseek.accounts.push(crate::config::ApiKeyAccount {
+            label: "work".into(),
+            api_key_env: Some("DEEPSEEK_WORK_API_KEY".into()),
+            api_key: None,
+            management_api_key_env: None,
+        });
+        let set = |name: &str| name == "DEEPSEEK_WORK_API_KEY";
+        let rows = statuses_with(&cfg, &probes(&set, &|_| false, &|_| false));
+        assert!(row(&rows, "deepseek").configured);
+        assert!(!row(&rows, "zai").configured);
+    }
+
     /// Antigravity has no credential of any kind — the binary probes whichever
     /// local product is running — so a frontend must not draw it as missing
     /// one, and must not offer to fix it.
@@ -368,9 +495,60 @@ mod tests {
             env_set: &|_| false,
             exists: &|_| false,
             keychain_has_claude: &|| true,
+            keychain_has_claude_for: &|_| false,
             commandcode_signed_in: &|_| false,
+            opencode_go_signed_in: &|_| false,
+            cline_signed_in: &|_| false,
         };
         assert!(row(&statuses_with(&cfg, &with_keychain), "anthropic").configured);
+        assert!(!row(&statuses_with(&cfg, &bare()), "anthropic").configured);
+    }
+
+    #[test]
+    fn an_anthropic_credentials_path_override_counts_as_configured() {
+        let mut cfg = Config::default();
+        let custom = PathBuf::from("/custom/anthropic/.credentials.json");
+        cfg.anthropic.credentials_path = Some(custom.clone());
+        let exists = |path: &Path| path == custom;
+        let rows = statuses_with(&cfg, &probes(&|_| false, &exists, &|_| false));
+        assert!(row(&rows, "anthropic").configured);
+    }
+
+    #[test]
+    fn an_anthropic_named_account_counts_as_configured() {
+        let mut cfg = Config::default();
+        let custom = PathBuf::from("/accounts/work/.credentials.json");
+        cfg.anthropic
+            .accounts
+            .push(crate::config::AnthropicAccount {
+                label: "work".into(),
+                credentials_path: custom.clone(),
+            });
+        let exists = |path: &Path| path == custom;
+        let rows = statuses_with(&cfg, &probes(&|_| false, &exists, &|_| false));
+        assert!(row(&rows, "anthropic").configured);
+    }
+
+    #[test]
+    fn a_keychain_only_anthropic_named_account_counts_as_configured() {
+        let mut cfg = Config::default();
+        let custom = PathBuf::from("/accounts/work/.credentials.json");
+        cfg.anthropic
+            .accounts
+            .push(crate::config::AnthropicAccount {
+                label: "work".into(),
+                credentials_path: custom,
+            });
+        let with_named_keychain = Probes {
+            env_set: &|_| false,
+            exists: &|_| false,
+            keychain_has_claude: &|| false,
+            keychain_has_claude_for: &|dir| dir == Path::new("/accounts/work"),
+            commandcode_signed_in: &|_| false,
+            opencode_go_signed_in: &|_| false,
+            cline_signed_in: &|_| false,
+        };
+        assert!(row(&statuses_with(&cfg, &with_named_keychain), "anthropic").configured);
         assert!(!row(&statuses_with(&cfg, &bare()), "anthropic").configured);
     }
 
@@ -381,6 +559,63 @@ mod tests {
         assert_eq!(codex.kind, AuthKind::Oauth);
         assert!(!codex.configured);
         assert_eq!(codex.login, "codex login");
+    }
+
+    #[test]
+    fn opencode_go_cli_auth_file_counts_as_configured() {
+        let mut cfg = Config::default();
+        cfg.opencode_go
+            .auth_paths
+            .replace(vec![PathBuf::from("/custom/opencode/auth.json")]);
+        let signed_in = |paths: &[PathBuf]| {
+            paths
+                .iter()
+                .any(|path| path.ends_with("opencode/auth.json"))
+        };
+        let rows = statuses_with(
+            &cfg,
+            &probes_full(&|_| false, &|_| false, &|_| false, &signed_in),
+        );
+        assert!(row(&rows, "opencode-go").configured);
+        assert!(!row(&statuses_with(&cfg, &bare()), "opencode-go").configured);
+    }
+
+    #[test]
+    fn devin_catalog_row_uses_only_its_configured_local_credential_file() {
+        let mut cfg = Config::default();
+        let path = PathBuf::from("/fixture/devin/credentials.toml");
+        cfg.devin.credentials_path = Some(path.clone());
+        let exists = |candidate: &Path| candidate == path;
+        let rows = statuses_with(&cfg, &probes(&|_| false, &exists, &|_| false));
+        let devin = row(&rows, "devin");
+        assert_eq!(devin.kind, AuthKind::Local);
+        assert!(devin.needs_credential);
+        assert!(devin.configured);
+        assert_eq!(devin.env, "");
+        assert_eq!(devin.login, "");
+    }
+
+    #[test]
+    fn an_openai_codex_auth_path_override_counts_as_configured() {
+        let mut cfg = Config::default();
+        let custom = PathBuf::from("/custom/openai/auth.json");
+        cfg.openai.codex_auth_path = Some(custom.clone());
+        let exists = |path: &Path| path == custom;
+        let rows = statuses_with(&cfg, &probes(&|_| false, &exists, &|_| false));
+        assert!(row(&rows, "openai").configured);
+    }
+
+    #[test]
+    fn an_openai_named_account_counts_as_configured() {
+        let mut cfg = Config::default();
+        let custom = PathBuf::from("/accounts/work/auth.json");
+        cfg.openai.accounts.push(crate::config::OpenAiAccount {
+            label: "work".into(),
+            codex_auth_path: custom.clone(),
+        });
+        let exists = |path: &Path| path == custom;
+        let rows = statuses_with(&cfg, &probes(&|_| false, &exists, &|_| false));
+        assert!(row(&rows, "openai").configured);
     }
 
     /// A provider is only ever fetched when config has it on, and `enabled` is
@@ -430,6 +665,27 @@ mod tests {
             &probes(&|_| false, &|_| false, &|paths| paths == [custom.clone()]),
         );
         assert!(row(&rows, "commandcode").configured);
+    }
+
+    /// Cline's credential file path is checked via the injected probe so
+    /// catalog status never hits the disk or $HOME during tests.
+    #[test]
+    fn cline_cli_auth_file_counts_as_configured() {
+        let mut cfg = Config::default();
+        let custom = PathBuf::from("/opt/cline/auth.json");
+        cfg.cline.auth_paths = Some(vec![custom.clone()]);
+
+        let signed_in = Probes {
+            env_set: &|_| false,
+            exists: &|_| false,
+            keychain_has_claude: &|| false,
+            keychain_has_claude_for: &|_| false,
+            commandcode_signed_in: &|_| false,
+            opencode_go_signed_in: &|_| false,
+            cline_signed_in: &|paths| paths == [custom.clone()],
+        };
+        assert!(row(&statuses_with(&cfg, &signed_in), "cline").configured);
+        assert!(!row(&statuses_with(&cfg, &bare()), "cline").configured);
     }
 
     /// Auth metadata has to be usable, not merely present: a key provider that

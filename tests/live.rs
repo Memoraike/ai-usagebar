@@ -56,6 +56,10 @@
 //!   `data.sqlite3`, then asserts the credit counters are non-negative and the
 //!   plan label is non-empty. `kiro_live` skips when there is no kiro-cli
 //!   install (no db and no `KIRO_DB_PATH`).
+//! - **Devin CLI**: reads the existing `credentials.toml` key in memory for a
+//!   read-only status request, then asserts reported percentages are bounded.
+//!   It never logs in, refreshes, or writes credentials; an explicit path for
+//!   an isolated copy may be supplied with `DEVIN_CREDENTIALS_PATH`.
 //! - **SuperGrok**: asks the official Grok Build CLI's `x.ai/billing` ACP
 //!   extension, then asserts usage percent and plan. Set
 //!   `SUPERGROK_GROK_BINARY` to the trusted official executable.
@@ -75,6 +79,7 @@ use ai_usagebar::antigravity;
 use ai_usagebar::cache::Cache;
 use ai_usagebar::cursor;
 use ai_usagebar::deepinfra;
+use ai_usagebar::devin;
 use ai_usagebar::error::AppError;
 use ai_usagebar::kimi;
 use ai_usagebar::kiro;
@@ -271,9 +276,12 @@ async fn openrouter_live() {
         .build()
         .unwrap();
     let endpoints = openrouter::fetch::Endpoints::default();
+    // Optional: the recent-models activity only answers to a management key.
+    let management_key = std::env::var("OPENROUTER_MANAGEMENT_API_KEY").ok();
     let out = openrouter::fetch_snapshot(
         &client,
         &api_key,
+        management_key.as_deref(),
         &cache,
         &endpoints,
         Duration::from_secs(0),
@@ -864,5 +872,105 @@ async fn ollama_live() {
         snap.weekly.as_ref().map(|w| w.utilization_pct),
         snap.session_models.len(),
         snap.weekly_models.len(),
+    );
+}
+
+#[tokio::test]
+#[ignore = "live API; run explicitly with existing Devin CLI credentials"]
+async fn devin_live() {
+    let mut config = ai_usagebar::config::DevinConfig::default();
+    if let Some(path) = std::env::var_os("DEVIN_CREDENTIALS_PATH").filter(|path| !path.is_empty()) {
+        config.credentials_path = Some(path.into());
+    }
+    let credentials_path = devin::credentials_path(&config).expect("resolve Devin CLI path");
+    if !credentials_path.is_file() {
+        eprintln!("devin_live: no Devin CLI credentials file — skipping");
+        return;
+    }
+
+    let cache = xdg_cache_for("devin");
+    let out = devin::fetch::fetch_snapshot(&config, &cache, Duration::ZERO)
+        .await
+        .expect("Devin status fetch should succeed using the existing CLI login");
+
+    for (label, window) in [
+        ("devin.daily", out.snapshot.daily.as_ref()),
+        ("devin.weekly", out.snapshot.weekly.as_ref()),
+    ] {
+        if let Some(window) = window {
+            assert_pct(label, window.utilization_pct);
+            assert!(window.window_duration > chrono::Duration::zero());
+        }
+    }
+    println!(
+        "✅ devin — daily={:?}, weekly={:?}, overage_balance_micros={:?}",
+        out.snapshot
+            .daily
+            .as_ref()
+            .map(|window| window.utilization_pct),
+        out.snapshot
+            .weekly
+            .as_ref()
+            .map(|window| window.utilization_pct),
+        out.snapshot.overage_balance_micros,
+    );
+}
+
+#[tokio::test]
+#[ignore = "live API; run with --ignored"]
+async fn cline_live() {
+    use ai_usagebar::cline;
+
+    let credential = match cline::creds::resolve(None, cline::creds::API_KEY_ENV, None) {
+        Ok(credential) => credential,
+        Err(error) => {
+            eprintln!("cline_live: {error} — skipping Cline smoke test");
+            return;
+        }
+    };
+    if credential.expired {
+        eprintln!("cline_live: the CLI's token has lapsed — run `cline` once and retry; skipping");
+        return;
+    }
+    let cache = xdg_cache_for("cline");
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(20))
+        .build()
+        .unwrap();
+    let now = chrono::Utc::now();
+    let out = cline::fetch::fetch_snapshot(
+        &client,
+        &credential,
+        &cache,
+        &cline::fetch::Endpoints::default(),
+        Duration::from_secs(0),
+        now,
+    )
+    .await
+    .expect("cline fetch should succeed against the real API");
+
+    // A ClinePass plan must report all three limits. A plan without the
+    // entitlement legitimately reports none — but never a partial set, which
+    // is what a renamed `type` value would look like.
+    let present = out
+        .snapshot
+        .windows()
+        .into_iter()
+        .filter(|(_, window)| window.is_some())
+        .count();
+    assert!(
+        present == 0 || present == 3,
+        "cline reported {present} of 3 limits — a limit type was renamed"
+    );
+    for (label, window) in out.snapshot.windows() {
+        let Some(window) = window else { continue };
+        assert_pct(&format!("cline.{label}"), window.pct());
+    }
+    println!(
+        "✅ cline — plan={:?}, 5h={:?}%, 7d={:?}%, 30d={:?}%",
+        out.snapshot.plan,
+        out.snapshot.five_hour.as_ref().map(|w| w.pct()),
+        out.snapshot.seven_day.as_ref().map(|w| w.pct()),
+        out.snapshot.thirty_day.as_ref().map(|w| w.pct()),
     );
 }

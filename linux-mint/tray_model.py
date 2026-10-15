@@ -43,6 +43,20 @@ def metric_display(metric):
     return str(metric.get("value") or tr("Not available", "Não informado"))
 
 
+def summary_metric(entry):
+    """The metric an entry's one-line menu summary shows.
+
+    Grouped rows (the Claude entry's context sessions, SuperGrok's product
+    slices) are not quota windows, so they stand in only when an entry has
+    nothing else.
+    """
+    metrics = entry.get("metrics") or []
+    quota = [metric for metric in metrics if not metric.get("group")] or metrics
+    if not quota:
+        return None
+    return max(quota, key=lambda item: item.get("percent") or 0)
+
+
 def metric_usage_label(metric, language=None):
     percent = metric.get("percent")
     if not isinstance(percent, (int, float)):
@@ -79,6 +93,52 @@ def connection_help(entry, language=None):
                   "Faça login no CLI oficial deste provedor ou configure uma chave de API compatível.", language)
     return tr("Authentication is unavailable for this provider. See the authentication guide.",
               "A autenticação deste provedor ainda não está disponível. Consulte o guia de autenticação.", language)
+
+
+def entry_vendor(entry):
+    entry_id = str(entry.get("id") or "")
+    slug = entry_id.split("@", 1)[0]
+    return slug or str(entry.get("name") or "")
+
+
+def vendor_slugs(order):
+    """First occurrence of each non-empty string. Anything else is ignored."""
+    if not isinstance(order, list):
+        return []
+    slugs = []
+    seen = set()
+    for item in order:
+        if isinstance(item, str) and item and item not in seen:
+            seen.add(item)
+            slugs.append(item)
+    return slugs
+
+
+def dashboard_entries(data):
+    """Report order, with `overview_vendors` leading when that field is present.
+
+    An empty or unusable list is still configured: cards stay in report order
+    and `primary` is not promoted. The primary fallback is only for a report
+    that omits the field, which is what the dashboard did before the list existed.
+    """
+    data = data or {}
+    entries = list(data.get("entries") or [])
+    if "overview_vendors" in data:
+        return ordered_entries(entries, data.get("overview_vendors"))
+    primary = data.get("primary")
+    entries.sort(key=lambda entry: (entry.get("id") != primary and entry.get("name") != primary))
+    return entries
+
+
+def ordered_entries(entries, order):
+    """Listed vendors first, in first-seen order. Unlisted vendors keep report order."""
+    slugs = vendor_slugs(order)
+    if not slugs:
+        return list(entries)
+    rank = {slug: index for index, slug in enumerate(slugs)}
+    indexed = list(enumerate(entries))
+    indexed.sort(key=lambda pair: (rank.get(entry_vendor(pair[1]), len(rank)), pair[0]))
+    return [entry for _, entry in indexed]
 
 
 def report_sections(entry):
@@ -135,8 +195,11 @@ def metric_pace(metric, now=None, language=None):
     # 10% left, is "behind" (red, flame).
     left = 100 - used
     gap = used - elapsed * 100 / window
+    elapsed_pct = elapsed * 100 / window
     critical = (projected > 100 and left < PACE_CRITICAL_LEFT) or (
-        projected > PACE_CRITICAL_PERCENT and gap >= PACE_CRITICAL_GAP
+        projected > PACE_CRITICAL_PERCENT
+        and gap >= PACE_CRITICAL_GAP
+        and not (elapsed_pct < 15 and left >= METER_YELLOW_BELOW_LEFT)
     )
     if not critical and projected > PACE_OVER_PERCENT and gap >= PACE_OVER_GAP:
         over = round(projected - 100)

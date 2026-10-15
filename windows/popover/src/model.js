@@ -19,7 +19,7 @@ import { m } from "./paraglide/messages.js";
 
 export const LAYOUT_KEY = "aiub.tray.layout.v1";
 const COLLAPSED_METRIC_CAP = 2;
-const lang = (locale) => locale === "pt-BR" ? "pt-BR" : "en";
+const lang = (locale) => locale === "pt-BR" || locale === "ko" || locale === "es" ? locale : "en";
 /** At most two starred metrics per provider, matching OpenUsage. */
 export const MAX_STARS_PER_PROVIDER = 2;
 
@@ -41,7 +41,8 @@ export function emptyPayload(hostError) {
     nextRefreshAt: 0,
     startupEnabled: false,
     hostError: hostError || "",
-    menuBarChart: false,
+    menuBarLook: "chart",
+    menuBarShortName: true,
     notificationsEnabled: true,
     notificationsThreshold: 97,
     os: "",
@@ -89,7 +90,8 @@ function normalizePayload(parsed) {
     nextRefreshAt: Number(parsed.next_refresh_at) || 0,
     startupEnabled: parsed.startup_enabled === true,
     hostError: clean(parsed.host_error, 1200),
-    menuBarChart: parsed.menu_bar_chart === true,
+    menuBarLook: normalizeMenuBarLook(parsed.menu_bar_look),
+    menuBarShortName: parsed.menu_bar_short_name !== false,
     notificationsEnabled: parsed.notifications_enabled !== false,
     notificationsThreshold: Number.isInteger(parsed.notifications_threshold) && parsed.notifications_threshold >= 1 && parsed.notifications_threshold <= 100 ? parsed.notifications_threshold : 97,
     os: normalizeOs(parsed.os),
@@ -115,7 +117,7 @@ function normalizeAccent(value) {
   return { light: value.light.toLowerCase(), dark: value.dark.toLowerCase() };
 }
 
-const SWITCHABLE_VENDORS = ["anthropic", "openai"];
+const SWITCHABLE_VENDORS = ["anthropic", "openai", "claude-desktop"];
 
 // Switchable logins per vendor. Only the macOS host sends any; anything absent
 // or malformed means no switch control at all rather than a guessed one.
@@ -135,6 +137,11 @@ function normalizeAccounts(value) {
       target: clean(raw.target, 4096),
       switching: raw.switching === true,
       error: clean(raw.error, 300),
+      prepareEnabled: vendor === "claude-desktop" && raw.prepare_enabled === true,
+      prepareTarget: clean(raw.prepare_target, 4096),
+      preparing: vendor === "claude-desktop" && raw.preparing === true,
+      prepareError: clean(raw.prepare_error, 300),
+      preparedReset: clean(raw.prepared_reset, 64),
     };
   }
   return out;
@@ -155,22 +162,51 @@ export function accountSwitchFor(cardId, accounts) {
   const at = id.indexOf("@");
   if (at <= 0) return null;
   const vendor = id.slice(0, at);
-  const info = accounts && Object.prototype.hasOwnProperty.call(accounts, vendor) ? accounts[vendor] : null;
-  if (!info) return null;
-  // Two labels that only differ past the cut share one card; neither is
-  // offered, since the control could not say which one it switches to.
-  const matches = info.labels.filter((label) => cardIdOf(vendor, label) === id);
-  if (matches.length !== 1) return null;
-  const label = matches[0];
-  const mine = info.target === label;
-  return {
-    vendor,
-    label,
-    active: info.active === label,
-    switching: info.switching && mine,
-    busy: info.switching && !mine,
-    error: mine && !info.switching && info.active !== label ? info.error : "",
-  };
+  // A Claude card the CLI does not know can still be a Claude Desktop login,
+  // whose switch moves the app alone.
+  const sources = vendor === "anthropic" ? [vendor, "claude-desktop"] : vendor === "claude-desktop" ? [] : [vendor];
+  for (const source of sources) {
+    const info = accounts && Object.prototype.hasOwnProperty.call(accounts, source) ? accounts[source] : null;
+    if (!info) continue;
+    // Two labels that only differ past the cut share one card; neither is
+    // offered, since the control could not say which one it switches to.
+    const matches = info.labels.filter((label) => cardIdOf(vendor, label) === id);
+    if (matches.length > 1) return null;
+    if (matches.length === 0) continue;
+    const label = matches[0];
+    const mine = info.target === label;
+    return {
+      vendor: source,
+      label,
+      desktop: source === "claude-desktop",
+      active: info.active === label,
+      switching: info.switching && mine,
+      busy: (info.switching || info.preparing) && !mine,
+      error: mine && !info.switching && info.active !== label ? info.error : "",
+      prepareEnabled: source === "claude-desktop" && info.prepareEnabled === true,
+      preparing: info.preparing && info.prepareTarget === label,
+      prepareError: info.prepareTarget === label && !info.preparing ? info.prepareError : "",
+      preparedReset: info.prepareTarget === label ? info.preparedReset : "",
+    };
+  }
+  return null;
+}
+
+/** A Prepare click is one optional turn, not an automatic quota polling loop. */
+export function desktopPreparation(card, account, nowMs) {
+  if (!account || account.vendor !== "claude-desktop" || !account.prepareEnabled || account.active) return null;
+  if (account.preparing) return { label: "Preparing…", disabled: true, hint: "Preparing this inactive account without switching Claude Desktop." };
+  const session = card.rows.find((row) => row.kind === "metric" && row.window === 18000);
+  const weekly = card.rows.find((row) => row.kind === "metric" && row.window === 604800);
+  const reset = Date.parse(session?.resetAt || "");
+  const confirmed = Date.parse(account.preparedReset || "");
+  const blocked = card.stale || Boolean(card.errorTitle) || (reset > nowMs && session?.usedPercent >= 100) || weekly?.usedPercent >= 100;
+  if (!blocked && (reset > nowMs && session.usedPercent < 100 || confirmed > nowMs)) {
+    return { label: "Ready", disabled: true, hint: "The five-hour window is already running. No additional message is needed." };
+  }
+  return { label: "Prepare", disabled: account.busy || account.switching || blocked, hint: account.prepareError || (blocked
+    ? "Wait for the limit to reset and refresh live usage before preparing."
+    : "Send one short Haiku message using this inactive account. Uses a little quota; no saved conversation or Desktop restart.") };
 }
 
 function githubPage(value) {
@@ -195,6 +231,11 @@ function normalizeOs(value) {
   const os = String(value || "").toLowerCase();
   if (["macos", "windows", "linux"].includes(os)) return os;
   return "";
+}
+
+// The menu-bar look the host reports; anything else reads as the default chart.
+function normalizeMenuBarLook(value) {
+  return value === "logos" || value === "quattro" ? value : "chart";
 }
 
 // The host's refresh interval; anything outside the offered set reads as the
@@ -434,7 +475,12 @@ export function paceVerdict(pace, leftPercent) {
   const gap = Number.isFinite(left) ? (100 - left) - Number(pace.elapsedPercent) : 0;
   // Nearly spent and still over the line: the last few percent go fast.
   if (projected > 100 && Number.isFinite(left) && left < PACE_CRITICAL_LEFT) return "critical";
-  if (projected > PACE_CRITICAL_PERCENT && gap >= PACE_CRITICAL_GAP) return "critical";
+  if (projected > PACE_CRITICAL_PERCENT && gap >= PACE_CRITICAL_GAP) {
+    if (Number(pace.elapsedPercent) < 15 && Number.isFinite(left) && left >= METER_YELLOW_BELOW_LEFT) {
+      return "over";
+    }
+    return "critical";
+  }
   if (projected > PACE_OVER_PERCENT && gap >= PACE_OVER_GAP) return "over";
   return "calm";
 }
@@ -653,13 +699,21 @@ function clampPercent(value) {
   return Math.max(0, Math.min(100, number));
 }
 
-// Where the "you should be here" tick sits on the meter, as a percent of its
-// width. The meter fills with what is consumed in Used mode and with what
-// remains in Left mode, so the tick follows the same reading.
-export function paceTickPercent(pace, showAs) {
-  if (!pace) return null;
-  const elapsed = clampPercent(pace.elapsedPercent);
+// The goal in the meter's reading: the share that should be spent by now in
+// Used mode, the share that should still remain in Left mode. Reading it as
+// spent beside a meter that shows what is left put `97%` next to `7% left`.
+export function usageGoalPercent(goal, showAs) {
+  if (!goal) return null;
+  const elapsed = clampPercent(goal.percent);
   return showAs === "used" ? elapsed : 100 - elapsed;
+}
+
+// Where the "you should be here" tick sits on the meter, as a percent of its
+// width: the elapsed share, because the meter always fills with what is
+// consumed — the Used/Left toggle reads the headline number, never the ink.
+export function paceTickPercent(pace) {
+  if (!pace) return null;
+  return clampPercent(pace.elapsedPercent);
 }
 
 // One-line pace verdict beside the row label, in OpenUsage's WidgetRowView
@@ -779,6 +833,7 @@ export function projectCards(payload, nowMs, locale) {
           reset: resetLabel(section, now, locale),
           resetAt: section.resetAt || "",
           window: section.window || 0,
+          grouped: Boolean(metricGroup),
         };
         row.key = metricRowKey(entry.id, section.label, metricGroup);
         rows.push(row);
@@ -1010,7 +1065,20 @@ export function stripCommand(layout, cards) {
   } else {
     for (const id of Object.keys(source)) stars[id] = source[id];
   }
-  return { style: "bars", stars, order };
+  // The macOS Quattro chip leaves out the metrics hidden here, like the native tab.
+  const hiddenRows = {};
+  for (const card of cards || []) {
+    const keys = hiddenMetricKeys(card, layout || emptyLayout());
+    if (keys.length) hiddenRows[card.id] = keys;
+  }
+  // The menu bar's percentages follow the popover's Used/Left reading.
+  return {
+    style: "bars",
+    stars,
+    order,
+    show_as: normalizeShowAs(layout && layout.showAs),
+    hidden_rows: hiddenRows,
+  };
 }
 
 function cleanIdList(list) {
@@ -1380,6 +1448,19 @@ export function visibleRowsFor(card, opts) {
     if (row) out.push(row);
   }
   return out;
+}
+
+/**
+ * Keys of the card's metric rows switched off in Customize. A hidden metric
+ * does not count toward the provider's headline percentage: the native tab
+ * and, through `stripCommand`, the macOS menu bar's Quattro chip both skip it.
+ * @returns {string[]}
+ */
+export function hiddenMetricKeys(card, layout) {
+  const off = prefsForCard(card, layout).off || {};
+  return (card.rows || [])
+    .filter((row) => row.kind === "metric" && off[rowKey(row)])
+    .map(rowKey);
 }
 
 export function cardHasExtras(card, hideExtras, prefs) {
@@ -1823,6 +1904,18 @@ export function shortcutFromKeyEvent(event) {
   if (event.metaKey) parts.push("Win");
   parts.push(key);
   return parts.join("+");
+}
+
+// Display-only spelling of a stored shortcut. macOS names the canonical `Win`
+// and `Alt` modifiers "Cmd" and "Option"; the value itself stays "Win+U" so the
+// host still registers it.
+export function displayShortcut(value, os) {
+  const text = String(value || "");
+  if (os !== "macos") return text;
+  return text
+    .split("+")
+    .map((part) => (part === "Win" ? "Cmd" : part === "Alt" ? "Option" : part))
+    .join("+");
 }
 
 // Collapses "system" into the scheme the OS currently prefers.

@@ -34,6 +34,9 @@ pub struct RenderInput<'a> {
     pub format_pace_color: bool,
     pub tooltip_pace_pts: bool,
     pub now: DateTime<Utc>,
+    /// What this account's live Claude Code sessions are doing, for the
+    /// tooltip (#356). `None`, or nothing working or waiting, = no line.
+    pub claude_sessions: Option<&'a crate::context::activity::SessionActivity>,
 }
 
 /// Compose the full Waybar output for an Anthropic snapshot.
@@ -275,6 +278,15 @@ fn build_placeholders(input: &RenderInput) -> HashMap<&'static str, String> {
             input.format_pace_color,
             theme,
         );
+    }
+    // Both sinks fed by this map (bar text and --tooltip-format) are Pango
+    // markup. The plan label comes from the credentials file and the scoped
+    // model name from the API, so escape them at the projection boundary.
+    // The default tooltip escapes the raw snapshot.
+    for key in ["plan", "scoped_model"] {
+        if let Some(value) = v.get_mut(key) {
+            *value = escape(value);
+        }
     }
     v
 }
@@ -558,6 +570,13 @@ fn render_default_tooltip(input: &RenderInput) -> String {
         }
     }
 
+    if let Some(text) = input.claude_sessions.and_then(|s| s.summary()) {
+        lines.push(Line::Body("".into()));
+        lines.push(Line::Body(format!(
+            " <span foreground='{dim}'>  {text}</span>"
+        )));
+    }
+
     let updated = updated_at_hm(input.now, input.outcome.cache_age);
     lines.push(Line::Body("".into()));
     lines.push(Line::Sep);
@@ -649,6 +668,7 @@ mod tests {
 
     fn input<'a>(outcome: &'a FetchOutcome, theme: &'a Theme) -> RenderInput<'a> {
         RenderInput {
+            claude_sessions: None,
             outcome,
             theme,
             format: DEFAULT_FORMAT,
@@ -690,7 +710,7 @@ mod tests {
     #[test]
     fn extra_usage_placeholders_and_tooltip_use_the_blocks_currency() {
         // Non-vacuous currency pin: with BRL in the snapshot, formatting
-        // through fmt_dollars again ("$141.57") must fail this test — that is
+        // with a bare `$` again ("$141.57") must fail this test — that is
         // the wrong-currency claim the wiring exists to prevent.
         let mut oc = sample_outcome();
         if let Some(e) = oc.snapshot.extra.as_mut() {
@@ -793,6 +813,32 @@ mod tests {
         inp.tooltip_format = Some("[{scoped_model}] {scoped_pct} {scoped_reset}");
         let out = render_anthropic(&inp);
         assert_eq!(out.tooltip, "[] 0 —");
+    }
+
+    #[test]
+    fn plan_and_scoped_model_are_pango_escaped_in_custom_formats() {
+        // The plan label comes from the credentials file and the scoped model
+        // name from the API's `limits[].scope.model.display_name`; both feed
+        // the bar text and a custom --tooltip-format, which are Pango markup.
+        let mut oc = sample_outcome();
+        oc.snapshot.plan = "Max <5x> & Team".into();
+        oc.snapshot.scoped = vec![crate::usage::ScopedWindow {
+            label: "Fable & <Opus>".into(),
+            window: UsageWindow {
+                utilization_pct: 84,
+                resets_at: Some(now() + chrono::Duration::days(5)),
+                window_duration: chrono::Duration::days(7),
+            },
+        }];
+        let theme = Theme::default();
+        let mut inp = input(&oc, &theme);
+        inp.format = "{plan} · {scoped_model}";
+        inp.tooltip_format = Some("{plan} · {scoped_model}");
+        let out = render_anthropic(&inp);
+        let escaped = "Max &lt;5x&gt; &amp; Team · Fable &amp; &lt;Opus&gt;";
+        assert!(out.text.contains(escaped), "{}", out.text);
+        assert!(!out.text.contains("<5x>"), "{}", out.text);
+        assert_eq!(out.tooltip, escaped);
     }
 
     #[test]
@@ -908,5 +954,34 @@ mod tests {
         let lines = wrap_words("aaa bbb ccc ddd eee fff", 8);
         // "aaa bbb" (7) fits; "ccc ddd" (7) fits next; "eee fff" (7) next.
         assert_eq!(lines, vec!["aaa bbb", "ccc ddd", "eee fff"]);
+    }
+
+    /// #356: the tooltip says what the account's live sessions are doing, and
+    /// says nothing when none are working or waiting.
+    #[test]
+    fn tooltip_names_working_and_waiting_sessions_only_when_there_are_some() {
+        use crate::context::activity::SessionActivity;
+        let oc = sample_outcome();
+        let theme = Theme::default();
+
+        let active = SessionActivity {
+            working: 2,
+            waiting: 1,
+        };
+        let mut inp = input(&oc, &theme);
+        inp.claude_sessions = Some(&active);
+        let out = render_anthropic(&inp);
+        assert!(
+            out.tooltip.contains("2 working · 1 waiting"),
+            "{}",
+            out.tooltip
+        );
+
+        let idle = SessionActivity::default();
+        let mut inp = input(&oc, &theme);
+        inp.claude_sessions = Some(&idle);
+        let quiet = render_anthropic(&inp);
+        assert!(!quiet.tooltip.contains("working"), "{}", quiet.tooltip);
+        assert!(!quiet.tooltip.contains("waiting"), "{}", quiet.tooltip);
     }
 }

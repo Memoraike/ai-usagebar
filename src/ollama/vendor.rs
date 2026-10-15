@@ -17,6 +17,23 @@ use crate::waybar::{Class, WaybarOutput};
 use super::fetch::FetchOutcome;
 
 pub const DEFAULT_FORMAT: &str = "{oll_session_pct}% · {oll_weekly_pct}%w";
+/// Bar text for historical monthly-only quota caches, without dollar credits.
+pub const MONTHLY_FORMAT: &str = "{oll_monthly_pct}%";
+
+/// Pick the bar format that names a window the account actually reported.
+/// Fabricating `0% · 0%w` for a monthly-only payload is a lie: those windows
+/// were omitted, not exhausted. A present window at 0% used still renders `0`.
+pub fn default_format(snap: &OllamaSnapshot) -> &'static str {
+    if snap.credits.is_some() {
+        "{oll_balance} / {oll_allowance}"
+    } else if snap.session.is_some() || snap.weekly.is_some() {
+        DEFAULT_FORMAT
+    } else if snap.monthly.is_some() {
+        MONTHLY_FORMAT
+    } else {
+        "{plan}"
+    }
+}
 
 /// Build placeholders with the historical default pacing tolerance.
 pub fn build_placeholders(
@@ -31,17 +48,9 @@ fn build_placeholders_with_tolerance(
     pace_tolerance: u32,
     now: DateTime<Utc>,
 ) -> HashMap<&'static str, String> {
-    let session_pct = snap
-        .session
-        .as_ref()
-        .map(|w| w.utilization_pct)
-        .unwrap_or(0);
-    let weekly_pct = snap.weekly.as_ref().map(|w| w.utilization_pct).unwrap_or(0);
-    let monthly_pct = snap
-        .monthly
-        .as_ref()
-        .map(|w| w.utilization_pct)
-        .unwrap_or(0);
+    let session_pct = window_pct(snap.session.as_ref());
+    let weekly_pct = window_pct(snap.weekly.as_ref());
+    let monthly_pct = window_pct(snap.monthly.as_ref());
     let session = window_pacing(snap.session.as_ref(), pace_tolerance, now);
     let weekly = window_pacing(snap.weekly.as_ref(), pace_tolerance, now);
     let monthly = window_pacing(snap.monthly.as_ref(), pace_tolerance, now);
@@ -50,35 +59,35 @@ fn build_placeholders_with_tolerance(
     placeholders(vec![
         ("icon", "🦙".to_string()),
         ("vendor_short", VendorId::Ollama.short_name().to_string()),
-        // Cross-vendor aliases for scroll-cycle friendly formats.
-        ("session_pct", session_pct.to_string()),
+        // Cross-vendor aliases for scroll-cycle friendly formats. Empty when
+        // the account did not report that window, so a native surface cannot
+        // mistake an omitted 5h/7d pair for a confident 0% bar. A present
+        // window at 0% used still emits "0".
+        ("session_pct", session_pct.clone()),
         (
             "session_reset",
-            countdown::format(window_reset(&snap.session), now),
+            window_reset_text(snap.session.as_ref(), now),
         ),
-        ("weekly_pct", weekly_pct.to_string()),
-        (
-            "weekly_reset",
-            countdown::format(window_reset(&snap.weekly), now),
-        ),
+        ("weekly_pct", weekly_pct.clone()),
+        ("weekly_reset", window_reset_text(snap.weekly.as_ref(), now)),
         ("session_elapsed", session.elapsed.clone()),
         ("weekly_elapsed", weekly.elapsed.clone()),
         ("plan", snap.plan.clone()),
         ("oll_plan", snap.plan.clone()),
-        ("oll_session_pct", session_pct.to_string()),
+        ("oll_session_pct", session_pct),
         (
             "oll_session_reset",
-            countdown::format(window_reset(&snap.session), now),
+            window_reset_text(snap.session.as_ref(), now),
         ),
-        ("oll_weekly_pct", weekly_pct.to_string()),
+        ("oll_weekly_pct", weekly_pct),
         (
             "oll_weekly_reset",
-            countdown::format(window_reset(&snap.weekly), now),
+            window_reset_text(snap.weekly.as_ref(), now),
         ),
-        ("oll_monthly_pct", monthly_pct.to_string()),
+        ("oll_monthly_pct", monthly_pct),
         (
             "oll_monthly_reset",
-            countdown::format(window_reset(&snap.monthly), now),
+            window_reset_text(snap.monthly.as_ref(), now),
         ),
         ("oll_session_elapsed", session.elapsed),
         ("oll_session_pace", session.ratio_pace),
@@ -90,11 +99,44 @@ fn build_placeholders_with_tolerance(
         ("oll_monthly_pace", monthly.ratio_pace),
         ("oll_monthly_pace_indicator", monthly.point_pace),
         ("oll_cost", cost),
+        (
+            "oll_balance",
+            snap.credits
+                .as_ref()
+                .map(|c| c.balance.clone())
+                .unwrap_or_default(),
+        ),
+        (
+            "oll_allowance",
+            snap.credits
+                .as_ref()
+                .map(|c| c.allowance.clone())
+                .unwrap_or_default(),
+        ),
+        (
+            "oll_purchased",
+            snap.credits
+                .as_ref()
+                .and_then(|c| c.purchased.clone())
+                .unwrap_or_default(),
+        ),
     ])
 }
 
-fn window_reset(w: &Option<UsageWindow>) -> Option<DateTime<Utc>> {
-    w.as_ref().and_then(|w| w.resets_at)
+fn window_pct(window: Option<&UsageWindow>) -> String {
+    window
+        .map(|w| w.utilization_pct.to_string())
+        .unwrap_or_default()
+}
+
+/// Countdown for a window that exists. An omitted window stays empty so a
+/// native parser's `isReported` / `quotaWindow` cannot revive it; a present
+/// window with no timestamp still renders the shared `"—"` sentinel.
+fn window_reset_text(window: Option<&UsageWindow>, now: DateTime<Utc>) -> String {
+    match window {
+        Some(w) => countdown::format(w.resets_at, now),
+        None => String::new(),
+    }
 }
 
 #[derive(Default)]
@@ -150,8 +192,17 @@ pub fn render(
     let format = opts
         .format
         .clone()
-        .unwrap_or_else(|| DEFAULT_FORMAT.to_string());
-    let values = build_placeholders_with_tolerance(snap, opts.pace_tolerance, now);
+        .unwrap_or_else(|| default_format(snap).to_string());
+    let mut values = build_placeholders_with_tolerance(snap, opts.pace_tolerance, now);
+    // Both sinks fed by this map (bar text and --tooltip-format) are Pango
+    // markup. The plan label is configurable and the activity cost is the string
+    // the server sent, so escape them at the projection boundary. The default
+    // tooltip escapes the raw snapshot.
+    for key in ["plan", "oll_plan", "oll_cost"] {
+        if let Some(value) = values.get_mut(key) {
+            *value = escape(value);
+        }
+    }
 
     let mut text = substitute(&format, &values);
     if outcome.stale {
@@ -179,7 +230,7 @@ pub fn render(
 }
 
 fn row(w: &UsageWindow) -> WindowRow {
-    // No reset timestamp on the wire, so no elapsed marker / pace glyph.
+    // Keep the compact tooltip row; resets are rendered by the shared helper.
     let _ = w;
     WindowRow::default()
 }
@@ -231,8 +282,23 @@ fn render_tooltip(
         lines.push(TooltipLine::Body("".into()));
     }
 
+    if let Some(credits) = &snap.credits {
+        lines.push(TooltipLine::Body(format!(
+            "   {} remaining of {}",
+            escape(&credits.balance),
+            escape(&credits.allowance)
+        )));
+        if let Some(purchased) = &credits.purchased {
+            lines.push(TooltipLine::Body(format!(
+                "   Purchased credits: {}",
+                escape(purchased)
+            )));
+        }
+        lines.push(TooltipLine::Body("".into()));
+    }
+
     if let Some(cost) = snap.activity_cost.as_deref() {
-        let period = snap.activity_period.as_deref().unwrap_or("activity");
+        let period = escape(snap.activity_period.as_deref().unwrap_or("activity"));
         lines.push(TooltipLine::Body(format!(
             " <span foreground='{dim}'>  $  {period}</span>"
         )));
@@ -334,6 +400,7 @@ mod tests {
             monthly_models: vec![],
             activity_cost: Some("0.00000".into()),
             activity_period: Some("last_4_weeks".into()),
+            credits: None,
         }
     }
 
@@ -357,6 +424,28 @@ mod tests {
         }
     }
 
+    fn monthly_snap(pct: i32) -> OllamaSnapshot {
+        OllamaSnapshot {
+            plan: "pro".into(),
+            session: None,
+            weekly: None,
+            monthly: Some(UsageWindow {
+                utilization_pct: pct,
+                resets_at: None,
+                window_duration: chrono::Duration::days(30),
+            }),
+            session_models: vec![],
+            weekly_models: vec![],
+            monthly_models: vec![OllamaModelUsage {
+                name: "gpt-oss:120b".into(),
+                request_count: 100,
+            }],
+            activity_cost: Some("0.00000".into()),
+            activity_period: Some("last_4_weeks".into()),
+            credits: None,
+        }
+    }
+
     #[test]
     fn placeholders_expose_session_and_weekly() {
         let now = Utc::now();
@@ -366,14 +455,114 @@ mod tests {
             Some("82")
         );
         assert_eq!(values.get("oll_weekly_pct").map(String::as_str), Some("23"));
+        assert_eq!(values.get("session_pct").map(String::as_str), Some("82"));
+        assert_eq!(values.get("weekly_pct").map(String::as_str), Some("23"));
+        assert_eq!(values.get("oll_monthly_pct").map(String::as_str), Some(""));
         assert_eq!(values.get("oll_cost").map(String::as_str), Some("0.00000"));
         assert_eq!(values.get("vendor_short").map(String::as_str), Some("oll"));
         assert_eq!(values.get("plan").map(String::as_str), Some("pro"));
+        assert_eq!(default_format(&sample_snap()), DEFAULT_FORMAT);
+    }
+
+    #[test]
+    fn monthly_only_account_leaves_session_and_weekly_placeholders_empty() {
+        // Fails on main: unwrap_or(0) fabricates "0" for omitted windows, so a
+        // monthly-only account paints a fake 0% 5h/7d pair. Empty means absent;
+        // a present window at 0% used still emits "0" (see zero_used below).
+        let now = Utc::now();
+        let values = build_placeholders(&monthly_snap(42), now);
+        for key in [
+            "session_pct",
+            "session_reset",
+            "weekly_pct",
+            "weekly_reset",
+            "oll_session_pct",
+            "oll_weekly_pct",
+        ] {
+            assert_eq!(
+                values[key], "",
+                "{key} must render empty, not a fabricated 0"
+            );
+        }
+        assert_eq!(values["oll_monthly_pct"], "42");
+        assert_eq!(values["oll_monthly_reset"], "—");
+        assert_eq!(default_format(&monthly_snap(42)), MONTHLY_FORMAT);
+
+        let zero_used = build_placeholders(&monthly_snap(0), now);
+        assert_eq!(zero_used["oll_monthly_pct"], "0");
+        assert_eq!(zero_used["session_pct"], "");
+    }
+
+    #[test]
+    fn monthly_only_default_bar_shows_the_monthly_percent() {
+        let snap = monthly_snap(42);
+        let outcome = sample_outcome(snap.clone());
+        let out = render(&outcome, &snap, &Theme::default(), &opts(), Utc::now());
+        assert!(!out.text.contains('{'), "{}", out.text);
+        assert!(out.text.contains("42%"), "{}", out.text);
+        assert!(
+            !out.text.contains("0%w") && !out.text.contains("0% ·"),
+            "monthly-only must not paint the session/weekly pair: {}",
+            out.text
+        );
+        assert!(out.tooltip.contains("Monthly"), "{}", out.tooltip);
+        assert!(out.tooltip.contains("gpt-oss:120b"), "{}", out.tooltip);
+    }
+
+    #[test]
+    fn no_windows_default_bar_shows_the_plan_not_a_zero_pair() {
+        let mut snap = monthly_snap(42);
+        snap.monthly = None;
+        snap.monthly_models.clear();
+        assert_eq!(default_format(&snap), "{plan}");
+        let out = render(
+            &sample_outcome(snap.clone()),
+            &snap,
+            &Theme::default(),
+            &opts(),
+            Utc::now(),
+        );
+        assert!(out.text.contains("pro"), "{}", out.text);
+        assert!(
+            !out.text.contains("0%"),
+            "no-window payload must not fabricate zeros: {}",
+            out.text
+        );
+    }
+
+    #[test]
+    fn credit_plan_renders_dollars_and_monthly_reset() {
+        let body: crate::ollama::types::Body = serde_json::from_str(include_str!(
+            "../../tests/fixtures/ollama/balance_credits.json"
+        ))
+        .unwrap();
+        let snap = body.into_snapshot("pro".into());
+        let now = "2026-10-09T08:00:00Z".parse().unwrap();
+        let values = build_placeholders(&snap, now);
+        assert_eq!(values["oll_balance"], "$45.00");
+        assert_eq!(values["oll_allowance"], "$60.00");
+        assert_eq!(values["oll_purchased"], "$12.50");
+        assert_eq!(values["oll_monthly_pct"], "25");
+        assert_eq!(values["session_pct"], "");
+        assert_ne!(values["oll_monthly_reset"], "—");
+        let out = render(
+            &sample_outcome(snap.clone()),
+            &snap,
+            &Theme::default(),
+            &opts(),
+            now,
+        );
+        assert!(out.text.contains("$45.00 / $60.00"), "{}", out.text);
+        assert!(out.tooltip.contains("$45.00 remaining of $60.00"));
+        assert!(out.tooltip.contains("Purchased credits: $12.50"));
+        assert!(out.tooltip.contains("Monthly"));
+        assert!(!out.tooltip.contains("Session (5h)"));
     }
 
     #[test]
     fn severity_tracks_worst_window() {
         assert_eq!(severity(&sample_snap()), severity_for(82));
+        assert_eq!(severity(&monthly_snap(42)), severity_for(42));
     }
 
     #[test]
@@ -385,5 +574,50 @@ mod tests {
         assert!(out.tooltip.contains("Ollama Cloud"));
         assert!(out.tooltip.contains("kimi-k3"));
         assert!(out.tooltip.contains("Session") || out.tooltip.contains("82"));
+        assert!(out.text.contains("82%"), "{}", out.text);
+        assert!(out.text.contains("23%w"), "{}", out.text);
+    }
+
+    #[test]
+    fn plan_is_pango_escaped_in_custom_formats() {
+        let mut snap = sample_snap();
+        snap.plan = "Cloud Pro & Enterprise <preview>".into();
+        let outcome = sample_outcome(snap.clone());
+        let mut o = opts();
+        o.format = Some("{plan}".into());
+        o.tooltip_format = Some("{oll_plan}".into());
+
+        let out = render(&outcome, &snap, &Theme::default(), &o, Utc::now());
+        assert!(!out.text.contains(" & "));
+        assert!(!out.tooltip.contains('<'));
+        assert!(
+            out.text
+                .contains("Cloud Pro &amp; Enterprise &lt;preview&gt;")
+        );
+        assert_eq!(out.tooltip, "Cloud Pro &amp; Enterprise &lt;preview&gt;");
+    }
+
+    #[test]
+    fn activity_cost_and_period_are_pango_escaped() {
+        // Both strings are kept exactly as the server sent them (historical
+        // /api/usage caches still carry them), so they are vendor text.
+        let mut snap = sample_snap();
+        snap.activity_cost = Some("0.5 <est> & up".into());
+        snap.activity_period = Some("last <4> weeks & more".into());
+        let outcome = sample_outcome(snap.clone());
+        let mut o = opts();
+        o.format = Some("{oll_cost}".into());
+
+        let out = render(&outcome, &snap, &Theme::default(), &o, Utc::now());
+        assert!(
+            out.text.contains("0.5 &lt;est&gt; &amp; up"),
+            "{}",
+            out.text
+        );
+        assert!(!out.text.contains("<est>"), "{}", out.text);
+        // The default tooltip names the period beside the cost.
+        let period = "last &lt;4&gt; weeks &amp; more";
+        assert!(out.tooltip.contains(period), "{}", out.tooltip);
+        assert!(!out.tooltip.contains("<4>"), "{}", out.tooltip);
     }
 }

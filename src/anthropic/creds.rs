@@ -116,8 +116,9 @@ pub enum CredsTarget {
     /// `~/.claude/.credentials.json` (or the Windows equivalent). On macOS the
     /// Keychain item is preferred when it is usable — Claude Code's live store.
     Default(PathBuf),
-    /// `--creds-path` or config `credentials_path` with no `CLAUDE_CONFIG_DIR`
-    /// of its own — never consults the Keychain.
+    /// `--creds-path` or config `credentials_path` — never consults the
+    /// Keychain. Not a `CLAUDE_CONFIG_DIR` for Keychain purposes, but its
+    /// directory is where [`CredsTarget::config_dir`] looks for `sessions/`.
     Explicit(PathBuf),
     /// A named account (`[[anthropic.accounts]]` or `accounts_dir`): prefers
     /// the macOS Keychain item scoped to `config_dir` (`path`'s parent, the
@@ -146,6 +147,21 @@ impl CredsTarget {
             CredsTarget::Named { path, .. } => path,
             CredsTarget::Desktop(d) => d.blob_path(),
         }
+    }
+
+    /// The `CLAUDE_CONFIG_DIR` this target belongs to: the directory Claude
+    /// Code keeps that account's state in, `sessions/` included (#356). `None`
+    /// for a Claude Desktop source, which has no such directory, and for a
+    /// bare relative file name, whose empty parent names no directory at all.
+    pub fn config_dir(&self) -> Option<PathBuf> {
+        let dir = match self {
+            CredsTarget::Named { config_dir, .. } => config_dir.clone(),
+            CredsTarget::Default(path) | CredsTarget::Explicit(path) => {
+                path.parent()?.to_path_buf()
+            }
+            CredsTarget::Desktop(_) => return None,
+        };
+        (!dir.as_os_str().is_empty()).then_some(dir)
     }
 }
 
@@ -737,5 +753,29 @@ mod tests {
         assert_eq!(v["someOtherField"], "keep me");
         assert_eq!(v["claudeAiOauth"]["accessToken"], "NEW");
         assert_eq!(v["claudeAiOauth"]["expiresAt"], 1234);
+    }
+
+    /// #356: a target names the `CLAUDE_CONFIG_DIR` whose `sessions/` belong
+    /// to it — the named account's own directory, or a credential file's.
+    #[test]
+    fn config_dir_is_the_directory_the_account_keeps_its_state_in() {
+        let named = CredsTarget::Named {
+            path: PathBuf::from("/home/u/.claude-work/.credentials.json"),
+            config_dir: PathBuf::from("/home/u/.claude-work"),
+        };
+        assert_eq!(
+            named.config_dir(),
+            Some(PathBuf::from("/home/u/.claude-work"))
+        );
+
+        let explicit = CredsTarget::Explicit(PathBuf::from("/srv/claude/.credentials.json"));
+        assert_eq!(explicit.config_dir(), Some(PathBuf::from("/srv/claude")));
+
+        let default = CredsTarget::Default(PathBuf::from("/home/u/.claude/.credentials.json"));
+        assert_eq!(default.config_dir(), Some(PathBuf::from("/home/u/.claude")));
+
+        // A bare relative file name has an empty parent, which is no directory.
+        let bare = CredsTarget::Explicit(PathBuf::from("credentials.json"));
+        assert_eq!(bare.config_dir(), None);
     }
 }

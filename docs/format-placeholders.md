@@ -3,6 +3,12 @@
 Use placeholders with `--format` and `--tooltip-format`. Unsupported or absent
 metrics expand to an empty string unless noted otherwise.
 
+Muse Code (`--vendor muse-code`, short name `msc`) supplies `{muse_plan}`,
+`{muse_session_pct}`, `{muse_session_reset}`, `{muse_weekly_pct}`, and
+`{muse_weekly_reset}`, plus the generic `{plan}`, `{vendor_short}`,
+`{session_pct}`, `{session_reset}`, `{weekly_pct}`, and `{weekly_reset}`.
+Percentages are used allowance; an omitted window expands to an empty string.
+
 ## Cross-provider formats
 
 `{vendor_short}` identifies the active provider:
@@ -15,12 +21,14 @@ metrics expand to an empty string unless noted otherwise.
 | DeepInfra | `dif` | | |
 | Kimi | `kmi` | Kilo | `klo` |
 | Novita | `nvt` | Moonshot | `msh` |
-| Grok | `grk` | SuperGrok | `sgk` |
+| Lyceum | `lyc` | Grok | `grk` |
 | Anthropic API | `aac` | Antigravity | `agy` |
 | Cursor | `cur` | MiniMax | `mmx` |
 | Kiro CLI | `kir` | Nous Research | `nrs` |
 | OpenCode Go | `ocg` | Command Code | `cmc` |
-| Ollama Cloud | `oll` | | |
+| Ollama Cloud | `oll` | SuperGrok | `sgk` |
+| Devin | `dvn` | Cline | `cln` |
+| Muse Code | `msc` | | |
 
 The same codes ride the `ai-usagebar usage --json` report as each entry's
 `short_name`, so a native frontend can draw a Waybar-style provider tag without
@@ -30,14 +38,18 @@ Use `{session_pct}`, `{session_reset}`, `{weekly_pct}`, and `{weekly_reset}`
 when one format must work across providers. Providers without matching time
 windows return neutral values. Cursor maps Cursor Models to the session slot
 and Other Models to the weekly slot; both reset with the billing cycle. Kiro
-has one pool, so it maps `kiro_pct` to both percentage slots.
+has one pool, so it maps `kiro_pct` to both percentage slots, and Nous Research
+maps `nous_pct` and `nous_renewal` the same way.
 
 Claude and Codex also provide `*_elapsed`, `*_pace`, and `*_bar` families.
-Z.AI, MiniMax, and OpenCode Go provide elapsed aliases plus provider-specific pace families.
+Z.AI, MiniMax, OpenCode Go, and Cursor provide elapsed aliases plus provider-specific pace families.
 Antigravity provides elapsed values plus `{session_model}`, `{weekly_model}`,
 `{scoped_model}`, and `{extra_model}` for whichever of its four windows the
 running product reports — a product that exposes only weekly buckets leaves the
 5-hour placeholders empty rather than reporting a figure it never received.
+Model and plan names are Pango-escaped at the placeholder boundary, so a name
+like `Claude & GPT OSS` can never break the bar's markup (non-Pango consumers
+see the escaped form, e.g. `&amp;`).
 Provider-specific families such as `{oai_*}`, `{zai_*}`, `{or_*}`, and
 `{orc_*}` are empty for providers that do not define them.
 
@@ -184,13 +196,22 @@ cumulative usage (the API reports it in US cents; `275` renders as `$2.75`).
 `{mst_session_elapsed}`, `{mst_session_pace}`,
 `{mst_session_pace_indicator}`, `{mst_weekly_pct}`, `{mst_weekly_reset}`,
 `{mst_weekly_elapsed}`, `{mst_weekly_pace}`,
-`{mst_weekly_pace_indicator}`
+`{mst_weekly_pace_indicator}`, `{mst_monthly_pct}`, `{mst_monthly_reset}`,
+`{mst_monthly_elapsed}`, `{mst_monthly_pace}`,
+`{mst_monthly_pace_indicator}`
 
-The default bar format is `5h {mst_session_pct}% · 7d {mst_weekly_pct}%`.
+The default bar format is `5h {mst_session_pct}% · 7d {mst_weekly_pct}%`, with
+the `30d {mst_monthly_pct}%` window appended when the account reports it, and
+`30d {mst_monthly_pct}%` as the whole bar for a monthly-only account (the
+individual Token Plan's shape).
 `{session_*}` and `{weekly_*}` are cross-provider aliases. The API has no plan
 name, so `{mst_plan}` is always `Model Studio`. An absent window (no-data,
 possibly unlimited) expands to the empty string — never `0%`. The percentages
 are whole numbers: the wire carries ratios in `[0,1]` (`0.4217` → `42`).
+`{mst_monthly_elapsed}`, `{mst_monthly_pace}` and
+`{mst_monthly_pace_indicator}` are always empty: the monthly cycle length is
+plan-dependent (28–31 days), so pacing would guess a denominator rather than
+measure one.
 `{orc_limit}` and `{orc_remaining}` render `unlimited` for unlimited-quota
 keys — the API's `100000000` sentinel is collapsed to "no limit" rather than a
 $100M wallet, and `{orc_consumed_pct}` renders `—`. `{orc_expires}` counts
@@ -242,6 +263,18 @@ These cover the desktop app's weekly included-usage pool from
 `api2.cursor.sh/aiserver.v1.DashboardService/GetSandUsageStatus`
 (Linux and macOS). The default format is `{gbt_weekly_pct}%`. Generic
 aliases are `{plan}` and `{weekly_pct}` / `{weekly_reset}`.
+`{weekly_elapsed}` aliases `{gbt_weekly_elapsed}`, the elapsed percentage of
+the reported period. The period length comes from `currentPeriodStart` and
+`nextResetTimestampUtc`; it is never assumed to be seven days.
+
+`{gbt_weekly_pace}` and `{gbt_weekly_pace_pct}` expose the ratio glyph and
+label, respecting `--pace-tolerance`. `{gbt_weekly_pace_indicator}`,
+`{gbt_weekly_pace_pts}` and `{gbt_weekly_pace_delta}` expose the point-delta
+glyph, label and signed difference. `--format-pace-color` colors these pace
+values; `--tooltip-pace-pts` selects the point glyph and elapsed marker in
+the tooltip. Missing or non-positive periods return empty elapsed aliases,
+neutral pace placeholders and no marker.
+
 `{gbt_on_demand}` renders `on`/`off` for pay-as-you-go past the included
 pool.
 
@@ -328,19 +361,48 @@ also says that Priority Tier costs are omitted.
 ## Cursor
 
 `{cursor_plan}`, `{cursor_auto_pct}`, `{cursor_api_pct}`,
-`{cursor_total_pct}`, `{cursor_reset}`, `{cursor_on_demand}`,
-`{cursor_unlimited}`
+`{cursor_total_pct}`, `{cursor_reset}`, `{cursor_elapsed}`,
+`{cursor_on_demand}`, `{cursor_unlimited}`,
+`{cursor_auto_pace}`, `{cursor_auto_pace_pct}`,
+`{cursor_auto_pace_indicator}`, `{cursor_auto_pace_pts}`,
+`{cursor_auto_pace_delta}`, `{cursor_api_pace}`, `{cursor_api_pace_pct}`,
+`{cursor_api_pace_indicator}`, `{cursor_api_pace_pts}`,
+`{cursor_api_pace_delta}`, `{cursor_credits}`
 
 - `{cursor_auto_pct}` is the Cursor Models pool (Auto and Composer).
 - `{cursor_api_pct}` is the Other Models pool (named and API models).
 - `{cursor_total_pct}` is the overall included-usage headline.
 - `{cursor_on_demand}` and `{cursor_unlimited}` return `on`/`off` and
   `yes`/`no`.
+- `{cursor_credits}` is the spending-page grant, `$21.00/$25.00 remaining`,
+  with the expiry when the grant has one. Several grants are joined with
+  ` | `. The placeholder is empty when the account has no visible grant.
 - `{session_pct}`, `{weekly_pct}`, and `{plan}` alias Cursor Models, Other
   Models, and `Cursor <Plan>`.
+- `{cursor_elapsed}` is the elapsed percentage of the billing cycle, and
+  `{session_elapsed}` / `{weekly_elapsed}` alias it. Both pools reset with the
+  cycle, so the three always agree.
+- `{cursor_auto_pace*}` and `{cursor_api_pace*}` pace each pool against that
+  cycle. `{…_pace}` and `{…_pace_pct}` are the ratio glyph and label and respect
+  `--pace-tolerance`; `{…_pace_indicator}`, `{…_pace_pts}` and `{…_pace_delta}`
+  are the point-delta glyph, label and signed difference.
+  `--format-pace-color` colors each pool by its own delta, and
+  `--tooltip-pace-pts` selects the point glyph in the tooltip and draws the
+  elapsed marker inside each pool's bar.
 
 A pool can exceed 100%. The default format is
 `{cursor_auto_pct}·{cursor_api_pct}%` and uses the worse pool's severity color.
+That format string stays the two pools. The Omarchy chip adds the grant's
+used percent after On-Demand, and the panel meters it the same way: remaining
+dollars beside a bar of how much of the grant is spent. The row is titled
+Credits, the spending card's own title. A grant Cursor names as a product
+credit ("Cursor Grok 4.6 Credit", "Cloud Agent Credits") keeps that title.
+
+The cycle length comes from `billingCycleStart` and `billingCycleEnd` and is
+never assumed to be a month. When the API omits the start (older responses, and
+caches written before it was stored), `{cursor_elapsed}` and its aliases are
+empty, the pace placeholders are neutral and the tooltip draws no pace glyph.
+An unlimited plan has no cap to pace, so every one of them is empty.
 
 Cursor's dashboard also reports overage and per-member team spend; ai-usagebar
 does not. Team payloads without `individualUsage.plan` fall back to the
@@ -363,6 +425,31 @@ rotated credentials in an account-scoped `kiro/oauth.json` file. That file is
 mode `0600` on Unix. kiro-cli's database is opened read-only and is never
 modified.
 
+## Nous Research
+
+`{nous_plan}`, `{nous_pct}`, `{nous_renewal}`, `{nous_credits_remaining}`,
+`{nous_monthly_credits}`, `{nous_purchased_credits_remaining}`,
+`{nous_top_up_credits_remaining}`, `{nous_total_usable_credits}`,
+`{nous_rollover_credits}`
+
+These describe the Portal account the OAuth login reads. `{nous_pct}` is the
+consumed share of the monthly subscription-credit pool, a whole number held to
+0..=100 and computed from the subscription credits alone, never from top-up
+credits; it is `—` when the Portal omits the monthly allocation or the
+subscription credits remaining. `{nous_renewal}` counts down to the end of the
+current period (`—` when none is stated). The credit placeholders are plain
+numbers without a currency symbol: whole credits print without decimals,
+fractions keep up to six decimal places with trailing zeros trimmed, and a
+value the Portal does not report is `—`. `{nous_top_up_credits_remaining}`
+aliases `{nous_purchased_credits_remaining}`.
+
+The default format is `{nous_pct}% · {nous_renewal}`; with no `format`
+configured and no percentage available, the bar shows the renewal countdown
+alone. Nous has one pool and one period, so `{session_pct}` and
+`{weekly_pct}` alias `{nous_pct}`, `{session_reset}` and `{weekly_reset}`
+alias `{nous_renewal}`, and `{plan}` aliases `{nous_plan}`. There are no
+elapsed or pace placeholders.
+
 ## Command Code
 
 `{cc_plan}`, `{cc_session_pct}`, `{cc_session_reset}`, `{cc_session_used}`,
@@ -382,20 +469,58 @@ credit ledger, leaves the monthly family and `{cc_credits_reset}` at `—`.
 `{session_pct}` and `{weekly_pct}` alias the 5-hour and weekly windows.
 
 
+## Devin CLI
+
+`{devin_daily_pct}`, `{devin_daily_reset}`, `{devin_daily_elapsed}`,
+`{devin_daily_pace}`, `{devin_daily_pace_indicator}` and the corresponding
+`devin_weekly_*` placeholders describe consumed daily and weekly quota. The
+official CLI reports remaining percentages; ai-usagebar inverts them so higher
+values consistently mean more quota used. `{weekly_pct}` and
+`{weekly_reset}` alias the Devin weekly window. There is no 5-hour session, so
+`{session_pct}` and its related placeholders remain empty. The optional
+`{devin_overage_balance}` display uses the tested account's six-decimal USD
+interpretation; its currency contract is not verified for all accounts.
+
 ## Ollama Cloud
 
 `{oll_session_pct}`, `{oll_session_reset}`, `{oll_session_pace}`,
 `{oll_weekly_pct}`, `{oll_weekly_reset}`, `{oll_weekly_pace}`,
 `{oll_monthly_pct}`, `{oll_monthly_reset}`, `{oll_monthly_pace}`,
-`{oll_plan}`, `{oll_cost}`
+`{oll_plan}`, `{oll_cost}`, `{oll_balance}`, `{oll_allowance}`, `{oll_purchased}`
 
-Ollama Cloud reports either a 5-hour session + weekly pair, or a single
-calendar-month window, as a fraction of the plan limit — never both in the
-same response — so all three percentage placeholders are whole numbers
-after clamping to 0..=100, and the pair the account does not report stays
-at `0`. The API does not publish reset timestamps, pace deltas, or a plan
-label: `{oll_plan}` falls back to the `plan` string from your config, and
-the reset/pace families render neutral values when the window projection
-is unavailable. `{oll_cost}` is the dollar figure the settings page reports
-for the last four weeks of activity. `{session_pct}` and `{weekly_pct}`
-alias the session and weekly windows.
+The documented `/api/balance` endpoint automatically selects credit-based
+monthly plans or legacy session/weekly plans. Credit plans default to
+`{oll_balance} / {oll_allowance}` (remaining / included allowance, e.g.
+`$45.00 / $60.00`); `{oll_purchased}` is the separate purchased credit balance.
+These money placeholders include `$` and two decimal places and are empty
+for legacy quota snapshots. `{oll_monthly_pct}` is the included allowance's
+used percentage, excluding purchased credits; a zero allowance has no
+percentage window. The monthly reset and pacing use the API's billing period.
+
+Legacy plans keep `{oll_session_pct}% · {oll_weekly_pct}%w` as the default.
+Their remaining percentages are converted to used percentages, with resets
+preserved. All percentage placeholders are whole numbers clamped to 0..=100.
+An absent window is empty, not a fabricated `0`; `{session_pct}` and
+`{weekly_pct}` alias only the actual session and weekly windows.
+
+`{oll_plan}` remains the config-supplied label. Historical `/api/usage` quota
+caches remain readable, including monthly-only windows, activity cost, and
+missing resets (`—`). The current usage-history response is not quota data
+and is rejected. Live balance snapshots have no activity cost, so `{oll_cost}`
+is `—`. See [ollama-setup.md](ollama-setup.md).
+
+## Lyceum
+
+`{lyceum_balance}`, `{lyceum_used}`, and `{lyceum_remaining}` are the USD
+balance values returned by Lyceum, formatted with `$` and two decimal places.
+Lyceum reports no quota percentage or reset, so the shared session/weekly
+percentage placeholders are empty and reset placeholders are neutral.
+
+## Cline
+
+`{cline_5h_pct}`, `{cline_5h_reset}`, `{cline_7d_pct}`, `{cline_7d_reset}`,
+`{cline_30d_pct}`, and `{cline_30d_reset}` carry the three ClinePass limits as
+the percentage Cline reports and each open window's reset; `{cline_plan}` is
+the plan name and `{cline_period_end}` the billing period's end. A limit the
+account does not report leaves its placeholders empty rather than guessing a
+figure.

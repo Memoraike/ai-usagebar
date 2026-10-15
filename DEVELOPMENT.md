@@ -87,7 +87,7 @@ Default config locations:
 |---|---|
 | Linux | `~/.config/ai-usagebar/config.toml` |
 | macOS | `~/Library/Application Support/ai-usagebar/config.toml` (legacy `~/.config/…` still wins if present) |
-| Windows | `%APPDATA%\ai-usagebar\config.toml` |
+| Windows | `%APPDATA%\ai-usagebar\config\config.toml` |
 
 ## Tests
 

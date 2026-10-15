@@ -169,6 +169,14 @@ pub const KEY_VENDORS: &[KeyVendor] = &[
         secret_label: "API key",
         note: "credit balance",
     },
+    KeyVendor {
+        id: VendorId::Lyceum,
+        label: "Lyceum",
+        section: VendorId::Lyceum.config_section(),
+        config_key: "api_key",
+        secret_label: "API key",
+        note: "billing credits",
+    },
 ];
 
 /// How many providers the on/off section lists: every known vendor, in
@@ -421,13 +429,13 @@ impl SettingsState {
         // A configured but disabled primary is ineffective. Display the first
         // enabled vendor instead; when none are enabled retain the historical
         // Anthropic fallback in memory without inventing a persisted primary.
+        // Copilot and the key vendors above are offered while disabled, but
+        // only as an explicit pick: shown as the current primary, an untouched
+        // save would write their `enabled = true` back.
         let primary = cfg
             .ui
             .primary
-            .filter(|vendor| {
-                primary_choices.contains(vendor)
-                    && (*vendor != VendorId::Copilot || cfg.copilot.enabled)
-            })
+            .filter(|vendor| primary_choices.contains(vendor) && cfg.is_enabled(*vendor))
             .or_else(|| primary_choices.first().copied())
             .unwrap_or_else(|| cfg.ui.primary.unwrap_or(VendorId::Anthropic));
         Self {
@@ -2193,6 +2201,28 @@ mod tests {
         let s = SettingsState::from_config(&cfg);
         assert_ne!(s.primary, VendorId::Grok);
         assert_eq!(Some(s.primary), cfg.enabled_vendors().first().copied());
+    }
+
+    /// Switching off the vendor that is still the primary is a state a save
+    /// can produce. A key vendor that keeps its key stays on offer, so the
+    /// overlay must not reopen with it selected: the next save, whatever it
+    /// changed, would take that as the user's pick and switch it back on.
+    #[test]
+    fn an_unrelated_save_leaves_a_disabled_primary_switched_off() {
+        let (_dir, path) = temp_config(Some(
+            "[ui]\nprimary = \"openrouter\"\n[openrouter]\nenabled = false\napi_key = \"test\"\n",
+        ));
+        let cfg = Config::load_from(&path).unwrap();
+        let mut s = SettingsState::from_config_with(&cfg, |_| false);
+        assert!(s.primary_choices.contains(&VendorId::Openrouter));
+        assert_ne!(s.primary, VendorId::Openrouter);
+
+        s.notify_enabled = !s.notify_enabled;
+        s.notify_enabled_dirty = true;
+        save_to_path(&s, &path).unwrap();
+
+        let saved = Config::load_from(&path).unwrap();
+        assert!(!saved.is_enabled(VendorId::Openrouter));
     }
 
     #[test]

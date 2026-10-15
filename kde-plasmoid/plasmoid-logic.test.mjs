@@ -17,6 +17,23 @@ import {
 
 const at = rel => fileURLToPath(new URL(rel, import.meta.url));
 
+{
+    const fixture = readFileSync(at('../tests/fixtures/grokbot_paced_report.json'), 'utf8');
+    const entry = parseReport(fixture).entries[0];
+    assert.equal(entry.id, 'grokbot');
+    assert.equal(metricDetail(detailRows(entry)[0]), '50% elapsed · 20pts ahead');
+}
+
+{
+    const fixture = readFileSync(at('../tests/fixtures/cursor_paced_report.json'), 'utf8');
+    const entry = parseReport(fixture).entries[0];
+    assert.equal(entry.id, 'cursor');
+    assert.deepEqual(detailRows(entry).map(metricDetail), [
+        'Auto + Composer · 50% elapsed · 20pts ahead',
+        'Named / API models · on-demand off · 50% elapsed · 20pts under',
+    ]);
+}
+
 // ---------------------------------------------------------------------------
 // V4 portability. Both of these shipped as real bugs during development and
 // neither is caught by Node, which accepts them happily.
@@ -103,6 +120,9 @@ assert.match(mainQml, /sourceName\s*!==\s*root\.pendingCommand/,
     'a completed command must be matched to the exact in-flight command');
 assert.match(mainQml, /Logic\.panelCells\(root\.entry, \{max: 2\}\)/,
     'the compact view must not pretend a removed weekly toggle selects metrics');
+assert.match(readFileSync(at('./package/contents/ui/UsageRow.qml'), 'utf8'),
+    /item\.row\.headline\s*===\s*["']value["']/,
+    'UsageRow must honor headline === "value" before falling back to the percentage');
 
 // The Vendors page was removed when the report started carrying per-vendor
 // status; config.qml must not still point at the deleted file, which Plasma
@@ -289,6 +309,38 @@ assert.equal(isAlarming(openai), true, 'so is stale data');
 assert.equal(isAlarming(zai), true, 'so is an errored vendor');
 assert.equal(isAlarming(null), false);
 
+// Context sessions (the "Sessions" group) are a breakdown, not quota windows:
+// a session at 90% of its context window must not leak into the headline metric,
+// paint it critical or trigger the alarm when the quota sits lower.
+const sessionBreakdown = parseReport(JSON.stringify({entries: [{
+    id: 'anthropic', error: null,
+    sections: [
+        {type: 'metric', label: 'Session (5h)', percent: 29, value: '29%', severity: 'low'},
+        {type: 'metric', label: 'session one', group: 'Sessions', percent: 90,
+         value: '90%', severity: 'critical'},
+    ],
+}]})).entries[0];
+assert.equal(headline(sessionBreakdown).text, '29%');
+assert.equal(headline(sessionBreakdown).severity, 'low');
+assert.equal(isAlarming(sessionBreakdown), false);
+
+// A grouped row still stands in when an entry has no ungrouped metrics.
+const onlyGrouped = parseReport(JSON.stringify({entries: [{
+    id: 'anthropic', error: null,
+    sections: [
+        {type: 'metric', label: 'session one', group: 'Sessions', percent: 90,
+         value: '90%', severity: 'critical'},
+    ],
+}]})).entries[0];
+assert.equal(headline(onlyGrouped).text, '90%');
+assert.equal(headline(onlyGrouped).severity, 'critical');
+assert.equal(isAlarming(onlyGrouped), true);
+
+// The card accent follows the same partition: a session row never colours the
+// card while a quota window is there, and still stands in without one.
+assert.equal(cardFor(sessionBreakdown).accent, 'low');
+assert.equal(cardFor(onlyGrouped).accent, 'critical');
+
 // Spacers are dropped: Column spacing sets the rhythm, so keeping them would
 // double it.
 assert.equal(detailRows(anthropic).length, 2);
@@ -308,6 +360,14 @@ assert.deepEqual(panelCells(zai).map(c => c.text), ['⚠']);
 assert.deepEqual(panelCells(null), []);
 // A vendor whose only section is a block has no percentage to plot.
 assert.deepEqual(panelCells(openai), []);
+// Grouped session rows take no panel cell while a quota window can fill it
+// (the same partition the headline applies) and still stand in when the entry
+// has nothing else.
+assert.deepEqual(panelCells(sessionBreakdown, {max: 2}).map(c => c.text), ['29%']);
+assert.deepEqual(panelCells(onlyGrouped, {max: 2}).map(c => c.text), ['90%']);
+// A metric that names 'value' as its headline draws the value string in panel cells.
+assert.deepEqual(panelCells(metered('value'), {max: 1}).map(c => c.text), ['$75.00']);
+assert.deepEqual(panelCells(emptyValue, {max: 1}).map(c => c.text), ['60%']);
 
 // ---------------------------------------------------------------------------
 // cards (viewMode "VendorCards")
@@ -358,6 +418,9 @@ const partial = cardFor(parseReport(JSON.stringify({entries: [{
 }]})).entries[0]);
 assert.deepEqual(partial.windows.map(w => [w.percent, w.value]), [[null, '$1.20']]);
 assert.equal(partial.accent, 'low');
+// A metric that names 'value' as its headline draws the value string on the card gauge.
+assert.deepEqual(cardFor(metered('value')).windows.map(w => w.value), ['$75.00']);
+assert.deepEqual(cardFor(emptyValue).windows.map(w => w.value), ['60%']);
 
 assert.equal(shortLabel('Session (5h)'), '5h');
 assert.equal(shortLabel('Weekly (7d)'), '7d');

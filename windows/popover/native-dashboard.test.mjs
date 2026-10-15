@@ -13,8 +13,19 @@ try {
   const { Settings } = await server.ssrLoadModule('/src/screens/Settings.tsx');
   const { Footer } = await server.ssrLoadModule('/src/components/Chrome.tsx');
   const { TooltipProvider } = await server.ssrLoadModule('/src/components/ui/tooltip.tsx');
-  const { LanguageProvider } = await server.ssrLoadModule('/src/lib/i18n.tsx');
+  const { LanguageProvider, translateUsage } = await server.ssrLoadModule('/src/lib/i18n.tsx');
   const { emptyLayout, emptyPayload } = await server.ssrLoadModule('/src/model.js');
+  // Usage strings from the report reach the page in English and are translated for display.
+  assert.equal(translateUsage('es', '54% left · 46% used · Limit reached'), '54% restante · 46% usado · Límite alcanzado');
+  // The pt-BR "$X of $Y used" rewrite was dead: its leading `\b` could never
+  // match before a `$` (#380). Assert it actually fires, at the start of a
+  // string and mid-string, and that other locales are left alone.
+  assert.equal(translateUsage('pt-BR', '$5.00 of $20.00 used'), '$5.00 de $20.00 usados');
+  assert.equal(
+    translateUsage('pt-BR', '46% used · $5.00 of $20.00 used'),
+    '46% usados · $5.00 de $20.00 usados',
+  );
+  assert.equal(translateUsage('en', '$5.00 of $20.00 used'), '$5.00 of $20.00 used');
   const nowMs = Date.parse('2026-09-24T11:00:00Z');
   const card = {
     id: 'anthropic', title: 'Claude', plan: '', stale: false, error: '', rows: [{
@@ -29,11 +40,11 @@ try {
     hostError: '', version: 'test',
   };
 
-  function sectionMarkup(layout, language = 'pt-BR', section = card) {
+  function sectionMarkup(layout, language = 'pt-BR', section = card, account = null) {
     return renderToStaticMarkup(React.createElement(TooltipProvider, {},
       React.createElement(LanguageProvider, { language },
         React.createElement(ProviderSection, {
-          card: section, layout, nowMs,
+          account, card: section, layout, nowMs,
           onCustomize() {}, onRowAction() {}, onRowMenuOpenChange() {},
           onSwitchAccount() {}, onToggleCollapse() {}, onToggleShowAs() {},
         }))));
@@ -44,11 +55,39 @@ try {
     // The header keeps only the Customize shortcut; the per-card Reset button is gone.
     assert.doesNotMatch(header, /aria-label="Reset Claude"/);
     assert.match(header, /aria-label="Customize Claude"/);
+    // 4h of the 5h window have passed: the goal reads 20% left beside `54% restantes`,
+    // and 80% used once the meter shows what is used.
     const withGoal = sectionMarkup({ ...emptyLayout(), popoverStyle, usageGoal: true });
-    assert.match(withGoal, /Meta agora<\/span><strong class="font-semibold">80%<\/strong>/);
+    assert.match(withGoal, /Meta agora<\/span><strong class="font-semibold">20%<\/strong>/);
+    assert.match(withGoal, /class="usage-goal-meter-fill" style="width:20%"/);
+    const usedGoal = sectionMarkup({ ...emptyLayout(), popoverStyle, usageGoal: true, showAs: 'used' });
+    assert.match(usedGoal, /Meta agora<\/span><strong class="font-semibold">80%<\/strong>/);
     assert.match(withGoal, /class="usage-goal-meter[^\"]*" role="progressbar"/);
     const withoutGoal = sectionMarkup({ ...emptyLayout(), popoverStyle, usageGoal: false });
     assert.doesNotMatch(withoutGoal, /usage-goal-meter|Meta agora/);
+  }
+  // An inactive Claude Desktop account with a trusted CLI configured gets a
+  // Prepare button beside the switch star; both usage windows survive every
+  // prepare state.
+  const desktopCard = { ...card, id: 'anthropic@desktop-2', title: 'Claude · desktop-2 (desktop)',
+    rows: [card.rows[0], { ...card.rows[0], key: 'weekly', label: 'Weekly', window: 604800 }] };
+  const desktopAccount = { vendor: 'claude-desktop', label: 'desktop-2', active: false, switching: false, busy: false, error: '' };
+  for (const popoverStyle of ['classic', 'native']) {
+    const layout = { ...emptyLayout(), popoverStyle };
+    const unusedCard = { ...desktopCard, rows: desktopCard.rows.map((row) => ({ ...row, resetAt: '', usedPercent: 0 })) };
+    const prepareAccount = { ...desktopAccount, prepareEnabled: true };
+    const prepare = sectionMarkup(layout, 'en', unusedCard, prepareAccount);
+    assert.match(prepare, /aria-label="Prepare Claude Desktop account desktop-2"/);
+    assert.match(prepare, /Prepare<\/button>/);
+    assert.match(prepare, />Session</);
+    assert.match(prepare, />Weekly</);
+    assert.doesNotMatch(sectionMarkup(layout, 'en', unusedCard, { ...prepareAccount, active: true }), /Prepare Claude Desktop/);
+    const preparing = sectionMarkup(layout, 'en', unusedCard, { ...prepareAccount, preparing: true, busy: true });
+    assert.match(preparing, /disabled="" aria-label="Preparing… Claude Desktop/);
+    const ready = sectionMarkup(layout, 'en', desktopCard, prepareAccount);
+    assert.match(ready, /disabled="" aria-label="Ready Claude Desktop/);
+    const retry = sectionMarkup(layout, 'en', unusedCard, { ...prepareAccount, prepareError: 'Proxy unavailable' });
+    assert.match(retry, /desktop-account-control is-failed/);
   }
   assert.match(sectionMarkup({ ...emptyLayout(), resetTimes: 'exact', timeFormat: '24' }), /Redefine hoje às 12:00/);
   assert.match(sectionMarkup({ ...emptyLayout(), resetTimes: 'countdown', timeFormat: '24' }), /Redefine em 1h 0m/);
@@ -71,10 +110,108 @@ try {
       }))));
   // Provider tabs carry the logo and value; the full name is the accessible label, never the short code.
   assert.match(nativeDashboard, /role="group" aria-label="Provedores"/);
-  assert.match(nativeDashboard, /aria-label="Claude 46%"/);
+  // The default Left reading: 46% used reads 54%, like the meter below the tabs.
+  assert.match(nativeDashboard, /aria-label="Claude 54%"/);
   assert.doesNotMatch(nativeDashboard, />cld</);
   assert.match(nativeDashboard, /data-card-id="anthropic"/);
   assert.match(nativeDashboard, /aria-expanded="true"/);
+  // The tab reads the highest-percent window, like the Quattro bar: Z.AI with the weekly limit
+  // spent and the 5h session idle read "0%". A grouped row never outranks a quota window.
+  const quotaRow = (label, usedPercent, extra = {}) => ({
+    ...card.rows[0], key: `metric:${label}`, label, usedPercent, leftPercent: 100 - usedPercent, ...extra,
+  });
+  const spentWeekly = {
+    ...card, id: 'zai', title: 'Z.AI',
+    rows: [quotaRow('Session', 0), quotaRow('Weekly', 100), quotaRow('Context', 100, { grouped: true }), quotaRow('MCP', 18)],
+  };
+  const groupedOnly = { ...card, id: 'supergrok', title: 'SuperGrok', rows: [quotaRow('Grok Build', 7, { grouped: true })] };
+  const quotaDashboard = (showAs) => renderToStaticMarkup(React.createElement(TooltipProvider, {},
+    React.createElement(LanguageProvider, { language: 'pt-BR' },
+      React.createElement(NativeDashboard, {
+        cards: [spentWeekly, groupedOnly, { ...card, rows: [quotaRow('Session', 0), quotaRow('Context', 90, { grouped: true })] }],
+        hint: false, layout: { ...emptyLayout(), popoverStyle: 'native', showAs }, nowMs, payload,
+        onCustomizeProvider() {}, onDismissHint() {}, onOpenCustomize() {}, onOpenSettings() {},
+        onRowAction() {}, onRowMenuOpenChange() {}, onSwitchAccount() {},
+        onToggleCollapse() {}, onToggleShowAs() {},
+      }))));
+  const zaiDashboard = quotaDashboard('used');
+  assert.match(zaiDashboard, /aria-label="Z.AI 100%"/);
+  assert.match(zaiDashboard, /aria-label="SuperGrok 7%"/);
+  assert.match(zaiDashboard, /aria-label="Claude 0%"/);
+  // In the Left reading the tab shows what is left of that same most-used window: the spent
+  // weekly limit reads 0%, never the idle session's 100%.
+  const leftDashboard = quotaDashboard('left');
+  assert.match(leftDashboard, /aria-label="Z.AI 0%"/);
+  assert.match(leftDashboard, /aria-label="SuperGrok 93%"/);
+  assert.match(leftDashboard, /aria-label="Claude 100%"/);
+  // A value headline (a prepaid balance meter) is a figure, not a quota window: the tab keeps
+  // ranking percent windows in either reading — the rule the menu-bar chip follows — and a
+  // provider with only a balance chips its figure, the same either way.
+  const valueRow = (label, usedPercent) => ({
+    ...card.rows[0], key: `metric:${label}`, label, usedPercent, leftPercent: 100 - usedPercent,
+    headline: 'value', value: '$0.25',
+  });
+  const valueDashboard = (showAs) => renderToStaticMarkup(React.createElement(TooltipProvider, {},
+    React.createElement(LanguageProvider, { language: 'pt-BR' },
+      React.createElement(NativeDashboard, {
+        cards: [
+          { ...card, id: 'deepseek', title: 'DeepSeek', rows: [valueRow('Balance', 95), quotaRow('Weekly', 12)] },
+          { ...card, id: 'openrouter', title: 'OpenRouter', rows: [valueRow('Credit balance', 40)] },
+        ],
+        hint: false, layout: { ...emptyLayout(), popoverStyle: 'native', showAs }, nowMs, payload,
+        onCustomizeProvider() {}, onDismissHint() {}, onOpenCustomize() {}, onOpenSettings() {},
+        onRowAction() {}, onRowMenuOpenChange() {}, onSwitchAccount() {},
+        onToggleCollapse() {}, onToggleShowAs() {},
+      }))));
+  assert.match(valueDashboard('used'), /aria-label="DeepSeek 12%"/);
+  assert.match(valueDashboard('left'), /aria-label="DeepSeek 88%"/);
+  assert.match(valueDashboard('used'), /aria-label="OpenRouter \$0\.25"/);
+  assert.match(valueDashboard('left'), /aria-label="OpenRouter \$0\.25"/);
+
+  // A metric hidden in Customize never counts: Z.AI with Session and Weekly at 0% and the
+  // monthly MCP window at 18% switched off reads 0% used (100% left), not 18%. A hidden window
+  // with the highest percent loses to the visible ones; with every metric hidden the tab falls
+  // back to what the card still shows (a balance, else a dash).
+  const idleZai = {
+    ...card, id: 'zai', title: 'Z.AI',
+    rows: [quotaRow('Session', 0), quotaRow('Weekly', 0), quotaRow('MCP', 18)],
+  };
+  const busyKimi = {
+    ...card, id: 'kimi', title: 'Kimi',
+    rows: [quotaRow('Session', 30), quotaRow('Weekly', 30), quotaRow('MCP', 90)],
+  };
+  const allHidden = {
+    ...card, id: 'openai', title: 'Codex',
+    rows: [quotaRow('Session', 40), { kind: 'text', key: 'text:Balance', label: 'Balance', value: '$7' }],
+  };
+  const nothingLeft = { ...card, id: 'cursor', title: 'Cursor', rows: [quotaRow('Session', 40)] };
+  const hiddenDashboard = (showAs, rows) => renderToStaticMarkup(React.createElement(TooltipProvider, {},
+    React.createElement(LanguageProvider, { language: 'pt-BR' },
+      React.createElement(NativeDashboard, {
+        cards: [idleZai, busyKimi, allHidden, nothingLeft],
+        hint: false, layout: { ...emptyLayout(), popoverStyle: 'native', showAs, rows }, nowMs, payload,
+        onCustomizeProvider() {}, onDismissHint() {}, onOpenCustomize() {}, onOpenSettings() {},
+        onRowAction() {}, onRowMenuOpenChange() {}, onSwitchAccount() {},
+        onToggleCollapse() {}, onToggleShowAs() {},
+      }))));
+  const off = (...keys) => ({ always: [], demand: [], off: Object.fromEntries(keys.map((key) => [key, true])) });
+  const hiddenRows = {
+    zai: off('metric:MCP'),
+    kimi: off('metric:MCP'),
+    openai: off('metric:Session'),
+    cursor: off('metric:Session'),
+  };
+  const hiddenUsed = hiddenDashboard('used', hiddenRows);
+  assert.match(hiddenUsed, /aria-label="Z.AI 0%"/);
+  assert.match(hiddenUsed, /aria-label="Kimi 30%"/);
+  assert.match(hiddenUsed, /aria-label="Codex \$7"/);
+  assert.match(hiddenUsed, /aria-label="Cursor —"/);
+  assert.match(hiddenDashboard('left', hiddenRows), /aria-label="Z.AI 100%"/);
+  // Nothing hidden: the tab still reads the busiest window.
+  const unhidden = hiddenDashboard('used', {});
+  assert.match(unhidden, /aria-label="Z.AI 18%"/);
+  assert.match(unhidden, /aria-label="Kimi 90%"/);
+  assert.match(unhidden, /aria-label="Codex 40%"/);
   // A waiting release shows the same Update available card as Classic, above the provider tabs.
   const withUpdate = renderToStaticMarkup(React.createElement(TooltipProvider, {},
     React.createElement(LanguageProvider, { language: 'en' },
@@ -119,12 +256,13 @@ try {
   assert.match(menu, /Barra de menus/);
   assert.doesNotMatch(menu, /Exibição do uso/);
   assert.match(menu, /Barra de menus mostra/);
-  assert.match(menu, /Logotipos/);
+  // An empty payload reads as the host default, the chart.
+  assert.match(menu, /Gráfico/);
   assert.doesNotMatch(menu, /Período de uso|Provedor em foco/);
   assert.doesNotMatch(menu, /Identificar provedores por|Mostrar todos os provedores|Ocultar valor de uso/);
   const menuEnglish = settingsTab('menu', settingsProps, 'en');
   assert.match(menuEnglish, /Menu Bar Shows/);
-  assert.match(menuEnglish, /Logos/);
+  assert.match(menuEnglish, /Chart/);
   assert.doesNotMatch(menuEnglish, /Usage Window|Focused Provider|Highest consumption/);
   const preferences = settingsTab('preferences');
   assert.match(preferences, /Aparência/);
@@ -147,7 +285,7 @@ try {
   const chartMenuBar = settingsTab('general', {
     ...settingsProps,
     layout: { ...emptyLayout(), popoverStyle: 'classic' },
-    payload: { ...settingsPayload, menuBarChart: true },
+    payload: { ...settingsPayload, menuBarLook: 'chart' },
   });
   assert.match(chartMenuBar, /Barra de menus mostra/);
   assert.match(chartMenuBar, /Gráfico/);
@@ -155,10 +293,23 @@ try {
   const providersMenuBar = settingsTab('general', {
     ...settingsProps,
     layout: { ...emptyLayout(), popoverStyle: 'classic' },
-    payload: { ...settingsPayload, menuBarChart: false },
+    payload: { ...settingsPayload, menuBarLook: 'logos' },
   });
   assert.match(providersMenuBar, /Logotipos/);
   assert.doesNotMatch(providersMenuBar, /Identificar provedores por|Mostrar todos os provedores|Ocultar valor de uso/);
+  // The Quattro look is a third choice of the same picker, not a separate set of controls.
+  const quattroMenuBar = settingsTab('general', {
+    ...settingsProps,
+    layout: { ...emptyLayout(), popoverStyle: 'classic' },
+    payload: { ...settingsPayload, menuBarLook: 'quattro' },
+  });
+  assert.match(quattroMenuBar, /Barra de menus mostra/);
+  assert.match(quattroMenuBar, /Quattro/);
+  assert.doesNotMatch(quattroMenuBar, /Identificar provedores por|Mostrar todos os provedores|Ocultar valor de uso/);
+  // The short-name switch belongs to the Quattro look only.
+  assert.match(quattroMenuBar, /Mostrar nome curto/);
+  assert.doesNotMatch(chartMenuBar, /Mostrar nome curto/);
+  assert.doesNotMatch(providersMenuBar, /Mostrar nome curto/);
   const footerMarkup = renderToStaticMarkup(React.createElement(TooltipProvider, {},
     React.createElement(LanguageProvider, { language: 'en' },
       React.createElement(Footer, {

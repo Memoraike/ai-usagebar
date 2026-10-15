@@ -4,7 +4,7 @@ import MdiArrowDownCircle from "~icons/mdi/arrow-down-circle-outline";
 import MdiCheckCircle from "~icons/mdi/check-circle-outline";
 import MdiLoading from "~icons/mdi/loading";
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogTitle } from "@/components/ui/dialog";
-import type { Payload, UpdateAction } from "@/lib/types";
+import type { Language, Payload, UpdateAction } from "@/lib/types";
 import { cn } from "@/lib/utils";
 import { m } from "@/paraglide/messages.js";
 import { useI18n } from "@/lib/i18n";
@@ -127,7 +127,7 @@ export function UpdateDialog({
   );
 }
 
-function viewFor(payload: Payload, checkBaseline: number, checkRequestedAt: number, nowMs: number, language: "en" | "pt-BR"): View {
+function viewFor(payload: Payload, checkBaseline: number, checkRequestedAt: number, nowMs: number, language: Language): View {
   const update = payload.update;
   const state = update?.state;
   const action = updateAction(update, payload.repository, language);

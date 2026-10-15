@@ -6,7 +6,7 @@ import tempfile
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
 
-from tray_model import connection_help, installed_binary, is_not_connected, meter_color, metric_display, metric_pace, metric_usage_label, report_sections, tr
+from tray_model import connection_help, dashboard_entries, installed_binary, is_not_connected, meter_color, metric_display, metric_pace, metric_usage_label, report_sections, summary_metric, tr
 
 
 NOW = datetime(2026, 9, 25, 12, 0, tzinfo=timezone.utc)
@@ -21,6 +21,22 @@ def metric(used, window=18_000, elapsed=3_600):
 
 
 class TrayModelTest(unittest.TestCase):
+    def test_grokbot_report_projects_the_actual_period(self):
+        fixture = json.loads((Path(__file__).resolve().parent.parent / "tests/fixtures/grokbot_paced_report.json").read_text())
+        entry = fixture["entries"][0]
+        row = list(report_sections(entry))[0]
+        projected = metric_pace(row, NOW, "en_US")
+        self.assertEqual(projected, ("behind", "🔥 Limit in 2d 3h"))
+        self.assertEqual(meter_color(row, projected), "red")
+        self.assertEqual(metric_pace({**row, "window_secs": None}, NOW, "en_US"), None)
+
+    def test_cursor_report_paces_each_pool_against_the_billing_cycle(self):
+        fixture = json.loads((Path(__file__).resolve().parent.parent / "tests/fixtures/cursor_paced_report.json").read_text())
+        ahead, under = list(report_sections(fixture["entries"][0]))
+        self.assertEqual(metric_pace(ahead, NOW, "en_US"), ("behind", "🔥 Limit in 2d 3h"))
+        self.assertEqual(metric_pace(under, NOW, "en_US"), ("ahead", None))
+        self.assertEqual(metric_pace({**ahead, "window_secs": None}, NOW, "en_US"), None)
+
     def test_binary_resolution_supports_cargo_and_saved_override(self):
         with tempfile.TemporaryDirectory() as temporary_home:
             home = Path(temporary_home)
@@ -67,7 +83,8 @@ class TrayModelTest(unittest.TestCase):
         self.assertEqual(calm[0], "near")
         self.assertEqual(meter_color(metric(7, week, eight_hours), calm), "blue")
         self.assertEqual(metric_pace(metric(9, week, eight_hours), NOW)[0], "over")
-        self.assertEqual(metric_pace(metric(10, week, eight_hours), NOW)[0], "behind")
+        self.assertEqual(metric_pace(metric(10, week, eight_hours), NOW)[0], "over")
+        self.assertEqual(metric_pace(metric(55, week, eight_hours), NOW)[0], "behind")
 
     def test_weekly_warmup_is_capped_at_one_hour(self):
         self.assertIsNone(metric_pace(metric(1, 604_800, 3_599), NOW))
@@ -95,6 +112,51 @@ class TrayModelTest(unittest.TestCase):
         self.assertFalse(is_not_connected({"status": "error", "error": "credentials error: expired", "stale": True,
                                            "metrics": [{"label": "Weekly", "percent": 45}]}))
 
+    def test_overview_vendors_order_the_dashboard_and_keep_the_rest(self):
+        entries = [
+            {"id": "anthropic", "name": "anthropic"},
+            {"id": "openai", "name": "openai"},
+            {"id": "copilot", "name": "copilot"},
+            {"id": "supergrok", "name": "supergrok"},
+            {"id": "antigravity", "name": "antigravity"},
+            {"id": "opencode-go", "name": "opencode-go"},
+            {"id": "anthropic@work", "name": "anthropic"},
+        ]
+        ordered = dashboard_entries({
+            "entries": entries,
+            "overview_vendors": ["anthropic", "openai", "supergrok", "opencode-go", "antigravity"],
+        })
+        self.assertEqual(
+            [entry["id"] for entry in ordered],
+            ["anthropic", "anthropic@work", "openai", "supergrok", "opencode-go", "antigravity", "copilot"],
+        )
+        primary_first = dashboard_entries({"entries": entries, "primary": "openai"})
+        self.assertEqual(primary_first[0]["id"], "openai")
+        self.assertEqual(
+            [entry["id"] for entry in primary_first[1:]],
+            ["anthropic", "copilot", "supergrok", "antigravity", "opencode-go", "anthropic@work"],
+        )
+        repeated = dashboard_entries({
+            "entries": entries,
+            "primary": "openai",
+            "overview_vendors": ["anthropic", "openai", "anthropic", 1, ""],
+        })
+        self.assertEqual(repeated[0]["id"], "anthropic")
+        self.assertEqual(repeated[1]["id"], "anthropic@work")
+        self.assertEqual(repeated[2]["id"], "openai")
+        empty = dashboard_entries({
+            "entries": entries,
+            "primary": "openai",
+            "overview_vendors": [],
+        })
+        self.assertEqual([entry["id"] for entry in empty], [entry["id"] for entry in entries])
+        junk = dashboard_entries({
+            "entries": entries,
+            "primary": "openai",
+            "overview_vendors": [1, 2],
+        })
+        self.assertEqual([entry["id"] for entry in junk], [entry["id"] for entry in entries])
+
     def test_report_sections_preserve_order_and_metric_groups(self):
         entry = {"sections": [
             {"type": "text", "label": "Account", "value": "Pro"},
@@ -109,6 +171,17 @@ class TrayModelTest(unittest.TestCase):
              ("heading", "Breakdown"), ("metric", "Daily"),
              ("metric", "Weekly"), ("block", "Sessions")],
         )
+
+    def test_menu_summary_reads_quota_windows_not_context_sessions(self):
+        metrics = [
+            {"label": "Session (5h)", "percent": 29},
+            {"label": "Weekly", "percent": 35},
+            {"label": "ship the release", "percent": 90, "group": "Sessions"},
+        ]
+        self.assertEqual(summary_metric({"metrics": metrics})["label"], "Weekly")
+        # A grouped row still stands in when the entry has nothing else.
+        self.assertEqual(summary_metric({"metrics": metrics[2:]})["percent"], 90)
+        self.assertIsNone(summary_metric({"metrics": []}))
 
     def test_expired_antigravity_session_explains_remote_refresh_setup(self):
         entry = {"status": "error", "error": "Credentials error: Antigravity's saved Google session expired and ai-usagebar has no OAuth client to refresh it"}

@@ -43,7 +43,7 @@ use super::browse;
 use super::hotkey::{self, HotkeyBinding};
 use super::icon::{Severity, tray_icon_rgba};
 use super::marks;
-use super::menu_bar::{self, LogoSegment, StatusItemContent};
+use super::menu_bar::{self, LogoSegment, MenuBarLook, StatusItemContent, UsageReading};
 use super::options_menu::{self, OptionsAction, OptionsLabels};
 use super::panel::{
     CLICK_LOCK_MS, CORNER_RADIUS, CocoaRect, FALLBACK_WORK_AREA_HEIGHT, PopoverPlacement,
@@ -54,8 +54,8 @@ use super::payload::{
     wrap_report,
 };
 use super::strip::{
-    BARS_PIXEL_SIDE, BARS_POINT_SIDE, Stars, bar_fill, bars_layout, bars_rgba,
-    content_from_payload, parse_strip_ipc,
+    BARS_PIXEL_SIDE, BARS_POINT_SIDE, HiddenRows, Stars, bar_fill, bars_layout, bars_rgba,
+    content_from_payload, parse_hidden_rows, parse_strip_ipc,
 };
 use super::style::PopoverStyle;
 use super::updates::Updates;
@@ -104,17 +104,16 @@ enum Theme {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct LogoStripKey {
     segments: Vec<LogoSegment>,
-    line_counts: Vec<usize>,
 }
 
 /// One premeasured provider segment captured by the AppKit drawing block.
 struct LogoStripItem {
     mark: Option<Retained<NSImage>>,
-    fallback_name: Retained<NSString>,
+    /// The short name, drawn after the mark (Quattro look) or in its place.
+    name: Option<Retained<NSString>>,
     values: Vec<Retained<NSString>>,
     label_width: f64,
     value_width: f64,
-    line_count: usize,
 }
 
 impl Theme {
@@ -170,7 +169,16 @@ struct TrayState {
     stars: Stars,
     strip_order: Vec<String>,
     strip_order_known: bool,
-    menu_bar_chart: bool,
+    menu_bar_look: MenuBarLook,
+    /// `[tray] menu_bar_short_name`: the Quattro look's short name beside the mark.
+    menu_bar_short_name: bool,
+    /// The popover's Used/Left reading, from its `strip` IPC.
+    usage_reading: UsageReading,
+    /// Metrics hidden in the popover's Customize, from its `strip` IPC; the
+    /// Quattro look's highest window leaves them out.
+    hidden_rows: HiddenRows,
+    /// Provider id the popover has selected; the Quattro look draws this one.
+    selected_provider: Option<String>,
     menu_bar_logo_key: Option<LogoStripKey>,
     notifications_enabled: bool,
     notifications_threshold: u8,
@@ -243,7 +251,7 @@ fn run_loop() -> Result<(), String> {
     let _ = cmd_tx.send(WorkerCmd::Refresh);
 
     let empty = wrap_report("{}", &facts_snapshot(&facts), now_ms(), None);
-    let menu_bar_chart = config.tray.menu_bar_style.as_deref() != Some("provider");
+    let menu_bar_look = MenuBarLook::from_style(config.tray.menu_bar_style.as_deref());
     let tray = build_tray()?;
 
     let theme = Theme::Light;
@@ -283,7 +291,11 @@ fn run_loop() -> Result<(), String> {
         stars: Stars::new(),
         strip_order: Vec::new(),
         strip_order_known: false,
-        menu_bar_chart,
+        menu_bar_look,
+        menu_bar_short_name: config.tray.menu_bar_short_name(),
+        usage_reading: UsageReading::Used,
+        hidden_rows: HiddenRows::new(),
+        selected_provider: None,
         menu_bar_logo_key: None,
         notifications_enabled: config.notifications.enabled,
         notifications_threshold: config.notifications.threshold,
@@ -406,11 +418,31 @@ fn host_facts(config: &Config) -> HostFacts {
     facts
 }
 
-/// Which Claude CLI and Codex logins are active, for the switch control on
-/// each account's card. Read fresh on every report, so a switch made from the
-/// terminal shows up too.
+/// The `accounts` key of the Claude Desktop app's own logins: the switch on a
+/// Claude card the CLI does not know, which moves the app alone.
+const DESKTOP_VENDOR: &str = "claude-desktop";
+
+/// Which Claude CLI, Claude Desktop and Codex logins are active, for the switch
+/// control on each account's card. Read fresh on every report, so a switch made
+/// from the terminal shows up too.
 fn account_facts(config: &Config) -> Vec<AccountSwitchFact> {
     let mut out = Vec::new();
+    if let Some((labels, active)) = crate::claude_desktop::Paths::resolve(&config.anthropic)
+        .ok()
+        .and_then(|paths| crate::claude_desktop::switchable(&paths))
+    {
+        out.push(AccountSwitchFact {
+            vendor: DESKTOP_VENDOR.into(),
+            active,
+            labels,
+            prepare_enabled: config
+                .anthropic
+                .desktop_prepare_binary
+                .as_ref()
+                .is_some_and(|path| path.is_absolute() && path.is_file()),
+            ..AccountSwitchFact::default()
+        });
+    }
     let claude = config.anthropic.all_accounts();
     if config.anthropic.enabled && !claude.is_empty() {
         let active = crate::anthropic::cli_account::home_claude_json()
@@ -452,6 +484,10 @@ fn refresh_account_facts(facts: &SharedFacts) {
                     fact.target.clone_from(&old.target);
                     fact.switching = old.switching;
                     fact.error.clone_from(&old.error);
+                    fact.prepare_target.clone_from(&old.prepare_target);
+                    fact.preparing = old.preparing;
+                    fact.prepare_error.clone_from(&old.prepare_error);
+                    fact.prepared_reset.clone_from(&old.prepared_reset);
                 }
                 fact
             })
@@ -484,8 +520,14 @@ fn run_account_switch(facts: &SharedFacts, vendor: &str, label: &str) {
 fn switch_with(tray: &std::path::Path, vendor: &str, label: &str) -> String {
     let mut command = std::process::Command::new(tray);
     command.args(["account", "switch", "--yes"]);
-    if vendor == "openai" {
-        command.arg("--codex");
+    match vendor {
+        "openai" => {
+            command.arg("--codex");
+        }
+        DESKTOP_VENDOR => {
+            command.arg("--desktop");
+        }
+        _ => {}
     }
     command.arg("--").arg(label);
     match command.stdin(std::process::Stdio::null()).output() {
@@ -554,43 +596,45 @@ fn apply_facts(state: &mut TrayState) {
 
 fn apply_strip_icon(state: &mut TrayState) {
     let content = content_from_payload(&state.payload, &state.stars, &state.strip_order);
-    let tooltip = menu_bar::tooltip(&content);
+    let tooltip = menu_bar::tooltip(&content, state.usage_reading);
     let _ = state.tray.set_tooltip(Some(tooltip.as_str()));
     state.tray.set_title(Some(""));
-    let segments = menu_bar::logo_segments(&content, &state.payload);
-    let has_content = if state.menu_bar_chart {
+    let segments = menu_bar::logo_segments(
+        &content,
+        &state.payload,
+        state.menu_bar_look,
+        state.selected_provider.as_deref(),
+        state.menu_bar_short_name,
+        state.usage_reading,
+        &state.hidden_rows,
+    );
+    let has_content = if state.menu_bar_look == MenuBarLook::Chart {
         !content.bars.is_empty()
     } else {
         !segments.is_empty()
     };
-    match menu_bar::status_item_content(state.menu_bar_chart, has_content) {
+    match menu_bar::status_item_content(state.menu_bar_look, has_content) {
         StatusItemContent::AppIcon => {
             state.menu_bar_logo_key = None;
             set_static_status_icon(state);
         }
         StatusItemContent::Chart => {
             state.menu_bar_logo_key = None;
-            let fractions: Vec<f64> = content.bars.iter().map(|metric| metric.fraction).collect();
+            let fractions = menu_bar::chart_fractions(&content);
             if let Ok(icon) = bars_icon(&fractions) {
-                let _ = state.tray.set_icon(Some(icon));
+                let _ = state.tray.set_icon_templated(Some(icon));
             }
-            state.tray.set_icon_as_template(true);
             if let Some(image) = template_bars_image(&fractions) {
                 set_status_button_image(Some(&image));
             }
         }
         StatusItemContent::Logos => {
             let key = LogoStripKey {
-                line_counts: segments
-                    .iter()
-                    .map(|segment| segment.values.len())
-                    .collect(),
                 segments: segments.clone(),
             };
             if state.menu_bar_logo_key.as_ref() != Some(&key) {
                 let image = logo_strip_image(&segments);
-                let _ = state.tray.set_icon(None);
-                state.tray.set_icon_as_template(true);
+                let _ = state.tray.set_icon_templated(None);
                 set_status_button_image(Some(&image));
                 state.menu_bar_logo_key = Some(key);
             }
@@ -609,12 +653,11 @@ fn static_icon() -> Result<Icon, tray_icon::BadIcon> {
 }
 
 fn set_static_status_icon(state: &mut TrayState) {
-    let _ = state.tray.set_icon(None);
+    let _ = state.tray.set_icon_templated(None);
     set_status_button_image(None);
     if let Ok(icon) = static_icon() {
-        let _ = state.tray.set_icon(Some(icon));
+        let _ = state.tray.set_icon_templated(Some(icon));
     }
-    state.tray.set_icon_as_template(true);
 }
 
 enum ShortcutOutcome {
@@ -741,7 +784,8 @@ fn push_to_webview(state: &TrayState) {
 
 fn popover_payload(state: &TrayState) -> String {
     let mut payload = state.payload.clone();
-    payload["menu_bar_chart"] = json!(state.menu_bar_chart);
+    payload["menu_bar_look"] = json!(state.menu_bar_look.picker_value());
+    payload["menu_bar_short_name"] = json!(state.menu_bar_short_name);
     payload["notifications_enabled"] = json!(state.notifications_enabled);
     payload["notifications_threshold"] = json!(state.notifications_threshold);
     host_payload(&payload)
@@ -839,18 +883,24 @@ fn persist_menu_bar_value(key: &str, value: toml_edit::Value) {
     }
 }
 
+/// A switch the popover asks for is honored only for a vendor and label the
+/// host itself reported, and never while a switch or a prepare is running.
+fn account_switch_allowed(accounts: &[AccountSwitchFact], vendor: &str, label: &str) -> bool {
+    accounts.iter().any(|fact| {
+        fact.vendor == vendor
+            && !fact.switching
+            && !fact.preparing
+            && fact.active.as_deref() != Some(label)
+            && fact.labels.iter().any(|known| known == label)
+    })
+}
+
 /// Start a switch the popover asked for. Only a vendor and label the host
 /// itself reported are accepted, and never while one is already running.
 fn request_account_switch(state: &mut TrayState, value: &Value) {
     let vendor = value.get("vendor").and_then(Value::as_str).unwrap_or("");
     let label = value.get("label").and_then(Value::as_str).unwrap_or("");
-    let allowed = facts_snapshot(&state.facts).accounts.iter().any(|fact| {
-        fact.vendor == vendor
-            && !fact.switching
-            && fact.active.as_deref() != Some(label)
-            && fact.labels.iter().any(|known| known == label)
-    });
-    if !allowed {
+    if !account_switch_allowed(&facts_snapshot(&state.facts).accounts, vendor, label) {
         return;
     }
     with_facts(&state.facts, |f| {
@@ -888,6 +938,87 @@ fn request_account_switch(state: &mut TrayState, value: &Value) {
     }
 }
 
+/// A prepare is Desktop-only, needs an explicit trusted CLI, a known inactive
+/// account and a known active one, and never runs next to a switch.
+fn account_prepare_allowed(accounts: &[AccountSwitchFact], vendor: &str, label: &str) -> bool {
+    vendor == DESKTOP_VENDOR
+        && !accounts.iter().any(|fact| fact.switching || fact.preparing)
+        && accounts.iter().any(|fact| {
+            fact.vendor == vendor
+                && fact.prepare_enabled
+                && fact.active.is_some()
+                && fact.active.as_deref() != Some(label)
+                && fact.labels.iter().any(|known| known == label)
+        })
+}
+
+fn request_account_prepare(state: &mut TrayState, value: &Value) {
+    let vendor = value.get("vendor").and_then(Value::as_str).unwrap_or("");
+    let label = value.get("label").and_then(Value::as_str).unwrap_or("");
+    if !account_prepare_allowed(&facts_snapshot(&state.facts).accounts, vendor, label) {
+        return;
+    }
+    with_facts(&state.facts, |f| {
+        if let Some(fact) = f
+            .accounts
+            .iter_mut()
+            .find(|fact| fact.vendor == DESKTOP_VENDOR)
+        {
+            fact.prepare_target = label.into();
+            fact.preparing = true;
+            fact.prepare_error.clear();
+            fact.prepared_reset.clear();
+        }
+    });
+    apply_facts(state);
+    let facts = state.facts.clone();
+    let proxy = state.proxy.clone();
+    let worker = state.worker.clone();
+    let label = label.to_string();
+    let spawned = std::thread::Builder::new()
+        .name("ai-usagebar-desktop-prepare".into())
+        .spawn(move || {
+            let result = (|| -> crate::Result<crate::claude_desktop::prepare::Preparation> {
+                let config = Config::load()?;
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|_| {
+                        crate::AppError::Other("Could not start preparation worker.".into())
+                    })?
+                    .block_on(crate::claude_desktop::prepare::run(&config, &label))
+            })();
+            with_facts(&facts, |f| {
+                if let Some(fact) = f
+                    .accounts
+                    .iter_mut()
+                    .find(|fact| fact.vendor == DESKTOP_VENDOR)
+                {
+                    fact.preparing = false;
+                    match result {
+                        Ok(done) => fact.prepared_reset = done.reset_at.to_rfc3339(),
+                        Err(error) => fact.prepare_error = error.to_string(),
+                    }
+                }
+            });
+            let _ = proxy.send_event(UserEvent::Facts);
+            let _ = worker.send(WorkerCmd::Refresh);
+        });
+    if spawned.is_err() {
+        with_facts(&state.facts, |f| {
+            if let Some(fact) = f
+                .accounts
+                .iter_mut()
+                .find(|fact| fact.vendor == DESKTOP_VENDOR)
+            {
+                fact.preparing = false;
+                fact.prepare_error = "Could not start preparation worker.".into();
+            }
+        });
+        apply_facts(state);
+    }
+}
+
 fn handle_ipc(state: &mut TrayState, body: &str, control_flow: &mut ControlFlow) {
     let Ok(value) = serde_json::from_str::<Value>(body) else {
         return;
@@ -913,6 +1044,7 @@ fn handle_ipc(state: &mut TrayState, body: &str, control_flow: &mut ControlFlow)
         "toggle-startup" => toggle_startup(state),
         "menu-labels" => state.menu_labels = state.menu_labels.merged(&value),
         "switch-account" => request_account_switch(state, &value),
+        "prepare-account" => request_account_prepare(state, &value),
         "resize" => handle_resize(state, &value),
         "set-shortcut" => {
             let text = value.get("value").and_then(Value::as_str).unwrap_or("");
@@ -947,15 +1079,31 @@ fn handle_ipc(state: &mut TrayState, body: &str, control_flow: &mut ControlFlow)
                 push_to_webview(state);
             }
         }
-        "set-menu-bar-chart" => {
-            if let Some(enabled) = value.get("value").and_then(Value::as_bool) {
-                state.menu_bar_chart = enabled;
-                persist_menu_bar_value(
-                    "menu_bar_style",
-                    (if enabled { "bars" } else { "provider" }).into(),
-                );
+        "set-menu-bar-look" => {
+            let look = value
+                .get("value")
+                .and_then(Value::as_str)
+                .and_then(MenuBarLook::from_picker_value);
+            if let Some(look) = look {
+                state.menu_bar_look = look;
+                persist_menu_bar_value("menu_bar_style", look.style().into());
                 apply_strip_icon(state);
                 push_to_webview(state);
+            }
+        }
+        "set-menu-bar-short-name" => {
+            if let Some(show) = value.get("value").and_then(Value::as_bool) {
+                state.menu_bar_short_name = show;
+                persist_menu_bar_value("menu_bar_short_name", show.into());
+                apply_strip_icon(state);
+                push_to_webview(state);
+            }
+        }
+        "select-provider" => {
+            let id = value.get("id").and_then(Value::as_str).unwrap_or("");
+            state.selected_provider = (!id.is_empty()).then(|| id.to_owned());
+            if state.menu_bar_look == MenuBarLook::Quattro {
+                apply_strip_icon(state);
             }
         }
         "strip" => {
@@ -963,6 +1111,8 @@ fn handle_ipc(state: &mut TrayState, body: &str, control_flow: &mut ControlFlow)
             state.stars = stars;
             state.strip_order = order;
             state.strip_order_known = true;
+            state.usage_reading = UsageReading::from_strip_ipc(&value);
+            state.hidden_rows = parse_hidden_rows(&value);
             apply_strip_icon(state);
         }
         "open-url" => {
@@ -1209,8 +1359,7 @@ fn build_tray() -> Result<TrayIcon, String> {
     // opens the WKWebView panel, and the right click shows the Options menu
     // only while `TrayIcon::show_menu` runs.
     TrayIconBuilder::new()
-        .with_icon(icon)
-        .with_icon_as_template(true)
+        .with_icon_templated(icon)
         .with_menu_on_left_click(false)
         .with_menu_on_right_click(false)
         .build()
@@ -1442,14 +1591,11 @@ fn apply_contents_scale(view: &NSView, scale: f64) {
 const LOGO_STRIP_HEIGHT: f64 = 18.0;
 /// Provider marks occupy a square that preserves their original aspect ratio.
 const LOGO_MARK_BOX: f64 = 16.0;
+/// Space between a mark and its short name, and between a label and its values.
+const LOGO_LABEL_GAP: f64 = 4.0;
 /// A single value uses the larger menu-bar text size.
-const LOGO_SINGLE_VALUE_FONT_SIZE: f64 = 12.0;
-/// Two values use a compact, tightly stacked text size.
-const LOGO_STACKED_VALUE_FONT_SIZE: f64 = 9.0;
-/// Two 9 pt values overlap by 2 pt, matching OpenUsage's tight stack.
-const LOGO_STACKED_LINE_STEP: f64 = 7.0;
-
-/// Build one AppKit template image for provider marks and their starred values.
+const LOGO_SINGLE_VALUE_FONT_SIZE: f64 = 13.0;
+/// Build one AppKit template image for provider marks and one readable summary value each.
 fn logo_strip_image(segments: &[LogoSegment]) -> Retained<NSImage> {
     debug_assert!(!segments.is_empty());
     // SAFETY: AppKit exposes this immutable font-weight constant for the life of the process.
@@ -1457,56 +1603,52 @@ fn logo_strip_image(segments: &[LogoSegment]) -> Retained<NSImage> {
     let label_font = NSFont::systemFontOfSize_weight(LOGO_SINGLE_VALUE_FONT_SIZE, semibold);
     let single_value_font =
         NSFont::monospacedDigitSystemFontOfSize_weight(LOGO_SINGLE_VALUE_FONT_SIZE, semibold);
-    let stacked_value_font =
-        NSFont::monospacedDigitSystemFontOfSize_weight(LOGO_STACKED_VALUE_FONT_SIZE, semibold);
     let label_attributes = font_attributes(&label_font);
     let single_value_attributes = font_attributes(&single_value_font);
-    let stacked_value_attributes = font_attributes(&stacked_value_font);
 
     let items: Vec<LogoStripItem> = segments
         .iter()
         .map(|segment| {
             let mark = marks::mark_svg(&segment.slug).and_then(svg_image);
-            let fallback_name = NSString::from_str(segment.short_name.as_deref().unwrap_or(""));
-            let label_width = if mark.is_some() {
-                LOGO_MARK_BOX
+            let name = (segment.with_name || mark.is_none())
+                .then(|| NSString::from_str(segment.short_name.as_deref().unwrap_or("")));
+            let mark_width = if mark.is_some() { LOGO_MARK_BOX } else { 0.0 };
+            let name_width = name
+                .as_ref()
+                .map_or(0.0, |name| text_width(name, &label_attributes));
+            let label_width = if mark_width > 0.0 && name_width > 0.0 {
+                mark_width + LOGO_LABEL_GAP + name_width
             } else {
-                text_width(&fallback_name, &label_attributes)
+                mark_width + name_width
             };
             let values: Vec<Retained<NSString>> = segment
                 .values
                 .iter()
-                .take(2)
+                .take(1)
                 .map(|value| NSString::from_str(value))
                 .collect();
-            let line_count = values.len();
-            let value_attributes = if line_count > 1 {
-                &stacked_value_attributes
-            } else {
-                &single_value_attributes
-            };
             let value_width = values
                 .iter()
-                .map(|value| text_width(value, value_attributes))
+                .map(|value| text_width(value, &single_value_attributes))
                 .fold(0.0_f64, f64::max);
             LogoStripItem {
                 mark,
-                fallback_name,
+                name,
                 values,
                 label_width,
                 value_width,
-                line_count,
             }
         })
         .collect();
 
     let item_gap = 11.0;
+    let single_line_height = text_height(&single_value_attributes);
     let width = items
         .iter()
         .map(|item| {
             item.label_width
                 + if item.label_width > 0.0 {
-                    4.0 + item.value_width
+                    LOGO_LABEL_GAP + item.value_width
                 } else {
                     item.value_width
                 }
@@ -1515,7 +1657,7 @@ fn logo_strip_image(segments: &[LogoSegment]) -> Retained<NSImage> {
         + item_gap * items.len().saturating_sub(1) as f64;
     let block = RcBlock::new(move |dst: NSRect| {
         let mut x = dst.origin.x;
-        let fallback_y = dst.origin.y + (LOGO_STRIP_HEIGHT - LOGO_SINGLE_VALUE_FONT_SIZE) / 2.0;
+        let single_line_y = dst.origin.y + (LOGO_STRIP_HEIGHT - single_line_height) / 2.0;
         for (index, item) in items.iter().enumerate() {
             if let Some(mark) = &item.mark {
                 draw_fitted_mark(
@@ -1523,33 +1665,21 @@ fn logo_strip_image(segments: &[LogoSegment]) -> Retained<NSImage> {
                     x,
                     dst.origin.y + (LOGO_STRIP_HEIGHT - LOGO_MARK_BOX) / 2.0,
                 );
-            } else {
-                draw_status_text(&item.fallback_name, x, fallback_y, &label_attributes);
+            }
+            if let Some(name) = &item.name {
+                let name_x = if item.mark.is_some() {
+                    x + LOGO_MARK_BOX + LOGO_LABEL_GAP
+                } else {
+                    x
+                };
+                draw_status_text(name, name_x, single_line_y, &label_attributes);
             }
             x += item.label_width;
             if item.label_width > 0.0 {
-                x += 4.0;
+                x += LOGO_LABEL_GAP;
             }
-            let stacked = item.line_count > 1;
-            let value_attributes = if stacked {
-                &stacked_value_attributes
-            } else {
-                &single_value_attributes
-            };
-            let font_size = if stacked {
-                LOGO_STACKED_VALUE_FONT_SIZE
-            } else {
-                LOGO_SINGLE_VALUE_FONT_SIZE
-            };
-            let line_step = if stacked {
-                LOGO_STACKED_LINE_STEP
-            } else {
-                font_size
-            };
-            let text_height = font_size + line_step * item.line_count.saturating_sub(1) as f64;
-            let text_y = dst.origin.y + (LOGO_STRIP_HEIGHT - text_height) / 2.0;
-            for (line, value) in item.values.iter().enumerate() {
-                draw_status_text(value, x, text_y + line as f64 * line_step, value_attributes);
+            for value in &item.values {
+                draw_status_text(value, x, single_line_y, &single_value_attributes);
             }
             x += item.value_width;
             if index + 1 < items.len() {
@@ -1600,6 +1730,18 @@ fn text_width(text: &NSString, attributes: &NSDictionary<NSAttributedStringKey, 
     unsafe { text.sizeWithAttributes(Some(attributes)).width.ceil() }
 }
 
+/// Height of one line set in `attributes`. AppKit draws at the top of the line
+/// box, which is taller than the font size, so centring on the point size alone
+/// leaves single-line text about a point below a mark of the same strip.
+fn text_height(attributes: &NSDictionary<NSAttributedStringKey, AnyObject>) -> f64 {
+    // SAFETY: as in `text_width`, `attributes` carries the font it was built with.
+    unsafe {
+        NSString::from_str("0")
+            .sizeWithAttributes(Some(attributes))
+            .height
+    }
+}
+
 /// Draw text with the same font attributes used to calculate its width.
 fn draw_status_text(
     text: &NSString,
@@ -1629,12 +1771,21 @@ fn draw_fitted_mark(image: &NSImage, x: f64, y: f64) {
         ),
         size: NSSize::new(width, height),
     };
-    image.drawInRect_fromRect_operation_fraction(
-        destination,
-        source,
-        NSCompositingOperation::SourceOver,
-        1.0,
-    );
+    // The strip is drawn in a flipped context so text lays out top-down.
+    // Plain `drawInRect:fromRect:operation:fraction:` ignores that and paints
+    // the mark upside down, which only showed on asymmetric marks (Z.AI's Z
+    // read as a mirrored S); `respectFlipped` keeps it upright.
+    // SAFETY: no hints dictionary is passed, so its generic type is moot.
+    unsafe {
+        image.drawInRect_fromRect_operation_fraction_respectFlipped_hints(
+            destination,
+            source,
+            NSCompositingOperation::SourceOver,
+            1.0,
+            true,
+            None,
+        );
+    }
 }
 
 fn template_bars_image(fractions: &[f64]) -> Option<Retained<NSImage>> {
@@ -1684,16 +1835,22 @@ fn draw_template_bars(dst: NSRect, fractions: &[f64]) {
                 1.0,
             );
         }
-        if fill.fill_w > 0.0
-            && fill.remainder_w > 0.0
+        if fill.remainder_w > 0.0
             && let Some(divider_x) = fill.divider_x
         {
+            // A remainder starting at 0 is the whole track of an empty gauge:
+            // round both ends like the track, not like a tail meeting a fill.
+            let r_left = if divider_x <= 0.0 {
+                layout.rx
+            } else {
+                (layout.rx * 0.2).floor().max(0.0)
+            };
             fill_round_rect(
                 ox + layout.track_x + divider_x,
                 y,
                 fill.remainder_w,
                 layout.track_h,
-                layout.rx,
+                r_left,
                 0.24,
             );
         }
@@ -1782,5 +1939,67 @@ impl SingleInstance {
         file.try_lock_exclusive().ok()?;
         let _ = writeln!(&file, "{}", std::process::id());
         Some(Self { _lock: file })
+    }
+}
+
+#[cfg(test)]
+mod account_switch_tests {
+    use super::*;
+
+    #[test]
+    fn prepares_only_explicit_inactive_desktop_profiles_and_blocks_concurrent_switches() {
+        let mut accounts = vec![AccountSwitchFact {
+            vendor: DESKTOP_VENDOR.into(),
+            active: Some("one".into()),
+            labels: vec!["one".into(), "two".into()],
+            prepare_enabled: true,
+            ..AccountSwitchFact::default()
+        }];
+        assert!(account_prepare_allowed(&accounts, DESKTOP_VENDOR, "two"));
+        assert!(!account_prepare_allowed(&accounts, DESKTOP_VENDOR, "one"));
+        assert!(!account_prepare_allowed(
+            &accounts,
+            DESKTOP_VENDOR,
+            "unknown"
+        ));
+        assert!(!account_prepare_allowed(&accounts, "anthropic", "two"));
+        accounts[0].preparing = true;
+        assert!(!account_prepare_allowed(&accounts, DESKTOP_VENDOR, "two"));
+        assert!(!account_switch_allowed(&accounts, DESKTOP_VENDOR, "two"));
+        accounts[0].preparing = false;
+        accounts[0].switching = true;
+        assert!(!account_prepare_allowed(&accounts, DESKTOP_VENDOR, "two"));
+        accounts[0].switching = false;
+        accounts[0].prepare_enabled = false;
+        assert!(!account_prepare_allowed(&accounts, DESKTOP_VENDOR, "two"));
+        accounts[0].prepare_enabled = true;
+        accounts[0].active = None;
+        assert!(!account_prepare_allowed(&accounts, DESKTOP_VENDOR, "two"));
+    }
+
+    #[test]
+    fn requires_known_inactive_account_and_serializes_switches() {
+        let mut accounts = vec![
+            AccountSwitchFact {
+                vendor: DESKTOP_VENDOR.into(),
+                active: Some("one".into()),
+                labels: vec!["one".into(), "two".into()],
+                ..AccountSwitchFact::default()
+            },
+            AccountSwitchFact {
+                vendor: "anthropic".into(),
+                ..AccountSwitchFact::default()
+            },
+        ];
+        assert!(account_switch_allowed(&accounts, DESKTOP_VENDOR, "two"));
+        assert!(!account_switch_allowed(&accounts, DESKTOP_VENDOR, "one"));
+        assert!(!account_switch_allowed(
+            &accounts,
+            DESKTOP_VENDOR,
+            "unknown"
+        ));
+        assert!(!account_switch_allowed(&accounts, "anthropic", "two"));
+        accounts[0].switching = true;
+        assert!(!account_switch_allowed(&accounts, DESKTOP_VENDOR, "two"));
     }
 }

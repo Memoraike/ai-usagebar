@@ -24,6 +24,10 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(120);
 /// A sha256 sidecar is one line; anything bigger is not ours.
 const MAX_SIDECAR_BYTES: usize = 4 * 1024;
+/// The release JSON carries every asset and the release notes: about 100 KB
+/// today, so the vendor body cap leaves room to grow without trusting the
+/// server's length.
+const MAX_RELEASE_BYTES: usize = crate::vendor::MAX_BODY_BYTES;
 /// GitHub asks for a User-Agent; naming the version helps them and us.
 const USER_AGENT: &str = concat!("ai-usagebar-tray/", env!("CARGO_PKG_VERSION"));
 
@@ -71,11 +75,10 @@ pub async fn check_at(
     if !status.is_success() {
         return Err(format!("release check returned HTTP {}", status.as_u16()));
     }
-    let body = response
-        .text()
+    let body = crate::vendor::read_body_capped(response, MAX_RELEASE_BYTES)
         .await
         .map_err(|e| format!("release check body unreadable: {e}"))?;
-    let release = match parse_release(&body) {
+    let release = match parse_release(&String::from_utf8_lossy(&body)) {
         Ok(release) => release,
         Err(reason) if reason.contains("prerelease") || reason.contains("draft") => {
             return Ok(None);
@@ -203,24 +206,10 @@ async fn fetch_bytes(client: &reqwest::Client, url: &str, cap: u64) -> Result<Ve
     if !status.is_success() {
         return Err(format!("download returned HTTP {}", status.as_u16()));
     }
-    if let Some(len) = response.content_length()
-        && len > cap
-    {
-        return Err(format!(
-            "download is {len} bytes, above the {cap} byte limit"
-        ));
-    }
-    let bytes = response
-        .bytes()
+    let cap = usize::try_from(cap).unwrap_or(usize::MAX);
+    crate::vendor::read_body_capped(response, cap)
         .await
-        .map_err(|e| format!("download body failed: {e}"))?;
-    if bytes.len() as u64 > cap {
-        return Err(format!(
-            "download is {} bytes, above the {cap} byte limit",
-            bytes.len()
-        ));
-    }
-    Ok(bytes.to_vec())
+        .map_err(|e| format!("download body failed: {e}"))
 }
 
 /// Directory of the running exe; the update replaces siblings there.
@@ -328,5 +317,41 @@ mod tests {
         assert!(err.contains("403"), "{err}");
         // The upstream body may name the account; it must not reach the UI.
         assert!(!err.contains("rate limited"), "{err}");
+    }
+
+    /// Answer one request with a chunked body of `len` bytes and keep the
+    /// connection open without the final chunk, like a server that never stops
+    /// streaming. A plain thread: the crate's tokio has no `net` feature.
+    fn endless_chunked_server(len: usize) -> String {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let Ok((mut socket, _)) = listener.accept() else {
+                return;
+            };
+            let _ = socket.read(&mut [0u8; 4096]);
+            let head = format!("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n{len:x}\r\n");
+            let _ = socket.write_all(head.as_bytes());
+            let _ = socket.write_all(&vec![b'x'; len]);
+            let _ = socket.write_all(b"\r\n");
+            std::thread::park();
+        });
+        format!("http://{addr}/latest")
+    }
+
+    /// A release body past the cap fails as soon as the cap is crossed, without
+    /// waiting for a body that never ends or buffering all of it.
+    #[tokio::test]
+    async fn an_oversized_release_body_is_refused_before_it_ends() {
+        let url = endless_chunked_server(MAX_RELEASE_BYTES + 1);
+        let err = tokio::time::timeout(
+            Duration::from_secs(5),
+            check_at(&http_client().unwrap(), &url, "1.0.0"),
+        )
+        .await
+        .expect("the cap should stop the read before the request timeout")
+        .unwrap_err();
+        assert!(err.contains("exceeds"), "{err}");
     }
 }

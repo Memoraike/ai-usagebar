@@ -60,6 +60,7 @@ Node contract tests (optional, needs Node 18+):
 node gnome-extension\marker-logic.test.mjs
 node gnome-extension\layout.test.mjs
 node gnome-extension\report-model.test.mjs
+node gnome-extension\prefs.test.mjs
 node kde-plasmoid\plasmoid-logic.test.mjs
 node windows\popover\popover.test.mjs
 node omarchy\model.test.mjs
@@ -84,10 +85,10 @@ TUI keys: `Tab` / `h` `l` cycle tabs, `r` refresh, `s` Settings, `q` quit.
 
 ## Configuration
 
-Default file: `%APPDATA%\ai-usagebar\config.toml`.
+Default file: `%APPDATA%\ai-usagebar\config\config.toml`.
 
 ```powershell
-$dir = "$env:APPDATA\ai-usagebar"
+$dir = "$env:APPDATA\ai-usagebar\config"
 New-Item -ItemType Directory -Force -Path $dir | Out-Null
 Copy-Item config.example.toml "$dir\config.toml"
 notepad "$dir\config.toml"

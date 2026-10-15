@@ -23,6 +23,7 @@ use crate::grokbot;
 use crate::kilo;
 use crate::kimi;
 use crate::kiro;
+use crate::lyceum;
 use crate::minimax;
 use crate::modelstudio;
 use crate::moonshot;
@@ -172,19 +173,23 @@ async fn build_output(cli: &Cli) -> Result<WaybarOutput> {
         Vendor::CommandCode => commandcode_output(cli, &config).await,
         Vendor::Ollama => ollama_output(cli, &config).await,
         Vendor::OrcaRouter => orcarouter_output(cli, &config).await,
+        Vendor::Lyceum => lyceum_output(cli, &config).await,
         Vendor::ModelStudio => modelstudio_output(cli, &config).await,
+        Vendor::Devin => devin_output(cli, &config).await,
+        Vendor::MuseCode => muse_output(cli, &config).await,
+        Vendor::Cline => cline_output(cli, &config).await,
     }
 }
 
 fn validate_vendor_options(cli: &Cli, vendor: Vendor) -> Result<()> {
     if cli.account.is_some()
-        && !matches!(vendor, Vendor::Anthropic | Vendor::Openai)
+        && !matches!(vendor, Vendor::Anthropic | Vendor::Openai | Vendor::Copilot)
         && !Config::API_KEY_ACCOUNT_VENDORS.contains(&vendor.to_id())
     {
         return Err(AppError::Other(
-            "--account is supported only for Claude, Codex (OpenAI), and the API-key \
-             vendors with a [[<vendor>.accounts]] array: Z.AI, OpenRouter, DeepSeek, \
-             DeepInfra, Kilo, Novita, Moonshot, Grok, MiniMax, and OrcaRouter"
+            "--account is supported only for Claude, Codex (OpenAI), GitHub Copilot, and \
+             the API-key vendors with a [[<vendor>.accounts]] array: Z.AI, OpenRouter, \
+             DeepSeek, DeepInfra, Kilo, Novita, Moonshot, Grok, MiniMax, and OrcaRouter"
                 .into(),
         ));
     }
@@ -226,10 +231,10 @@ async fn nous_output(cli: &Cli) -> Result<WaybarOutput> {
 }
 
 async fn opencode_go_output(cli: &Cli, config: &Config) -> Result<WaybarOutput> {
-    let api_key = crate::config::resolve_api_key(
-        "OpenCode Go",
+    let api_key = crate::opencode_go::creds::resolve_key(
         &config.opencode_go.api_key_env,
         config.opencode_go.api_key.as_deref(),
+        config.opencode_go.auth_paths.as_deref(),
     )?;
     let client = http_client()?;
     let cache = vendor_cache(cli, "opencode-go")?;
@@ -252,6 +257,44 @@ async fn opencode_go_output(cli: &Cli, config: &Config) -> Result<WaybarOutput> 
     let snapshot = outcome.snapshot.clone();
     let vendor_outcome: VendorOutcome = outcome.into();
     Ok(crate::opencode_go::vendor::render(
+        &vendor_outcome,
+        &snapshot,
+        &theme_from_cli(cli),
+        &RenderOpts::from_cli(cli),
+        Utc::now(),
+    ))
+}
+
+/// Cline reuses the credential the Cline CLI maintains; see
+/// [`crate::cline::creds`] for why this never refreshes it.
+async fn cline_output(cli: &Cli, config: &Config) -> Result<WaybarOutput> {
+    let credential = crate::cline::creds::resolve(
+        config.cline.auth_paths.as_deref(),
+        &config.cline.api_key_env,
+        config.cline.api_key.as_deref(),
+    )?;
+    let client = http_client()?;
+    let cache = vendor_cache(cli, "cline")?;
+    let endpoints = crate::cline::fetch::Endpoints::default();
+    let outcome = match crate::cline::fetch::fetch_snapshot(
+        &client,
+        &credential,
+        &cache,
+        &endpoints,
+        DEFAULT_TTL,
+        Utc::now(),
+    )
+    .await
+    {
+        Ok(outcome) => outcome,
+        Err(error) if error.is_transient() => {
+            return Ok(WaybarOutput::loading(cli.icon.as_deref()));
+        }
+        Err(error) => return Err(error),
+    };
+    let snapshot = outcome.snapshot.clone();
+    let vendor_outcome: VendorOutcome = outcome.into();
+    Ok(crate::cline::vendor::render(
         &vendor_outcome,
         &snapshot,
         &theme_from_cli(cli),
@@ -377,12 +420,19 @@ async fn antigravity_output(cli: &Cli, config: &Config) -> Result<WaybarOutput> 
         config.antigravity.oauth_client_id.as_deref(),
         config.antigravity.oauth_client_secret.as_deref(),
     );
-    let outcome =
-        match antigravity::fetch_snapshot(&client, &cache, DEFAULT_TTL, oauth.as_ref()).await {
-            Ok(o) => o,
-            Err(e) if e.is_transient() => return Ok(WaybarOutput::loading(cli.icon.as_deref())),
-            Err(e) => return Err(e),
-        };
+    let outcome = match antigravity::fetch_snapshot(
+        &client,
+        &cache,
+        DEFAULT_TTL,
+        oauth.as_ref(),
+        config.antigravity.ide_language_server,
+    )
+    .await
+    {
+        Ok(o) => o,
+        Err(e) if e.is_transient() => return Ok(WaybarOutput::loading(cli.icon.as_deref())),
+        Err(e) => return Err(e),
+    };
 
     let theme = theme_from_cli(cli);
     let snap = outcome.snapshot.clone();
@@ -617,6 +667,28 @@ async fn novita_output(cli: &Cli, config: &Config) -> Result<WaybarOutput> {
     ))
 }
 
+async fn lyceum_output(cli: &Cli, config: &Config) -> Result<WaybarOutput> {
+    let (api_key, cache) = api_key_target(cli, config, VendorId::Lyceum)?;
+    let client = http_client()?;
+    let outcome = match lyceum::fetch::fetch_snapshot(&client, &api_key, &cache, DEFAULT_TTL).await
+    {
+        Ok(outcome) => outcome,
+        Err(error) if error.is_transient() => {
+            return Ok(WaybarOutput::loading(cli.icon.as_deref()));
+        }
+        Err(error) => return Err(error),
+    };
+    let snapshot = outcome.snapshot.clone();
+    let vendor_outcome: crate::vendor::VendorOutcome = outcome.into();
+    Ok(lyceum::vendor::render(
+        &vendor_outcome,
+        &snapshot,
+        &theme_from_cli(cli),
+        &RenderOpts::from_cli(cli),
+        Utc::now(),
+    ))
+}
+
 async fn kilo_output(cli: &Cli, config: &Config) -> Result<WaybarOutput> {
     let (api_key, cache) = api_key_target(cli, config, VendorId::Kilo)?;
     let client = http_client()?;
@@ -693,6 +765,19 @@ async fn anthropic_api_output(cli: &Cli, config: &Config) -> Result<WaybarOutput
 ///
 /// The login's path is resolved inside the fetch, under its lock, because
 /// `account switch --codex` can move it between two looks.
+/// Each named Copilot account gets its own cache subdir, so a label switch
+/// never serves the previous account's figures. The payload already carries a
+/// token-hash marker, so a stale cache is refused rather than misattributed;
+/// the subdir keeps both accounts warm instead of one evicting the other.
+fn copilot_cache(cli: &Cli) -> Result<Cache> {
+    Ok(match (cli.cache_dir.as_deref(), cli.account.as_deref()) {
+        (Some(root), Some(label)) => Cache::at(root.join("copilot").join(label)),
+        (Some(root), None) => Cache::at(root.join("copilot")),
+        (None, Some(label)) => Cache::for_vendor_account("copilot", label)?,
+        (None, None) => Cache::for_vendor("copilot")?,
+    })
+}
+
 fn openai_cache(cli: &Cli) -> Result<Cache> {
     Ok(match (cli.cache_dir.as_deref(), cli.account.as_deref()) {
         (Some(root), Some(label)) => Cache::at(root.join("openai").join(label)),
@@ -736,9 +821,10 @@ async fn openai_output(cli: &Cli, config: &Config) -> Result<WaybarOutput> {
 }
 
 async fn copilot_output(cli: &Cli, config: &Config) -> Result<WaybarOutput> {
-    let token = config.copilot.resolve_token()?;
+    let label = cli.account.as_deref();
+    let token = config.copilot.resolve_token(label)?;
     let client = http_client()?;
-    let cache = vendor_cache(cli, "copilot")?;
+    let cache = copilot_cache(cli)?;
     let endpoints = copilot::fetch::Endpoints::default();
     let outcome =
         match copilot::fetch_snapshot(&client, &token, &cache, &endpoints, DEFAULT_TTL).await {
@@ -793,11 +879,13 @@ async fn zai_output(cli: &Cli, config: &Config) -> Result<WaybarOutput> {
 
 async fn openrouter_output(cli: &Cli, config: &Config) -> Result<WaybarOutput> {
     let (api_key, cache) = api_key_target(cli, config, VendorId::Openrouter)?;
+    let management_key = config.openrouter_management_key(cli.account.as_deref());
     let client = http_client()?;
     let endpoints = openrouter::fetch::Endpoints::default();
     let outcome = match openrouter::fetch_snapshot(
         &client,
         &api_key,
+        management_key.as_deref(),
         &cache,
         &endpoints,
         DEFAULT_TTL,
@@ -983,6 +1071,43 @@ async fn modelstudio_output(cli: &Cli, config: &Config) -> Result<WaybarOutput> 
     ))
 }
 
+async fn muse_output(cli: &Cli, config: &Config) -> Result<WaybarOutput> {
+    let cache = vendor_cache(cli, "muse-code")?;
+    let outcome = crate::muse::fetch::fetch_snapshot(&config.muse, &cache).await?;
+    let snap = outcome.snapshot.clone();
+    let outcome: VendorOutcome = outcome.into();
+    Ok(crate::muse::vendor::render(
+        &outcome,
+        &snap,
+        &theme_from_cli(cli),
+        &RenderOpts::from_cli(cli),
+        Utc::now(),
+    ))
+}
+
+async fn devin_output(cli: &Cli, config: &Config) -> Result<WaybarOutput> {
+    let cache = vendor_cache(cli, "devin")?;
+    let outcome =
+        match crate::devin::fetch::fetch_snapshot(&config.devin, &cache, DEFAULT_TTL).await {
+            Ok(outcome) => outcome,
+            Err(error) if error.is_transient() => {
+                return Ok(WaybarOutput::loading(cli.icon.as_deref()));
+            }
+            Err(error) => return Err(error),
+        };
+    let theme = theme_from_cli(cli);
+    let snapshot = outcome.snapshot.clone();
+    let vendor_outcome: VendorOutcome = outcome.into();
+    let opts = RenderOpts::from_cli(cli);
+    Ok(crate::devin::vendor::render(
+        &vendor_outcome,
+        &snapshot,
+        &theme,
+        &opts,
+        chrono::Utc::now(),
+    ))
+}
+
 async fn anthropic_output(cli: &Cli, config: &Config) -> Result<WaybarOutput> {
     let client = http_client()?;
     let (creds_target, cache) = anthropic_target(cli, config)?;
@@ -1000,11 +1125,29 @@ async fn anthropic_output(cli: &Cli, config: &Config) -> Result<WaybarOutput> {
         };
 
     let theme = theme_from_cli(cli);
+    let sessions = tooltip_sessions(&creds_target, &crate::context::activity::SystemProbe);
 
-    Ok(render_with_theme(&outcome, &theme, cli))
+    Ok(render_with_theme(&outcome, &theme, cli, sessions.as_ref()))
 }
 
-fn render_with_theme(outcome: &FetchOutcome, theme: &Theme, cli: &Cli) -> WaybarOutput {
+/// The live sessions of the account this module shows, read from the same
+/// target its quota was fetched from, so `--account work` reports work's
+/// sessions (#356). `None` for a target with no config directory (Desktop).
+fn tooltip_sessions(
+    target: &CredsTarget,
+    probe: &impl crate::context::activity::ProcessProbe,
+) -> Option<crate::context::activity::SessionActivity> {
+    target
+        .config_dir()
+        .map(|dir| crate::context::activity::scan_dir(&dir, probe))
+}
+
+fn render_with_theme(
+    outcome: &FetchOutcome,
+    theme: &Theme,
+    cli: &Cli,
+    claude_sessions: Option<&crate::context::activity::SessionActivity>,
+) -> WaybarOutput {
     let format_owned = cli
         .format
         .clone()
@@ -1019,6 +1162,7 @@ fn render_with_theme(outcome: &FetchOutcome, theme: &Theme, cli: &Cli) -> Waybar
         format_pace_color: cli.format_pace_color,
         tooltip_pace_pts: cli.tooltip_pace_pts,
         now: Utc::now(),
+        claude_sessions,
     };
     render_anthropic(&input)
 }
@@ -1169,6 +1313,36 @@ mod tests {
         }
     }
 
+    /// #356: the tooltip reads the sessions of the account whose quota it
+    /// shows — a named account's own directory, not `~/.claude`.
+    #[test]
+    fn tooltip_sessions_come_from_the_shown_accounts_directory() {
+        struct Running;
+        impl crate::context::activity::ProcessProbe for Running {
+            fn is_running(&self, _pid: u32, _start_time: Option<&str>) -> bool {
+                true
+            }
+        }
+        let work = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir(work.path().join("sessions")).unwrap();
+        std::fs::write(
+            work.path().join("sessions").join("4242.json"),
+            r#"{"pid": 4242, "kind": "interactive", "status": "waiting"}"#,
+        )
+        .unwrap();
+        let target = CredsTarget::Named {
+            path: work.path().join(".credentials.json"),
+            config_dir: work.path().to_path_buf(),
+        };
+
+        let sessions = tooltip_sessions(&target, &Running).expect("a config directory");
+        assert_eq!((sessions.working, sessions.waiting), (0, 1));
+
+        // A credential file with no directory around it names no sessions.
+        let bare = CredsTarget::Explicit("credentials.json".into());
+        assert!(tooltip_sessions(&bare, &Running).is_none());
+    }
+
     #[test]
     fn render_with_theme_uses_cli_overrides() {
         let cli = {
@@ -1179,7 +1353,7 @@ mod tests {
         };
         let outcome = dummy_outcome();
         let theme = Theme::default().with_overrides(cli.color_low.clone(), None, None, None);
-        let out = render_with_theme(&outcome, &theme, &cli);
+        let out = render_with_theme(&outcome, &theme, &cli, None);
         // Bar text should contain our format substitution, wrapped in the
         // overridden low-color span.
         assert!(out.text.contains("test:25"));
@@ -1400,6 +1574,7 @@ mod tests {
                 label: "work".into(),
                 api_key_env: None,
                 api_key: Some("work-key".into()),
+                management_api_key_env: None,
             });
         config
             .openrouter
@@ -1408,6 +1583,7 @@ mod tests {
                 label: "personal".into(),
                 api_key_env: None,
                 api_key: Some("personal-key".into()),
+                management_api_key_env: None,
             });
         let root = tempfile::tempdir().unwrap();
         let root_str = root.path().to_str().unwrap();
@@ -1441,11 +1617,13 @@ mod tests {
     #[test]
     fn account_flag_rejects_unrelated_vendors() {
         let cli = cli_with(Some("work"), None, Some("/tmp/cache"));
-        for vendor in [Vendor::Copilot, Vendor::Cursor, Vendor::Kimi, Vendor::Kiro] {
+        for vendor in [Vendor::Cursor, Vendor::Kimi, Vendor::Kiro] {
             assert!(validate_vendor_options(&cli, vendor).is_err(), "{vendor:?}");
         }
         assert!(validate_vendor_options(&cli, Vendor::Anthropic).is_ok());
         assert!(validate_vendor_options(&cli, Vendor::Openai).is_ok());
+        // Copilot joined the named-account vendors in #378.
+        assert!(validate_vendor_options(&cli, Vendor::Copilot).is_ok());
     }
 
     #[test]
@@ -1455,7 +1633,12 @@ mod tests {
             .iter()
             .filter(|vendor| validate_vendor_options(&cli, **vendor).is_ok())
             .map(|vendor| vendor.to_id())
-            .filter(|id| !matches!(id, VendorId::Anthropic | VendorId::Openai))
+            .filter(|id| {
+                !matches!(
+                    id,
+                    VendorId::Anthropic | VendorId::Openai | VendorId::Copilot
+                )
+            })
             .collect();
         assert_eq!(accepted, Config::API_KEY_ACCOUNT_VENDORS);
     }
@@ -1469,6 +1652,7 @@ mod tests {
             label: "work".into(),
             api_key_env: None,
             api_key: Some("work-key".into()),
+            management_api_key_env: None,
         });
         let root = tempfile::tempdir().unwrap();
         let root_str = root.path().to_str().unwrap();

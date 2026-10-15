@@ -5,7 +5,7 @@ import { Hint } from "@/components/Hint";
 import { ProviderIcon } from "@/components/ProviderIcon";
 import { ProviderSection } from "@/components/ProviderSection";
 import type { RowAction } from "@/components/RowMenu";
-import { accountSwitchFor, nextUpdateLabel, sendCommand } from "../model.js";
+import { accountSwitchFor, hiddenMetricKeys, nextUpdateLabel, rowKey, sendCommand } from "../model.js";
 import { DashboardBanners } from "./Dashboard";
 import type { Card, Layout, MetricRow, Payload } from "@/lib/types";
 import { m } from "@/paraglide/messages.js";
@@ -34,9 +34,30 @@ function primaryMetric(card: Card): MetricRow | undefined {
     ?? card.rows.find((row): row is MetricRow => row.kind === "metric");
 }
 
-function providerPreview(card: Card): string {
-  const metric = primaryMetric(card);
-  if (metric) return metric.headline === "value" ? metric.value : `${metric.usedPercent}%`;
+/**
+ * The tab's number: the highest-percent quota window, like the Quattro bar's
+ * default `auto` window (`maxPercent` in `omarchy/Model.js`), so a spent weekly
+ * limit is not hidden behind an idle 5h session reading 0%. Grouped rows stand
+ * in only when the card has no other percentage. A metric hidden in Customize
+ * never counts, so the tab cannot show a number the card below leaves out.
+ */
+function previewMetric(card: Card, layout: Layout): MetricRow | undefined {
+  const hidden = new Set(hiddenMetricKeys(card, layout));
+  const shown = { ...card, rows: card.rows.filter((row) => !hidden.has(rowKey(row))) };
+  const percents = shown.rows.filter((row): row is MetricRow => row.kind === "metric" && row.headline === "percent");
+  const windows = percents.filter((row) => !row.grouped);
+  const candidates = windows.length ? windows : percents;
+  if (!candidates.length) return primaryMetric(shown);
+  return candidates.reduce((best, row) => (row.usedPercent > best.usedPercent ? row : best));
+}
+
+/** The tab's text in the layout's Used/Left reading, like the meters below it. */
+function providerPreview(card: Card, layout: Layout): string {
+  const metric = previewMetric(card, layout);
+  if (metric) {
+    if (metric.headline === "value") return metric.value;
+    return `${layout.showAs === "used" ? metric.usedPercent : metric.leftPercent}%`;
+  }
   if (card.error) return "—";
   const balance = card.rows.find((row) => row.kind === "text" && /balance|credit/i.test(row.label));
   return balance?.kind === "text" ? balance.value : "—";
@@ -65,6 +86,12 @@ export function NativeDashboard({
     ?? cards.find((card) => card.id === payload.primary)
     ?? cards.find((card) => primaryMetric(card))
     ?? cards[0];
+  // The macOS menu bar's Quattro look draws the provider selected here, the way the
+  // Quattro bar follows its selected entry. Only macOS has that look.
+  function selectProvider(id: string) {
+    setSelectedId(id);
+    if (payload.os === "macos") sendCommand("select-provider", { id });
+  }
   const selectedAccount = selected ? accountSwitchFor(selected.id, payload.accounts) : null;
   const updated = payload.generatedAt > 0
     ? Math.max(0, Math.floor((nowMs - payload.generatedAt) / 60_000))
@@ -104,7 +131,7 @@ export function NativeDashboard({
           <div ref={wheelScrollRef} className="native-tabs native-provider-tabs" role="group" aria-label={m.providers()}>
             {cards.map((card) => {
               const active = selected?.id === card.id;
-              const preview = providerPreview(card);
+              const preview = providerPreview(card, layout);
               // Logo and value only, to fit more tabs: the name is in the hint, the label and the card below.
               return (
                 <Hint key={card.id} content={card.title}>
@@ -114,7 +141,7 @@ export function NativeDashboard({
                     aria-pressed={active}
                     className="native-tab"
                     data-active={active}
-                    onClick={() => setSelectedId(card.id)}
+                    onClick={() => selectProvider(card.id)}
                   >
                     <ProviderIcon className="text-label-2" slug={card.id} title={card.title} size={17} />
                     <span className="native-tab-value" data-text={preview}>{preview}</span>

@@ -191,7 +191,10 @@ function colorRow(settings, key, title) {
 export default class AiUsageBarPrefs extends ExtensionPreferences {
     fillPreferencesWindow(window) {
         const settings = this.getSettings();
-        const page = new Adw.PreferencesPage();
+        const page = new Adw.PreferencesPage({
+            title: _('General'),
+            icon_name: 'preferences-system-symbolic',
+        });
         window.add(page);
 
         // ── Display ──────────────────────────────────────────────────────
@@ -208,7 +211,7 @@ export default class AiUsageBarPrefs extends ExtensionPreferences {
 
         const showExtra = new Adw.SwitchRow({
             title: _('Show extra usage bar (3rd)'),
-            subtitle: _('o custo extra ($) como terceira barra'),
+            subtitle: _('the extra spend ($) as a third bar'),
         });
         settings.bind('show-extra', showExtra, 'active', Gio.SettingsBindFlags.DEFAULT);
         display.add(showExtra);
@@ -218,8 +221,8 @@ export default class AiUsageBarPrefs extends ExtensionPreferences {
         const poolLabels = [_('Both'), _('First only'), _('Second only'), _('Automatic')];
         const poolValues = ['both', 'primary', 'secondary', 'auto'];
         const pools = new Adw.ComboRow({
-            title: _('Pools no painel'),
-            subtitle: GLib.markup_escape_text(_('for providers with two independent pools (e.g. Antigravity: Gemini and Claude & GPT OSS)'), -1),
+            title: _('Panel pools'),
+            subtitle: _('for providers with two independent pools (e.g. Antigravity: Gemini and Claude & GPT OSS)'),
             model: Gtk.StringList.new(poolLabels),
         });
         bindCombo(settings, 'panel-pools', pools, poolValues);
@@ -248,6 +251,15 @@ export default class AiUsageBarPrefs extends ExtensionPreferences {
         });
         settings.bind('show-bars', showBars, 'active', Gio.SettingsBindFlags.DEFAULT);
         display.add(showBars);
+
+        const showPace = new Adw.SwitchRow({
+            title: _('Pace arrows'),
+            subtitle: _('With bars off: color each value by pace and add ↓ under, → on, ↑ ahead'),
+        });
+        settings.bind('show-pace', showPace, 'active', Gio.SettingsBindFlags.DEFAULT);
+        settings.bind('show-bars', showPace, 'sensitive', Gio.SettingsBindFlags.GET |
+            Gio.SettingsBindFlags.INVERT_BOOLEAN);
+        display.add(showPace);
 
         const barWidth = new Adw.SpinRow({
             title: _('Width of each bar (cells)'),
@@ -297,14 +309,25 @@ export default class AiUsageBarPrefs extends ExtensionPreferences {
         settings.bind('refresh-interval', interval, 'value', Gio.SettingsBindFlags.DEFAULT);
         data.add(interval);
 
+        // One switch per provider; each one switched on gets its own top bar
+        // indicator, in this order. Stored as the comma-separated `vendor` list.
         const vendorList = ['anthropic', 'openai', 'zai', 'openrouter', 'deepseek', 'antigravity'];
-        const vendor = new Adw.ComboRow({
-            title: _('Top bar vendor'),
-            subtitle: _('Which provider the top bar shows. The menu lists every enabled provider.'),
-            model: Gtk.StringList.new(vendorList),
+        const vendors = new Adw.ExpanderRow({
+            title: _('Top bar vendors'),
+            subtitle: _('One indicator per provider switched on. The menu lists every enabled provider.'),
         });
-        bindCombo(settings, 'vendor', vendor, vendorList);
-        data.add(vendor);
+        const enabledVendors = () => settings.get_string('vendor').split(',').map(v => v.trim());
+        const vendorRows = vendorList.map(v => {
+            const row = new Adw.SwitchRow({title: v, active: enabledVendors().includes(v)});
+            row.connect('notify::active', () => {
+                const chosen = vendorList.filter((x, i) => vendorRows[i].active);
+                if (chosen.join(',') !== settings.get_string('vendor'))
+                    settings.set_string('vendor', chosen.join(','));
+            });
+            vendors.add_row(row);
+            return row;
+        });
+        data.add(vendors);
 
         const binPath = new Adw.EntryRow({title: _('Binary path (empty = auto)')});
         settings.bind('binary-path', binPath, 'text', Gio.SettingsBindFlags.DEFAULT);
@@ -363,7 +386,7 @@ export default class AiUsageBarPrefs extends ExtensionPreferences {
                     row.subtitle = _('checking…');
                     checkCliInstalled(v.cli, (installed) => {
                         if (productDetected) {
-                            row.subtitle = _('✓ Antigravity detectado — mantenha o app, IDE ou agy aberto');
+                            row.subtitle = _('✓ Antigravity detected — keep the app, IDE or agy open');
                         } else if (installed) {
                             row.subtitle = _('agy installed — open a session to make the quota available');
                         } else {

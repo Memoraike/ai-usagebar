@@ -1,62 +1,963 @@
-# Changelog
-
-All notable changes to **ai-usagebar** are recorded here. The format is based on
-[Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
-follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
-
-Each release is also published at
-<https://github.com/akitaonrails/ai-usagebar/releases>.
-
 ## [Unreleased]
+
+## [1.38.0] — 2026-10-15
+
+### Added
+
+- **GNOME: several providers in the top bar.** The extension adds one
+  indicator per provider switched on under **Top bar vendors** (one switch per
+  provider, replacing the single-choice dropdown), side by side and each led by
+  the provider's brand icon. The `vendor` setting now holds a comma-separated
+  list; an existing single id keeps working unchanged.
+- **GNOME: pace arrows.** A new **Pace arrows** option (`show-pace`, off by
+  default) applies when bars are off: each value is colored by usage minus
+  elapsed, on the same point-delta bands as the bar's pace marker, and followed
+  by `↓` (more than 10 points under), `→` (within 10 under) or `↑` (ahead).
+  With it off, bars-off still shows plain percentages.
 
 ### Fixed
 
-- **GitHub Copilot no longer reports an allowance the plan does not have as
-  fully spent.** Copilot Free returns `premium_interactions` flagged
-  `has_quota: false` with a zero entitlement, whose `percent_remaining: 0` is
-  the degenerate output of `remaining / entitlement` rather than a consumed
-  quota. Reading it as 100% used painted the whole module critical red, while
-  VS Code does not show the bucket at all. A bucket GitHub says the plan does
-  not include is now left out of the tooltip, the TUI panel, the report metrics
-  every desktop frontend renders, and the severity the module is coloured from.
-  An allowance that is genuinely exhausted (`entitlement: 300, remaining: 0`)
-  still reads 100%.
-- **Antigravity no longer shows a quota window that has already rolled over.**
-  A local server that has not refreshed yet keeps reporting the fraction it
-  spent against a `resetTime` that has passed — two `agy` hubs answering for the
-  same account at the same moment disagreed, one saying `remainingFraction: 1`
-  with the next reset and the other still carrying the old period. Whichever
-  answered first was shown, so a five-hour window Antigravity's own settings
-  page reported as 100% remaining could render as "1% · Resets in now". A reset
-  that has passed now means what the server itself means by it: the window
-  refreshed, so the figure is zero and the deadline moves one period on — to
-  exactly the timestamp the caught-up hub reports. A server down across several
-  periods advances past all of them rather than returning a past deadline.
-  Windows still running are untouched, and a cached payload past its reset is
-  still refused rather than normalised, since no server is there to confirm what
-  happened in between.
-- **A fractional Copilot credit is no longer rounded away.** Quota figures are
-  read from GitHub's unrounded `quota_remaining` and `percent_remaining`
-  floats, not the sibling integers that have already dropped the fraction, so a
-  credit balance VS Code shows as "1.7 / 200" no longer reads "2 of 200". Whole
-  counts stay whole. A cache written before this still loads, at its stored
-  precision, until the next refresh.
+- **SuperGrok's usage row names its reset in the TUI and the report.** The
+  overall meter carried no footnote, so the TUI, `usage` and `usage --json`
+  showed a bare percentage where Claude and Grok Bot add `Resets in …`. A
+  weekly period now carries the countdown with its pace, a monthly or unknown
+  period the countdown alone, and a response without a reset still carries
+  nothing (#418).
+
+- **Antigravity reads its saved session from KDE's keyring.** go-keyring
+  stores the session with content type `text/plain; charset=utf8`, and
+  `secret-tool lookup` prints only an exact `text/plain` value, so on KDE's
+  ksecretd the lookup exited 1 and the closed-app fallback reported no
+  session. When `lookup` fails, the value is now read from `secret-tool
+  search`, which prints it whatever its content type (#419).
+
+- **GNOME preferences: the first tab is titled again, and the Pools subtitle no
+  longer shows a literal `&amp;`.** The first preferences page was constructed
+  without a title (it renders as an unlabeled tab beside "Vendors"), and a
+  subtitle wrapped in `GLib.markup_escape_text` showed the entity raw — markup
+  is off on those rows (#422).
+- **GNOME: switching every top-bar vendor off now hides them all.** The panel
+  used to fall back to Anthropic when the vendor list was empty, so prefs said
+  all off while the bar still showed it. And with no windows to draw, the empty
+  bar no longer shows the brand mark twice.
+
+## [1.37.0] — 2026-10-14
+
+### Added
+
+- **Muse Code subscription quota** (`[muse-code]`, `--vendor muse-code`):
+  session and weekly allowance percentages with resets, obtained through the
+  official CLI's existing file-based OAuth login. Requests are bounded to one
+  attempt per login every five minutes, including forced refreshes and failures;
+  credentials are never refreshed or rewritten and returned inference keys are
+  discarded. Missing/expired quota is unknown, with previous observations
+  marked stale. The Omarchy bar and panel use Meta's infinity mark. Existing
+  `[[custom]] id = "muse"` configurations stay valid.
+
+### Fixed
+
+- **Cline compact bar icon uses short name.** `VendorId::Cline.bar_icon()`
+  now returns `"cln"` via `short_name()` rather than the full five-letter
+  string `"Cline"`, matching all other providers without distinct Nerd Font marks.
+
+- **Cline catalog status probes credentials hermetically.** The vendor
+  catalog check for Cline CLI credentials now uses an injected probe on
+  `Probes` instead of directly calling filesystem operations in
+  `credential_present`, maintaining hermetic test isolation.
+
+- **macOS menu bar parses Cline rolling quota windows.** The Swift dropdown
+  menu and menubar item now parse Cline's 5-hour, weekly, and monthly rate-limit
+  windows into the primary, weekly, and third quota rows with proper labels,
+  falling back gracefully for older CLI binaries and unquoted plans.
+
+## [1.36.0] — 2026-10-12
+
+### Added
+
+- **Cline (ClinePass)** as a vendor: the three limits ClinePass meters —
+  5 hours, weekly, monthly — read as the percentage Cline itself reports from
+  the dashboard's `usage-limits` route (undocumented, the same calls the web
+  dashboard and the official `cline` CLI make), with the reset time of each
+  open window; the plan's billing period comes from the documented
+  `/api/v1/users/me/plan`. Enable `[cline]`; the credential is the one the
+  `cline` CLI already holds, and is only ever read — an expired token is
+  flagged, never refreshed (refreshing would sign the CLI out), and a blank
+  token is a credentials error naming `cline auth`. Figures are the server's
+  own percentages: no usage is re-derived from the charge ledger, and anything
+  outside the reported shape is schema drift, never a silent 0%.
+
+
+- **Prepare an inactive Claude Desktop account without switching to it (macOS).**
+  A Desktop account's card gains a Prepare action that opens the account's
+  5-hour window server-side: one short turn with the profile's token in an
+  isolated temporary home (no tools, MCP, history persistence, or project
+  context; the directory is deleted afterward). The app is neither switched
+  nor restarted. Contributed by GuohuaQiu1999 as the prepare half of #392;
+  the switch half shipped separately in v1.35.0.
+### Changed
+
+- **TUI tabs follow `[ui] overview_vendors`.** Listed vendors lead the sidebar
+  in that order. Enabled vendors left off the list keep the canonical order
+  after them. The Overview tab still lists only the named vendors.
+  `usage --json` includes `overview_vendors` when the list is set, including
+  an empty list, and omits the field otherwise. `entries` follow the tab
+  order, so a consumer that renders the payload in order follows the list
+  too. Frontends keep a repeated slug's first occurrence. The Linux Mint dashboard
+  reads that field instead of `config.toml`. When the field is absent it
+  still leads with `primary`; an empty list does not.
+
+### Fixed
+
+- **Linux Mint dashboard opens on Wayland.** Asking an X11 server time no
+  longer crashes when WSLg (or any Wayland session) hands back a Wayland
+  window.
+
+
+- **Cursor usage requests send the full browser header set.** cursor.com sits
+  behind Vercel's WAF, which negotiates client hints and denies
+  automated-looking TLS fingerprints outright, so a risk-based 403 appeared as
+  "authentication rejected" on a session cookie the same request accepted from
+  curl. The summary call now sends the complete header set a browser sends,
+  and a 403 reads as "authentication failed or an edge block" instead of
+  blaming the credentials (#410).
+
+- **Antigravity can skip the IDE's language server in discovery.** With the
+  Antigravity IDE open but signed out, its language server answered an
+  actionable 403 that masked the working `agy` saved-session fallback (#405).
+  `[antigravity] ide_language_server = false` excludes IDE-owned candidates
+  before any probe, so the fallback answers exactly as if the IDE were closed.
+  The default keeps today's discovery; an explicit `ANTIGRAVITY_LS_ADDRESS` is
+  never skipped. A no-op on Windows (the IDE cannot be told apart by filename).
+## [1.35.0] — 2026-10-11
+
+### Added
+
+- **Claude Desktop accounts switch from their card in the macOS tray.** A
+  Claude card for an account only the Desktop app knows (saved with
+  `ai-usagebar account add <label> --desktop`) now carries the same star as a
+  Claude Code account's card. The star switches the app alone through
+  `account switch --desktop`: Claude.app quits, the local history moves to
+  that account, and the app reopens. Because the app restarts, it takes a
+  second click. The tray offered the star only for Claude Code and Codex
+  logins, so a Desktop-only account could not be switched from the menu bar
+  as the old Swift app's Preferences allowed.
+
+- **Ollama Cloud provider mark in the Omarchy bar and panel.** Ship the
+  monochrome Lobe Icons SVG under MIT, with source provenance and the
+  existing LobeHub licence notice. The same mark is used for custom
+  providers that declare `brand = "ollama"`.
+
+
+- **OpenCode Go reads the official CLI's own credential.** A signed-in OpenCode
+  CLI (`opencode auth login`) now shows up on its own: the key is read
+  read-only from `~/.local/share/opencode/auth.json` (`$XDG_DATA_HOME`
+  honoured; `[opencode-go] auth_paths` overrides the file), and an explicit
+  `OPENCODE_GO_API_KEY` / `[opencode-go] api_key` still wins. Detection, waybar,
+  and the TUI follow the same resolution, and the CLI file is never written,
+  copied, or cached.
+
+- **Claude Code mod to switch the Claude Desktop account** (`claude-code-mod/`).
+  `/claude-account` in a Claude Code session opens a pane with the saved
+  Desktop accounts, each with its quota windows, and switches the app with
+  `account switch --desktop` after a dry run. The switch is handed to launchd
+  so it outlives Claude.app quitting, which takes the session down with it.
+### Changed
+
+- **Meters fill with what is consumed in both readings.** PR #389 made the
+  bar geometry follow the Show Usage As toggle, so in Left mode the fill
+  painted what *remained* while the color and the verdict kept speaking about
+  consumption — SuperGrok's "88% left" drew as an almost-full red bar that
+  read as nearly spent, and the monochrome menu-bar bars told the story
+  backwards too: the healthiest windows carried the most ink while a spent
+  one shrank to a barely visible track. The fill is now always the consumed
+  share on the popover and the compact bars alike; the Used/Left toggle reads
+  only the headline number, the chips, and the tooltip, and the pace tick
+  keeps sitting at the elapsed share of the window.
+
+- **Ollama Cloud quota now comes from `/api/balance`.** `/api/usage` returned
+  request and token history rather than quota, so the provider reads the
+  documented balance route instead. Both account shapes are served there —
+  verified against a real capture from a session/weekly account — so existing
+  quota users see no change beyond the source.
+
+### Fixed
+
+- **Windows tray icon no longer turns red for a Claude Code session row.**
+  The icon takes the hottest metric of every entry, and that count
+  included the context session rows under the Claude entry's "Sessions"
+  heading, so a session at 90% of its context window painted the tray
+  critical while the quota windows sat at 29%. The icon now ranks the
+  ungrouped quota windows first, grouped rows standing in only when an
+  entry has nothing else, the partition the Omarchy, Mint and KDE
+  frontends and the macOS menu bar already apply.
+
+- **Custom format placeholders escape the remaining API-controlled text.**
+  Claude's `{plan}` (built from the credentials file) and `{scoped_model}`
+  (the API's model display name), Codex's `{oai_credit_balance}` (kept as
+  the string OpenAI sent when it is not a plain number) and Ollama's
+  `{oll_cost}` were substituted into the bar text and a custom
+  `--tooltip-format` unescaped, and Ollama's default tooltip printed the
+  activity period raw. All of them reach Waybar's Pango markup, where an `&`
+  or `<` breaks the module. They are now escaped at the projection boundary,
+  the rule every other provider's plan and model placeholders already
+  follow.
+
+- **Omarchy settings view localizes Lyceum's billing credits note.**
+  The Lyceum API key card note ("billing credits") was missing from the
+  Omarchy I18n dictionary and fell back to raw English. It is now mapped
+  and localized across all supported languages (ru, pt-BR, ko, es, and en).
+
+- **An empty menu-bar bar draws a visible capsule.** A 0% row used to
+  vanish against the dark menu bar — its bare track was all but invisible
+  there. It now draws the whole track at the remainder's strength, like the
+  popover's empty meter.
+- **Early-window weekly usage no longer triggers a false critical pace alert.**
+  In long reset windows (such as SuperGrok, Grok Bot, or Claude/Codex weekly),
+  normal session usage during the opening stretch of a cycle (< 15% elapsed,
+  e.g. the first ~25 hours of a week) previously pushed the ratio past 130%
+  and the absolute gap past 5 percentage points, marking the metric as critical
+  (flame icon, and run-out date). In the opening 15% of a window with at least
+  50% allowance remaining, accelerated usage now warns as "over" pace (yellow)
+  rather than a run-out crisis (#390).
+
+- **KDE plasmoid displays value headlines as their value.** A metric declaring
+  `headline: "value"` with a non-null consumed percentage (such as prepaid
+  balances or credit spend) previously rendered as a percentage across panel
+  cells, card gauges, and popup rows. It now honors the headline and displays
+  the value string, falling back to the percentage only when the value is empty.
+
+- **KDE plasmoid: a Claude Code session row no longer colours the vendor
+  card.** The card view took its accent from the worst severity of every
+  metric row, grouped or not, so a context session at 90% of its window
+  painted the Claude card critical while the quota windows sat at 29%. The
+  accent now applies the same partition the headline and the panel cells
+  do: ungrouped quota rows first, grouped rows standing in only when an
+  entry has nothing else.
+
+
+- **Omarchy panel no longer logs a binding loop for the Flow layouts.** Both
+  provider-list and Cursor pool-toggle Flows bound `height` to
+  `childrenRect.height`, feeding their own geometry back through their content
+  rect; they now bind `implicitHeight`.
+
+- **Antigravity's 'plan has no quota' message reaches the user again.** The
+  friendly subscription 403 (#256) was misclassified as an auth rejection on
+  the full remote path, so a free-plan account watched a token refresh burn
+  and then read 'session expired' — the re-sign-in-for-nothing the fix was
+  meant to prevent. The subscription verdict now passes straight through, no
+  refresh, no retry, no `agy` spawn; every other 403 keeps the existing
+  behavior (#405).
+
+- **Ollama Cloud credit-based Pro plans no longer show an empty quota.**
+  Fetch the documented `/api/balance` endpoint instead of `/api/usage`, which
+  now returns request/token history. Automatically detect monthly included
+  credits (such as Pro's $60 allowance) or legacy session/weekly limits.
+  Show remaining/allowance dollars and purchased credits, derive monthly
+  utilization from included credits, and preserve billing resets and actual
+  period lengths. Historical quota caches remain readable; usage-history
+  payloads are rejected rather than silently accepted as empty limits.
+
+- **Model Studio reads the Token Plan's monthly window, not just the 5-hour
+  and weekly ones.** The gateway's `per1MonthPercentage`/`per1MonthResetTime`
+  fields were already present on accounts that report no 5-hour or weekly
+  quota (the individual Token Plan is one such shape), but neither
+  ai-usagebar nor the upstream `bl` CLI parsed them, leaving those accounts
+  on "no usage windows reported". Two things were wrong and both are fixed:
+  the tolerant unwrap reproduced the CLI verbatim (`data.DataV2?.data?.data
+  ?? …` — starting from the outer `data` the dispatcher always emits, never
+  a bare top-level `DataV2`), and the monthly window is parsed, cached,
+  rendered and documented. The monthly window draws its own bar with the
+  exact reset countdown in the widget, TUI, report JSON and popover cards.
+  Like OpenCode Go's monthly, it keeps the reset but no pace glyph — the
+  cycle length is plan-dependent (28–31 days), so pacing would guess a
+  denominator. New `30d {mst_monthly_pct}%` default bar text and
+  `{mst_monthly_pct|reset|elapsed|pace|pace_indicator}` placeholders.
+
+- **Nous Research credit amounts no longer display a trailing decimal point.**
+  When a credit balance had a fractional remainder that rounded to zero within
+  six decimal places (such as floating-point residue near a whole number),
+  trimming trailing zeros stripped the digits but retained the decimal point,
+  displaying values like "1." or "0.". Trailing dots are now stripped so whole
+  and rounded credit values format cleanly.
+
+- **The placeholder reference covers Nous Research.** `docs/format-placeholders.md`
+  had a section for every provider except Nous, so `{nous_pct}`,
+  `{nous_renewal}`, `{nous_plan}` and the six credit placeholders were
+  discoverable only in the source. The new section states what each carries,
+  how credits are formatted, the default format, and which shared placeholders
+  alias them.
+
+
+### Security
+
+- **Credential keyring lookups no longer inherit provider keys.** Antigravity's
+  saved-session read spawns `secret-tool` (Linux) / `security` (macOS), and the
+  Cursor database, Claude Desktop safe-storage, and Anthropic keychain reads,
+  writes and deletes spawn `security` — each child inherited every vendor
+  secret variable of this process (`ZAI_API_KEY`, `OPENROUTER_API_KEY`, the
+  named accounts' `api_key_env` names) it has no use for. They are dropped
+  before the lookup runs, the scrub the Grok Bot keyring lookups, `claude`,
+  `codex login`, `gh` and `agy` already apply (#402).
+
+## [1.34.0] — 2026-10-08
+
+### Added
+
+- **Several GitHub Copilot accounts.** `[[copilot.accounts]]` names the logins
+  `gh` already holds for a host, so a personal and a work plan can be watched
+  side by side:
+
+  ```toml
+  [[copilot.accounts]]
+  label = "work"
+  user = "my-work-login"
+  ```
+
+  Each account resolves through `gh auth token --user <user>` — ai-usagebar
+  still stores no GitHub token of its own — and gets its own tab, its own
+  `--account <label>`, and its own cache. With no array the behavior is
+  unchanged: whichever account `gh` has active. `show_default_account = false`
+  hides that unnamed entry once every account is named.
+
+  Two refusals rather than guesses: `GITHUB_COPILOT_TOKEN` names no account, so
+  pairing it with `--account` is an error instead of reporting one account's
+  quota under another's label; and a login outside GitHub's own grammar is
+  rejected before it reaches the command line, so a config value can never
+  arrive as a flag (#378).
+
+- **Spanish (Español) in the Omarchy panel and the tray popover.** `uiLocale`
+  gains `es`, and Auto picks it up from any `es_*` system locale. Settings →
+  Appearance → Language gains Español on Windows and macOS, with a full
+  `messages/es.json` catalog; metric labels and usage strings from the report
+  are translated as they are for Português.
 
 ### Changed
 
-- **Copilot quota labels follow what the account is billed for.** Under
-  token-based billing GitHub's `chat` bucket is the pooled credit balance every
-  premium interaction draws from, not a count of chat messages, so it is now
-  labelled **Credits** and `completions` **Inline suggestions** — matching what
-  VS Code shows for the same account. An account without token-based billing
-  keeps **Chat** and **Completions**.
-- **The Copilot bar headlines the worst quota the plan actually has.** The
-  default format becomes `{copilot_pct}% · {copilot_reset}`, where the new
-  `{copilot_pct}` is the highest usage across the buckets the plan includes —
-  the same figure `severity` already colours the module from, so the number and
-  the colour can no longer disagree. `{copilot_premium_pct}` and the other
-  per-bucket placeholders still work; on a plan without premium requests they
-  now expand to `—` instead of a figure for an allowance that does not exist.
+- **The Claude tooltip's session line follows the account the module shows.**
+  It reads the `sessions/` directory beside the credentials that module fetches
+  its quota from, so `--account work` shows work's sessions and a Claude Desktop
+  profile (`--desktop`) shows none, where 1.33.0 read `~/.claude` or the bar's
+  `$CLAUDE_CONFIG_DIR` for every module. Two consequences for setups that
+  differ from the default: a module with `--creds-path` or `[anthropic]
+  credentials_path` reads `sessions/` next to that file, and an exported
+  `$CLAUDE_CONFIG_DIR` no longer moves the default module's line, just as it
+  never moved its quota. Point `credentials_path` at that directory's
+  `.credentials.json`, or add it as an account, to see its sessions (#356).
+
+- **The macOS menu bar's Name look is now called Quattro.** It draws one chip
+  the way the Quattro bar does, the selected provider's logo, an optional short
+  name and its highest percentage, so it takes that bar's name in Settings →
+  Menu Bar → Menu Bar Shows. `[tray] menu_bar_style` is written as `"quattro"`;
+  `"name"`, what 1.32.0 saved, is still read as the same look.
+
+### Fixed
+
+- **The macOS menu bar's compact bars follow "Show Usage As: Left".** The
+  chart glyph previously mapped its bar fractions directly from used quota,
+  ignoring `state.usage_reading`. With Left reading selected, the popover
+  drew remaining quota while the menu bar stayed in Used mode (empty bars for
+  fresh quota, solid bars for exhausted quota). The chart fractions now
+  invert to remaining quota when Left reading is selected, matching the popover
+  meters — including a starred balance row's bar, whose chip text keeps its
+  figure the way the popover's headline does (#388).
+
+- **The Korean Omarchy panel no longer falls back to English for two labels.**
+  The `LABELS` table was checked by asserting that a single key existed, so
+  Korean shipped without `Gemini` and `Claude & GPT OSS` and quietly rendered
+  those two in English. Both are translated, and the contract test now requires
+  full key parity across every locale — the same rule `MESSAGES` already had,
+  which is why `MESSAGES` never drifted (#381).
+
+- **The tray popover's Portuguese money footnote now actually translates.**
+  `$X of $Y used` was rewritten through a pattern beginning with `\b`, which
+  can never match before a `$`, so the rewrite was dead and pt-BR users saw the
+  English footnote. Matching is now anchored on a line start or whitespace
+  rather than a word boundary — deliberately not a lookbehind, which only
+  reached Safari 16.4 while the macOS tray renders this in WebKit (#380).
+
+- **A blank Kimi access token reports a logged-out CLI instead of an opaque
+  401.** A credentials file carrying an empty `access_token` beside a future
+  `expires_at` is internally inconsistent — the CLI never writes one — but the
+  expiry was trusted, so `Authorization: Bearer ` went to the API. A blank
+  token now counts as expired, so the refresh token gets its chance and a
+  genuinely signed-out CLI says so. Completes the blank-token guard across
+  providers after Claude (#370) and Codex (#373) (#382).
+
+
+- **`agy` 1.3.1's prefixed missing-CSRF message still falls back to the saved
+  Google session.** The CLI now answers `unauthenticated: missing CSRF token`
+  instead of the historical `missing CSRF token`. The matcher treated that as
+  a signed-out 401 and hid the working Cloud Code figures. Both wordings now
+  take the remote fallback (#376).
+
+- **The Plasma settings page no longer logs `ReferenceError: index is not
+  defined`.** The "Current vendor" drop-down's delegate declares
+  `required property`, and in Qt 6 that stops `index` being injected, so
+  the `highlighted` binding threw once per row every time the page opened. The
+  delegate now declares `required property int index`. A QML test opens the
+  drop-down and fails on that warning.
+
+- **A signed-out Anthropic credentials file reports 'run `claude`', not a rate
+  limit.** A blank `accessToken` was sent as `Authorization: Bearer `, whose
+  401/429 answer was shown as a transient error — and the 429 variant armed the
+  five-minute backoff, so the card stayed wrong even after logging back in. A
+  blank access token is now a credentials error with the login hint, no request
+  is fired, and no backoff is armed (#370).
+
+- **A signed-out OpenAI credentials file reports 'run `codex login`', not a rate
+  limit.** A blank `access_token` was sent as `Authorization: Bearer `, whose
+  401/429 answer was shown as a transient error - and the 429 variant armed the
+  five-minute backoff, so the card stayed wrong even after logging back in. In
+  addition, an empty `refresh_token` triggered an invalid refresh request. A
+  blank access token is now a credentials error with the login hint, empty
+  refresh tokens are skipped, no request is fired, and no backoff is armed.
+
+
+- **macOS menu bar: wire Devin daily and weekly quotas.** The Devin CLI reports
+  daily and weekly quota windows but deliberately avoids faking a 5-hour
+  session on the session alias, so selecting Devin left the daily quota
+  unparsed and the primary bar blank. Append `{devin_daily_pct}`,
+  `{devin_daily_reset}`, and `{devin_daily_elapsed}` to the menu bar `FORMAT`
+  string at slots 54-56, route the daily quota to the primary window with the
+  `1d` tag and `Daily` label, and keep the weekly window on the `7d` tag and
+  `Weekly` label.
+
+- **The Claude tooltip's session line counts the right sessions.** It now
+  shares `usage --json`'s reader (#356), so the two can no longer disagree, and
+  with it the reader's rules. Agent SDK runs, which also write
+  `kind: "interactive"` (`entrypoint: "sdk-cli"`, as `claude -p` and background
+  agents such as claude-mem's observers do), no longer read as "working". A file
+  named for another pid, a symlink or a file written on another operating
+  system no longer counts, nor, on Linux, a zombie process. Crash leftovers no
+  longer crowd a live session out of a 64-file cap taken before filtering; a
+  scan now reads at most 256 files of 8 KiB. macOS checks the pid with
+  `kill(pid, 0)` instead of spawning `ps` for every file on every tick, and
+  Windows asks `OpenProcess` whether the process is still running instead of
+  trusting any status updated in the last half hour.
+  Two readings loosen with the shared reader: on Linux a session
+  file without `procStart` counts while its pid is alive, and a file
+  with no `kind` counts as interactive.
+
+- **HTTPS now trusts the OS certificate store.** The HTTP client compiled in
+  Mozilla's roots only, so a TLS-inspecting corporate proxy (its root installed
+  in the macOS keychain or the system store) failed every vendor request with an
+  opaque `error sending request`. The OS store is now consulted alongside the
+  bundled roots, and transport errors carry their source chain, so the
+  certificate cause (`UnknownIssuer` and friends) is visible instead of looking
+  like an outage (#377).
+
+- **A guard keeps the macOS menu bar's FORMAT mirror complete.** The bar parses
+  a flat format string by field index, so a vendor whose figures are missing
+  from it cannot be shown at all — three vendors in a row shipped that way
+  (#372 was the third). Every vendor is now classified in an exhaustive match:
+  either it has a slot of its own in the Swift mirror, or it names the generic
+  placeholders it renders through. Adding a vendor therefore does not compile
+  until someone decides which, and the claimed tokens are checked against both
+  the Swift format string and the placeholders Rust actually emits — so a
+  rename on either side fails rather than leaving the two agreeing about a
+  placeholder nothing produces.
+
+### Security
+
+- **The tray's self-update stops reading a response once it passes its size
+  limit.** The release check and the binary and checksum downloads now read
+  through the same capped reader the providers use. A response without a
+  `Content-Length` used to be buffered whole before the download limit was
+  compared, and the release check had no limit at all.
+
+## [1.33.0] — 2026-10-07
+
+### Added
+
+- **`usage --json` says which Claude Code sessions are working or waiting on
+  you.** With `[context] enabled`, each Claude account whose sessions are busy
+  or stopped on a permission prompt or a question gets an `Activity` row such
+  as `2 working · 1 waiting`, so every panel built on the report shows it with
+  no frontend change, plus an additive `activity` field
+  (`{"working": 2, "waiting": 1}`) for frontends that want an icon. It is read
+  from the `sessions/<pid>.json` files Claude Code keeps in the config directory
+  the account's credentials are fetched from, so an account `account switch`
+  moved into the default slot is read from `~/.claude` like its quota. Those
+  files outlive a crashed Claude Code, so a session counts only while a process
+  with its pid is running — on Linux, the same process by the start time Claude
+  Code recorded, so a recycled pid does not count either — and a file written on
+  another operating system never does. Agent SDK runs (`entrypoint: "sdk-cli"`,
+  which `claude -p` and background agents use) are not counted. The files are
+  only read; an idle account gets neither the row nor the field (#356).
+
+- **The Claude tooltip shows live Claude Code session status.** Claude Code
+  rewrites `<CLAUDE_CONFIG_DIR>/sessions/<pid>.json` whenever an interactive
+  session's status changes; the widget now reads those files (read-only,
+  bounded to 64 files of 8 KiB each) and appends one dim line to Claude's
+  tooltip — "2 working · 1 waiting" — counting only interactive sessions
+  whose process identity still checks out: `procStart` against procfs field
+  22 on Linux (recycled pids included), `ps` on macOS, and a thirty-minute
+  recency check on Windows where neither is available. A missing sessions
+  directory renders nothing; an all-idle summary stays silent (#356).
+- **`[nous] headline = "amount"` puts the Nous Research credits balance on the
+  bar**, the way the prepaid-balance vendors already do, instead of the consumed
+  percentage of the monthly allocation. There is no tank to state: the plan's
+  monthly credits are the percentage's own denominator. The default stays
+  `"percent"`, and the percentage keeps the meter, the severity colour and the
+  detail line. The Omarchy panel, the KDE plasmoid and the tray popover read the
+  metric's `headline` out of `usage --json` and are unaffected by the default;
+  Waybar and GNOME are fed by the per-vendor formats and do not see it at all.
+- **Devin CLI quota.** Reuses the official CLI's existing credential file
+  read-only to show daily and weekly quota usage and the optional overage
+  balance. The token is held in memory for the status request only; no login,
+  refresh, or credential writeback is performed. The provider is opt-in.
+- **Omarchy panel and settings in Korean (한국어).** `uiLocale` gains `ko`, and
+  Auto picks it up from a `ko_KR` system locale.
+- **Omarchy Quattro: switch the provider logos off.** **Show provider logos**
+  in the panel Settings (`brandIcons`, on by default) draws each provider's own
+  mark in the top bar and the panel hero. Off restores the generic robot icon
+  the bar used before the marks: one robot for a single provider, and the
+  provider's short code leading each chip's label when Show all providers is
+  on. The codes are wider than the marks, so a long row can reach the clock.
+
+- **Omarchy Quattro: choose which metrics the bar shows, and read them as used
+  or left.** A new **Metrics** section in the panel Settings expands per
+  provider, with one switch per metric, the way the tray's Customize does. A
+  switched-off metric disappears from the panel, the top bar and the tooltip,
+  per entry (each account of a provider is its own entry): Z.AI's monthly MCP
+  window can be switched off while Session and Weekly stay. It is also left out
+  of the highest percentage the bar and its icon alert state take, so a spent
+  window you chose not to watch no longer reddens the icon or sets the number.
+  The last metric still on cannot be switched off (its switch is dimmed and disabled), so
+  the bar never goes blank. Cursor and Antigravity list their time windows
+  there (Session, Weekly, Monthly) instead of their model pools, which keep
+  their buttons on the panel: switching a window off hides every pool of it,
+  and a provider with a single window, as Cursor today, has that switch locked.
+  **Show usage as** in the panel Settings (`showAs` in the widget settings,
+  `used` by default, so an existing bar reads as before) switches the bar, the
+  tooltip, the hero and the panel meters between what is used and what is left
+  of the same window. Which window the bar picks never changes with the
+  reading: Left shows the remainder of the most-used window, and the alert
+  state follows the used share. Both are the Quattro counterparts of the tray's
+  Customize switches and Show Usage As (#340, #353).
+### Changed
+
+- macOS **Menu Bar Shows → Logos** displays one readable allowance value per
+  provider instead of two tightly stacked percentages. Like Quattro's default
+  auto window and the Name chip, it selects the highest used percentage across
+  visible quota windows (the lowest remaining percentage in Left). A fresh short
+  window no longer obscures a mostly spent monthly allowance. Hidden metrics
+  stay excluded; Used/Left still follows the existing preference. Chart and
+  the detailed popover keep their multiple metrics.
+
+- **Omarchy Quattro: Antigravity gets model-pool buttons, like Cursor.** Gemini
+  and Claude & GPT OSS are independent pools, so the panel gains a button for
+  each (`showAntigravityGemini`, `showAntigravityClaudeGpt`, both on). The top
+  bar shows one figure per pool, each the pool's most-used Session or Weekly
+  window (for example `6% · 81%`), where it showed a single value before. A pool
+  switched off leaves the bar, the tooltip and the panel list with both of its
+  windows, and at least one pool stays on.
+
+- **Omarchy Quattro settings fold into an accordion.** Display, Language, Top
+  bar window, Show usage as, Metrics, Primary provider, Providers and Credentials (with
+  the login buttons) are collapsible sections, one open at a time with Display
+  open by default, so the page no longer needs a long scroll. A folded header
+  shows the current value (the provider switches show `on/total`), and what you
+  typed in a folded section is still saved. The Display switches are listed as
+  usage value, logos, provider name, color-coding, then all providers.
+
+### Fixed
+
+- macOS release archives include **AI Usage.app**, with a stable bundle ID
+  and a Finder icon based on the Windows tray artwork. The install guide uses
+  `/Applications` so menu-bar managers can identify the tray, and documents
+  Hidden Bar's macOS 27 issues with bare executables and user-local bundles.
+  Standalone binaries remain available for command-line use and the self-updater.
+
+- **A metric hidden in Customize no longer sets the provider's percentage.**
+  The Native popover's provider tab and the macOS menu bar's Name chip showed
+  the highest percentage among all of a provider's windows, including one
+  switched off in Customize, so Z.AI with Session and Weekly at `0%` and the
+  monthly MCP window hidden at `18%` still read `18%`. Hidden metrics are now
+  left out, so it reads `0%` (`100%` left). With every metric of the provider
+  hidden, the tab falls back to its balance or `—`, and the Name chip moves on
+  to the next provider with a value, as it does for a provider with no value.
+  Stars are unaffected: the Chart and Logos looks still show the starred
+  metrics.
+- **KDE plasmoid: grouped session rows no longer take a panel cell.** The
+  compact representation's cells came from the first metric sections in report
+  order, grouped or not, so a full Claude Code context session (or a SuperGrok
+  product slice) could occupy the second cell beside the quota windows. The
+  cells now apply the same partition the headline does: ungrouped quota rows
+  first, grouped rows standing in only when an entry has nothing else
+  (fixes #348).
+- **macOS menu bar: the Name chip never lets a balance outrank a quota
+  window.** A value-headline metric that also carries a percent (a prepaid
+  balance meter, a Cursor credit grant) entered the chip's highest-window
+  race on the host side only, so the chip could show its money figure while
+  the Native tab that selects it showed the percent window, in either
+  Used/Left reading. The chip now ranks only percent headlines, the rule the
+  tab's `previewMetric` already applies, and a value headline stands in only
+  when the provider has no window (fixes #349).
+- **macOS menu bar shows DeepInfra's USD balance.** The Swift balance mirror
+  did not include `{dif_balance}` in its FORMAT slot or balance field dispatch,
+  so a DeepInfra entry rendered with no balance value. It is appended at
+  index 53 (keeping every existing index stable) with a parser test.
+- **Nous Research: an allocation that is spent to the last credit reports the
+  rounding residue instead of a clean zero, and 1.31.0/1.32.0 rejected the whole
+  account snapshot for it.** The Portal answers a drained plan with
+  `subscription.credits_remaining = -1.64e-20`, `optional_credit` refused any
+  value below zero ("account credit must be finite and non-negative"), and the
+  widget, panel and TUI showed `Nous Research account response schema mismatch`
+  for an account whose only problem was being at zero. A value within `1e-6` of
+  zero now reads as `0.0`; a genuinely negative balance is still an error, so the
+  guard against nonsense payloads is unchanged.
+- **The tray's Global Shortcut recorder works on macOS.** The popover is a
+  WKWebView, and WebKit does not focus a `<button>` when it is clicked, so the
+  recorder's button-local key handler never ran and the field stayed on
+  "Press keys…" for every chord. The chord is now captured on `document` while
+  recording. The field also shows the canonical `Win`/`Alt` modifiers as
+  `Cmd`/`Option` on macOS (the stored value is unchanged) instead of the
+  Windows spelling (fixes #357).
+- **Omarchy Quattro now draws Z.AI's Z mark.** The panel and top bar were
+  using the older Zhipu molecule mark; they now use the same Z logo as the
+  tray.
+- **Omarchy Quattro: a provider with no mark no longer runs its short code into
+  the value.** Command Code, which has no logo, drew its code centred in the
+  one-glyph icon box, where three letters overflowed into the gap and read
+  `cmd5%`. The code now leads the label with a space (`cmd 5%`) and is not
+  repeated when the provider name is also on.
+## [1.32.0] — 2026-10-04
+
+### Added
+
+- **Cursor billing-cycle pacing in the widget, tooltip, TUI and macOS menu bar.**
+  Each pool (Cursor Models, Other Models) is paced against the billing cycle
+  when the API states both `billingCycleStart` and `billingCycleEnd`. The widget
+  gains `{cursor_elapsed}` (aliased as `{session_elapsed}` / `{weekly_elapsed}`,
+  which is what places the macOS pace marker) and a per-pool pace family,
+  `{cursor_auto_pace*}` and `{cursor_api_pace*}`, honouring `--pace-tolerance`,
+  `--format-pace-color` and `--tooltip-pace-pts`. The tooltip marks each pool
+  with its pace glyph, and the TUI and `usage --json` footnotes add the elapsed
+  share and point delta for Quattro, GNOME and KDE. A cycle whose length the API
+  did not state is never paced against a guessed month.
+
+- **Cursor spending-page credits.** A visible credit grant from
+  `GetClientVisibleCreditGrants` is a meter in the same form as On-Demand:
+  remaining dollars beside a bar of how much of the grant is spent, with the
+  expiry in the caption. The row is titled Credits, the spending card's own
+  title, unless Cursor named that grant as a product credit. A Credits switch
+  on the Cursor page shows or hides it on the top bar and tooltip, the same
+  way as Cursor Models, Other Models, and On-Demand. The Omarchy chip adds
+  that used percent after the other Cursor pools, and the hover line is that
+  percent alone, the same shape as the other pools. The TUI, the
+  `usage --json` report, and `{cursor_credits}` carry it too. A cache written
+  before that field existed is refetched instead of being served until its TTL
+  elapses. The usage bars stay up when that call fails, and an account with no
+  grant shows nothing extra. A grant with nothing left stays visible at 100%
+  used.
+
+- **The macOS menu bar can show one provider like the Quattro bar.** Settings →
+  Menu Bar → Menu Bar Shows gains **Name** next to Chart and Logos
+  (`[tray] menu_bar_style = "name"`): a single chip with the provider's logo,
+  its short name (`cld`, `cdx`, …) and its highest quota window, for the
+  provider selected in the popover. Like Quattro's default window, the value
+  is the highest percentage among all of the provider's windows, starred or
+  not, so it matches the provider's tab: a spent weekly limit reads `100%`
+  even while the 5h session reads `0%`, and Z.AI's monthly MCP window counts
+  as much as its 5h and weekly ones. Until one is picked it
+  follows `[ui] primary`, then the first provider with a value. The chart
+  stays the default. **Show Short Name** (`[tray] menu_bar_short_name =
+  false`) drops the name when the logo already says which provider it is; a
+  provider with no logo keeps its name.
+
+- **Lyceum Technology balance provider.** Lyceum's credit amounts are shown as
+  USD balances; no quota percentage or reset is inferred.
+
+### Changed
+
+- **macOS: Claude Desktop and Claude Code account switching moved into
+  Preferences.** The dropdown no longer carries two permanent **Claude Desktop ▸**
+  and **Claude Code ▸** rows — noise for anyone who uses one of them or neither.
+  Preferences gains a **Claude accounts** section with the same switch and
+  add-account actions, and the dim `Desktop: … · Code: …` line under the header
+  stays.
+
+- **The Cursor tooltip draws each pool as a progress bar.** Cursor Models and
+  Other Models were the only tooltip rows printing a bare "49% used"; they now
+  use the same gauge block as every other provider (label, bar with percentage,
+  reset countdown), followed by the dim line saying what the pool covers. The
+  trailing "Resets …" line is gone, since each pool now carries its own.
+
+- **The Native popover's provider tabs show the highest percentage.** A tab
+  read its first window, so Z.AI with the weekly limit spent and the 5h session
+  idle showed `0%`. It now shows the highest quota window, like the Quattro
+  bar; grouped rows (SuperGrok's product slices, Claude's CLI sessions) count
+  only when the provider has nothing else.
+- **Tab and menu-bar percentages follow Show Usage As.** With the popover
+  reading what is left (the default), the Native tabs and the macOS menu
+  bar's Logos values and tooltip still showed what was used, so a tab read
+  `18%` above meters reading `82% left`. They now show the same reading as
+  the meters, the remaining share of that most-used window, and so does the
+  new Name chip. The Chart look still draws usage.
+
+### Fixed
+
+- **Release verify-version guards AUR checksum-array parity.** When sources and
+  checksums drift (e.g. adding a detached signature or tarball without matching
+  checksum entries), makepkg rejects the package. The release workflow's
+  `verify-version` job now fails the tag if `PKGBUILD` / `PKGBUILD-bin` source
+  and `sha256sums` arrays or `.SRCINFO` entries differ in length (fixes #335).
+
+- **Custom format placeholders escape API-controlled plan and model names.**
+  Cursor, Z.AI, OpenAI, Kilo and Ollama substituted their plan or model
+  placeholders into the bar text and custom `--tooltip-format` unescaped,
+  which reached Waybar's Pango markup directly. Any plan or label containing
+  an `&` or `<` broke the markup. The text placeholders are now escaped at
+  the projection boundary, matching the established pattern in other vendors
+  (fixes #333).
+
+- **KDE plasmoid: a full Claude Code session no longer stands in for quota.**
+  With `[context] enabled = true`, each recent session reaches the Claude entry
+  as a grouped "Sessions" row whose percent is how full its context window is.
+  The headline picked the highest percent over every row, so a session at 90%
+  became the plasmoid's headline value, coloured it critical and triggered the
+  alarm while the 5h and weekly quotas were low. The plasmoid now reads the
+  ungrouped quota rows; grouped rows only stand in when an entry has nothing
+  else (fixes #332).
+
+- **Quota notifications no longer repeat on every refresh for Antigravity and
+  MiniMax.** Both list a `Session` and a `Weekly` heading over the same pool
+  labels, so two windows shared one dedupe key: a window past the threshold
+  (Antigravity's weekly Gemini at 98%) notified again each time its namesake
+  under the re-arm band (the session Gemini at 3%) cleared the record. Metrics
+  under a heading now always include it (`Weekly · Gemini`) in the key and
+  notification title, keeping the identity stable even when another window
+  is absent. Metrics without a heading keep their names.
+
+- **macOS dropdown rows line their bars up when a label is longer than 12
+  characters.** Labels were padded only up to 12, so Cursor's "Cursor Models"
+  pushed its bar one column right of "Other Models". Every row now pads to the
+  longest label in the dropdown plus one space, and the percentages are
+  right-aligned so the reset column stays straight.
+
+- **The usage goal reads like the bar above it.** With the popover showing
+  what is left, the goal still showed the share of the window that had passed,
+  so a session with `7% left` and 10 minutes to go sat above `Goal now 97%`.
+  The goal now follows the Used/Left reading, like the pace tick: `3%` left
+  there, and the same `97%` once the bar shows what is used.
+
+- **macOS menu-bar logos are no longer drawn upside down.** The Logos look
+  painted every provider mark flipped vertically; symmetric marks hid it, but
+  Z.AI's Z read as a mirrored S. Its single values also sat about a point
+  below the mark; they are now centred on it.
+
+- **macOS menu bar shows Lyceum's USD balance.** The Swift balance mirror was
+  not extended when the provider registered: `{lyceum_balance}` had no FORMAT
+  slot, so a Lyceum entry rendered with no value at all. It is appended at
+  index 52 (keeping every existing index stable) with a parser test.
+
+### Security
+
+- **Subprocess environment scrubbing extended to `codex login`.** Running
+  `ai-usagebar account add <label> --codex` now drops the static
+  `VENDOR_SECRET_ENV_VARS` list and per-account custom `api_key_env` variables
+  before spawning the interactive `codex` process, matching the scrub already
+  applied to `claude` and Grok ACP subprocesses (fixes #334).
+
+## [1.31.0] — 2026-10-03
+
+### Added
+
+- **Grok Bot weekly pacing in the widget and macOS menu bar.** Added elapsed
+  aliases and ratio/point pace placeholders using the account's reported period,
+  with configurable tolerance, placeholder colors and tooltip pace markers.
+- **Grok Bot pacing details in the TUI and usage report.** Added elapsed-time
+  and point-delta notes to the shared weekly metric, making them available to
+  Quattro, GNOME, KDE and Linux Mint alongside the existing Windows projections.
+
+- **Omarchy panel and settings speak English, Russian, and Brazilian Portuguese.**
+  A Language dropdown (`uiLocale`: Auto / English / Português (Brasil) / Русский)
+  remaps chrome, formatters, known report footnotes, and credential hints through
+  a local catalog; Auto follows the system locale. Long settings copy wraps under
+  the hero instead of overflowing the detail pill, and API-key notes wrap on their
+  own line under the env var name.
+
+- **Korean (한국어) in the tray popover.** Settings → Appearance → Language
+  gains 한국어 on Windows and macOS, with a full `messages/ko.json` catalog;
+  metric labels and usage strings from the report are translated as they are
+  for Português.
+
+- **OpenRouter: recent models activity and real-dollar credit balance.**
+  `GET /api/v1/activity` queries the 2 most recently used models, showing their
+  per-model cost and request counts alongside the existing spend breakdown in both
+  the TUI and the popover. When no quota reset date is published, the meter row
+  displays the account's available credit balance in USD ($) directly below the
+  gauge. Full Portuguese (pt-BR) localization support in the popover. The
+  activity endpoint requires an OpenRouter *management* key
+  (`management_api_key_env`, default `OPENROUTER_MANAGEMENT_API_KEY`, also per
+  `[[openrouter.accounts]]`); without one the activity request is skipped and
+  the block simply stays hidden.
+
+### Fixed
+
+- **Ollama Cloud monthly-only accounts no longer paint a fake 0% 5h/7d pair.**
+  Some Pro accounts report `limits.monthly` instead of `session`/`weekly`.
+  The TUI, tooltip and `usage --json` already showed that month; the widget
+  default format and the `{session_pct}`/`{weekly_pct}` aliases still emitted
+  `0` for the omitted windows, so Waybar and the macOS menu bar read as two
+  exhausted rate-limit windows. Absent windows are now empty placeholders (a
+  present month at 0% used still renders `0`), the default bar shows
+  `{oll_monthly_pct}%`, and the macOS selector draws that pool on the primary
+  bar as Monthly.
+
+- **Omarchy bar chips keep their icon next to their own value.** 1.30.0 put a
+  6 px spacer between a chip's brand mark and its value inside a row that
+  already spaces its children 4 px apart, so the gap became 14 px — wider than
+  the gap to the previous chip, and each icon read as part of the chip before
+  it. The spacer is gone; the row's spacing is the gap again, and an icon-only
+  chip still collapses to the mark alone.
+
+- **macOS menu bar parses DeepInfra named accounts.**
+  PR #291 added named account support to DeepInfra in Rust, but
+  `API_KEY_ACCOUNT_VENDORS` in the macOS menu bar was not updated. It now
+  includes `deepinfra` so `[[deepinfra.accounts]]` entries appear as menu
+  choices and in Preferences.
+
+- **Provider catalog and detection recognize named accounts and path overrides.**
+  `ai-usagebar vendors --json` and the TUI/macOS provider views reported
+  providers as unconfigured ("needs credential") when authentication was
+  configured via named accounts (`[[<vendor>.accounts]]`) without setting the
+  ambient key, or when `show_default_account = false` was set. The catalog now
+  checks named API-key accounts as well as Anthropic and OpenAI named accounts
+  and path overrides (`credentials_path`, `codex_auth_path`), matching the
+  credential resolution of the fetch and `detect` (see #307).
+
+- **Saving settings no longer switches a disabled primary provider back on.**
+  A key provider that was still `[ui] primary` after being switched off (from
+  the overlay's provider switches or by hand) stayed the selected primary
+  whenever it kept a key, inline or exported, so the next save from the TUI
+  overlay or the Omarchy settings panel wrote its `enabled = true` back,
+  whatever the edit was. A disabled primary now shows the first enabled
+  provider instead, as Copilot and keyless providers already did; picking a
+  provider explicitly still switches it on.
+
+- **Grok Bot reuses the token pair it refreshed.** After a 401 the widget
+  refreshes the desktop app's session and saves the new pair in its own
+  `oauth.json`, but it saved it under the fingerprint of the rotated refresh
+  token, while the next poll looks it up by the app's sign-in. Once the token
+  rotated the pair was never found again: every poll retried the expired
+  access token and refreshed with the original refresh token, which a server
+  that enforces rotation rejects. The pair is now keyed by the sign-in it was
+  refreshed from, as Kiro and Antigravity already do.
+
+- **Kiro no longer asks for a new login when the network drops during a
+  token refresh.** A refresh that could not reach the token endpoint was
+  reported as a credentials error ("Run `kiro-cli login` again") and recorded
+  as the last refresh error, so a laptop waking up offline with an expired
+  access token showed a sign-in warning for a login that was fine. Network
+  failures now take the same silent cache fallback as the usage call; a
+  refresh the endpoint rejects still asks for a new login.
+
+- **Antigravity's custom formats no longer break Waybar's markup.** The
+  documented `{scoped_model}` and `{extra_model}` placeholders carry the
+  third-party pool's name, "Claude & GPT OSS", and the bar text and a custom
+  `--tooltip-format` substituted it unescaped, so any format naming the pool
+  handed Waybar a bare `&` inside its markup. The pool names and the plan
+  label are now escaped in both, as Kiro already does for its plan.
+
+- **SuperGrok no longer shows an authentication failure's response body.**
+  When a refresh failed with a 401 or 403 and a cached figure was shown
+  instead, the cache recorded the neutral authentication message but the
+  outcome kept the raw response body, so the Waybar tooltip, the TUI and
+  `usage --json` displayed it on every poll that refetched. The outcome now
+  carries exactly what the cache recorded, as the other vendors already do.
+
+- **Grok reports a rejected management key under its HTTP status.** Without
+  a `team_id`, every refetch first validates the key, and an HTTP error from
+  that step was recorded as a generic error with code 0. The response body of
+  a 401 or 403 therefore reached `.last_error` and the TUI and report
+  warnings, the Waybar tooltip showed the stale balance without any error,
+  and a 429 never armed the five-minute backoff. That step is now recorded
+  like the balance call: under its status, with an auth failure's body
+  replaced by the neutral message.
+
+- **`~` now works in `[commandcode] auth_paths` and `[copilot] gh_binary`.**
+  Every other path setting expands a leading `~` when the config loads, but
+  these two kept it literally. Uncommenting the documented
+  `auth_paths = ["~/.commandcode/auth.json"]` made Command Code report "not
+  signed in" for a signed-in user, and `gh_binary = "~/bin/gh"` made Copilot
+  report that the GitHub CLI is not installed.
+
+- **The in-tree `ai-usagebar-bin` PKGBUILD builds again.** Since #282 each
+  architecture downloads a tarball and its detached `.sig`, so it needs two
+  checksums, but the v1.29.0 version bump reset `sha256sums_x86_64` and
+  `sha256sums_aarch64` to a single `'SKIP'` (and `.SRCINFO-bin` to one line
+  each), which makepkg rejects as an array that differs in size from its
+  sources. Packages published by the release workflow were unaffected,
+  because it rewrites both arrays with two entries; local builds and the
+  manual AUR fallback were not.
+
+- **A config whose only inline key is Ollama Cloud's is tightened to `0600`.**
+  On Unix, a config holding an inline credential is made private when it is
+  loaded, but `[ollama] api_key` was missing from the list of fields that
+  triggers it, so such a file kept whatever mode it was created with,
+  typically readable by every local user. It now gets the same protection as
+  every other provider's inline key.
+
+- **A key pasted into `api_key_env` is no longer repeated in errors.** A value
+  that is not an environment variable name is most likely the key itself in
+  the wrong field, and the shared resolver already refuses to echo it, but
+  two messages still did: Kimi's "no credentials" error, when no Kimi Code
+  CLI login exists either, and the `[[custom]]` validation error, which fails
+  the whole config load. Both reached the widget's tooltip, `usage --json`
+  and the TUI. They now name `api_key_env` without its value.
+
+- **Named accounts' key variables no longer reach other tools' processes.**
+  The `gh`, `grok`, `agy` and `claude` processes ai-usagebar starts get every
+  provider key variable removed from their environment, but that list held
+  only the default names and `[[custom]]` variables. A key read from a named
+  account's variable (`[[deepseek.accounts]] api_key_env`), from a renamed
+  `api_key_env`, or from an OpenRouter `management_api_key_env` other than the
+  default was passed to all of them; these are now removed as well.
+
+- **Linux Mint: the tray menu's summary reads the quota, not a Claude Code
+  session.** With `[context] enabled = true`, the Claude entry's metrics also
+  list each recent session with how full its context window is, and the
+  menu's one-line summary showed the highest of them all, so a session at 90%
+  read as "Claude: 90%" while the 5h and weekly quotas were low. The summary
+  now picks among the quota rows; grouped rows only stand in when an entry
+  has nothing else.
+
+- **Omarchy: a full Claude Code session no longer stands in for the Claude
+  quota.** With `[context] enabled = true`, each recent session reaches the
+  Claude entry as a grouped "Sessions" row whose percent is how full its
+  context window is. The bar picked the highest percent over every row, so a
+  session at 90%, even one from yesterday, became the Claude chip's value,
+  coloured it critical and turned on the bar's alarm while the 5h and weekly
+  quotas were low. The bar now reads the quota rows; grouped rows only stand
+  in when an entry has nothing else.
+
+- **The documented Windows config file is the one the binary reads.** On
+  Windows the default config is `%APPDATA%\ai-usagebar\config\config.toml`,
+  but `--help`, the README and three docs pages named
+  `%APPDATA%\ai-usagebar\config.toml`, and the PowerShell snippet in
+  `docs/windows-build.md` created that file. Nothing reads it, so a config set
+  up from the docs was silently ignored. They now name the real location, as
+  `windows/README.md` already did.
+
+- **Provider catalog recognizes Anthropic named accounts backed by Keychain.**
+  On macOS, an Anthropic named account configured via `[[anthropic.accounts]]`
+  or discovered via `accounts_dir` whose credentials exist only in its
+  `CLAUDE_CONFIG_DIR`-scoped Keychain item reported `configured: false` in
+  `ai-usagebar vendors --json`, even though the fetch and `detect` resolved it.
+  The catalog now probes the account's Keychain item when no on-disk credentials
+  file exists (fixes #329).
+
+### Security
+
+- **A broken `config.toml` no longer has its offending line quoted back.**
+  TOML parse errors quote the line the parser stopped on, and the commonest
+  mistake, a missing quote, is often on an inline `api_key` line, so the key
+  itself reached the widget's tooltip, `usage --json` (and with it every
+  desktop frontend), the TUI, the Settings overlay and stderr. Config parse
+  errors now give the line and column with the parser's message, never the
+  line's content.
 
 ## [1.30.0] — 2026-10-01
 
@@ -1621,7 +2522,6 @@ Each release is also published at
   still names the buckets it did receive. `docs/vendor-endpoints.md` gains the
   Antigravity row it never had — it was the only provider missing from that
   table — and the placeholder reference no longer promises all four windows.
-
 ## [1.9.1] — 2026-08-30
 
 ### Fixed
@@ -3489,7 +4389,15 @@ vendors. Highlights:
 - Live API smoke test suite (`make smoke`) that exercises the real
   undocumented endpoints to detect schema drift before users do.
 
-[Unreleased]: https://github.com/akitaonrails/ai-usagebar/compare/v1.30.0...HEAD
+[Unreleased]: https://github.com/akitaonrails/ai-usagebar/compare/v1.38.0...HEAD
+[1.38.0]: https://github.com/akitaonrails/ai-usagebar/compare/v1.37.0...v1.38.0
+[1.37.0]: https://github.com/akitaonrails/ai-usagebar/compare/v1.36.0...v1.37.0
+[1.36.0]: https://github.com/akitaonrails/ai-usagebar/compare/v1.35.0...v1.36.0
+[1.35.0]: https://github.com/akitaonrails/ai-usagebar/compare/v1.34.0...v1.35.0
+[1.34.0]: https://github.com/akitaonrails/ai-usagebar/compare/v1.33.0...v1.34.0
+[1.33.0]: https://github.com/akitaonrails/ai-usagebar/compare/v1.32.0...v1.33.0
+[1.32.0]: https://github.com/akitaonrails/ai-usagebar/compare/v1.31.0...v1.32.0
+[1.31.0]: https://github.com/akitaonrails/ai-usagebar/compare/v1.30.0...v1.31.0
 [1.30.0]: https://github.com/akitaonrails/ai-usagebar/compare/v1.29.0...v1.30.0
 [1.29.0]: https://github.com/akitaonrails/ai-usagebar/compare/v1.28.0...v1.29.0
 [1.28.0]: https://github.com/akitaonrails/ai-usagebar/compare/v1.27.0...v1.28.0

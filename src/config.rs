@@ -71,10 +71,15 @@ pub struct Config {
     pub ollama: OllamaConfig,
     pub orcarouter: OrcaRouterConfig,
     pub modelstudio: ModelStudioConfig,
+    pub lyceum: LyceumConfig,
+    pub devin: DevinConfig,
+    #[serde(rename = "muse-code")]
+    pub muse: MuseConfig,
     /// Quota-threshold desktop notifications (`[notifications]`).
     pub notifications: NotificationsConfig,
     /// User-defined providers, one `[[custom]]` table each.
     pub custom: Vec<CustomProviderConfig>,
+    pub cline: ClineConfig,
 }
 
 /// UI / dispatch preferences. Currently just `primary` — which vendor the
@@ -86,8 +91,9 @@ pub struct UiConfig {
     /// `None` → fall back to anthropic for backward compatibility.
     pub primary: Option<VendorId>,
     /// Which vendors the Overview shows (the TUI's first tab and the macOS
-    /// menu-bar's top section), in this order. `None` → every enabled vendor,
-    /// in the canonical order.
+    /// menu-bar's top section), in this order. The TUI tab bar leads with the
+    /// same list; enabled vendors left off it follow in the canonical order.
+    /// `None` → every enabled vendor, in the canonical order.
     pub overview_vendors: Option<Vec<VendorId>>,
     /// Layout style for vendor navigation in the TUI: sidebar | navbar | none.
     pub vendor_box: Option<VendorBoxStyle>,
@@ -113,8 +119,12 @@ pub struct TrayConfig {
     pub refresh_minutes: Option<u64>,
     /// What the tray does when a newer release is published.
     pub updates: Option<UpdateMode>,
-    /// macOS menu-bar presentation: `provider` (logos) or `bars` (default).
+    /// macOS menu-bar presentation: `bars` (default), `provider` (logos) or
+    /// `name` (the selected provider's logo, short name and value).
     pub menu_bar_style: Option<String>,
+    /// Whether the `name` style draws the short name beside the logo.
+    /// `None` → shown. A provider with no logo shows its name regardless.
+    pub menu_bar_short_name: Option<bool>,
 }
 
 /// Poll intervals the tray offers, in minutes. The provider cache TTL is
@@ -150,6 +160,10 @@ impl TrayConfig {
 
     pub fn updates(&self) -> UpdateMode {
         self.updates.unwrap_or_default()
+    }
+
+    pub fn menu_bar_short_name(&self) -> bool {
+        self.menu_bar_short_name.unwrap_or(true)
     }
 }
 
@@ -290,6 +304,9 @@ pub struct AnthropicConfig {
     /// reads and writes that layout so the two tools stay interchangeable.
     /// Unrelated to `accounts_dir`, which is the `claude` CLI's own accounts.
     pub desktop_profiles_dir: Option<PathBuf>,
+    /// Explicit trusted official Claude Code CLI/wrapper for a manual, isolated
+    /// preparation turn. None disables the action; never resolved via PATH.
+    pub desktop_prepare_binary: Option<PathBuf>,
 }
 
 impl Default for AnthropicConfig {
@@ -301,6 +318,7 @@ impl Default for AnthropicConfig {
             accounts_dir: None,
             show_default_account: true,
             desktop_profiles_dir: None,
+            desktop_prepare_binary: None,
         }
     }
 }
@@ -382,12 +400,32 @@ impl AnthropicConfig {
     /// accounts identically; the widget layers its `--cache-dir` override on
     /// top of the cache returned here.
     pub fn account_target(&self, label: &str) -> Result<(CredsTarget, Cache)> {
-        let active = crate::anthropic::cli_account::home_claude_json()
+        self.account_target_with(label, self.active_cli_label().as_deref())
+    }
+
+    /// The named account the `claude` CLI is signed into right now, if any —
+    /// the `cli_active` that [`account_target_with`] takes. Reads
+    /// `~/.claude.json`, so tests inject the label instead.
+    ///
+    /// [`account_target_with`]: AnthropicConfig::account_target_with
+    pub fn active_cli_label(&self) -> Option<String> {
+        crate::anthropic::cli_account::home_claude_json()
             .ok()
             .and_then(|path| {
                 crate::anthropic::cli_account::resolve_active_label(&path, &self.all_accounts())
-            });
-        self.account_target_with(label, active.as_deref())
+            })
+    }
+
+    /// What the default (unlabelled) Claude entry reads: config
+    /// `credentials_path` as an explicit strict read, otherwise the platform
+    /// default, which alone gets the macOS Keychain fallback.
+    pub fn default_creds_target(&self) -> CredsTarget {
+        match self.credentials_path.clone() {
+            Some(path) => CredsTarget::Explicit(path),
+            None => {
+                CredsTarget::Default(crate::anthropic::creds::default_path().unwrap_or_default())
+            }
+        }
     }
 
     /// The pure half of [`account_target`](AnthropicConfig::account_target),
@@ -763,6 +801,28 @@ pub fn set_vendor_enabled_in_doc(
     set_bool(doc, vendor.config_section(), "enabled", enabled)
 }
 
+/// A TOML error as `line L, column C: message`. `toml` and `toml_edit` both
+/// quote the offending source line in their `Display`, and in `config.toml`
+/// that line can hold an inline `api_key`: one missing quote around a key put
+/// the key in the widget's tooltip, in `usage --json` and on stderr. The
+/// position is enough to find the mistake.
+pub(crate) fn toml_error_summary(
+    input: &str,
+    span: Option<std::ops::Range<usize>>,
+    message: &str,
+) -> String {
+    let message = message.trim_end();
+    match span.and_then(|range| input.get(..range.start)) {
+        Some(before) => {
+            let line = before.matches('\n').count() + 1;
+            let line_start = before.rfind('\n').map_or(0, |i| i + 1);
+            let column = before[line_start..].chars().count() + 1;
+            format!("line {line}, column {column}: {message}")
+        }
+        None => message.to_string(),
+    }
+}
+
 /// Read `path` into a `toml_edit` document with comments intact. A missing
 /// file is an empty document, so a writer can create the config from nothing;
 /// any other I/O failure or a parse error is reported rather than clobbered.
@@ -776,7 +836,8 @@ pub(crate) fn read_config_document(path: &Path) -> Result<toml_edit::DocumentMut
         return Ok(toml_edit::DocumentMut::new());
     }
     original.parse().map_err(|e: toml_edit::TomlError| {
-        AppError::Other(format!("config.toml not parseable: {e}"))
+        let summary = toml_error_summary(&original, e.span(), e.message());
+        AppError::Other(format!("config.toml not parseable: {summary}"))
     })
 }
 
@@ -959,20 +1020,103 @@ impl Default for OpenAiConfig {
 /// GitHub Copilot quota from the private endpoint used by VS Code. The token
 /// comes from an explicit environment override or the official GitHub CLI;
 /// this app never reads, copies, or writes GitHub credential stores.
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct CopilotConfig {
     pub enabled: bool,
     /// Path to the official GitHub CLI. Unset looks `gh` up on `PATH`, which
     /// is how `gh` is normally installed; set it to pin the executable.
     pub gh_binary: Option<PathBuf>,
+    /// Extra Copilot accounts beyond whichever one `gh` has active, each
+    /// selected with `--account <label>` (issue #378). Empty by default, so an
+    /// existing single-account config behaves exactly as before.
+    pub accounts: Vec<CopilotAccount>,
+    /// Whether the default (unnamed) Copilot account gets its own tab.
+    /// Defaults to `true` for back-compat. Set `false` once every account is
+    /// named, so the ambient active `gh` login does not also appear as a
+    /// duplicate of whichever one it happens to be. Ignored when there are no
+    /// named accounts, so Copilot never loses its only tab.
+    pub show_default_account: bool,
+}
+
+impl Default for CopilotConfig {
+    fn default() -> Self {
+        Self {
+            // Unlike Claude and Codex, Copilot stays opt-in: enabling it
+            // spawns `gh` on every refresh.
+            enabled: false,
+            gh_binary: None,
+            accounts: Vec::new(),
+            show_default_account: true,
+        }
+    }
+}
+
+/// One named Copilot account, resolved through the GitHub CLI's own
+/// multi-account support rather than by storing a token here.
+///
+/// ```toml
+/// [[copilot.accounts]]
+/// label = "work"
+/// user = "my-work-login"
+/// ```
+///
+/// Sign the second account in with `gh auth login` (gh keeps both on the same
+/// host); `gh auth status` lists the login names. `user` is that login name,
+/// not an email, and is validated against GitHub's login grammar before it
+/// reaches the command line.
+///
+/// There is deliberately no `hostname` field yet. `gh` supports GitHub
+/// Enterprise hosts, but the quota endpoint
+/// (`https://api.github.com/copilot_internal/user`) is github.com-only, so
+/// accepting a hostname would promise GHES support the fetch cannot keep.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct CopilotAccount {
+    /// Stable name used on the CLI (`--account <label>`) and as the cache
+    /// subdir (`~/.cache/ai-usagebar/copilot/<label>`).
+    pub label: String,
+    /// The GitHub login this account signs in as, passed to
+    /// `gh auth token --user <user>`.
+    pub user: String,
 }
 
 impl CopilotConfig {
-    pub fn resolve_token(&self) -> Result<String> {
+    /// The GitHub login for `label`, or `None` for the default account.
+    /// An unknown label is an error rather than a silent fall back to the
+    /// active `gh` account, which would report the wrong account's quota.
+    pub fn resolve_user(&self, label: Option<&str>) -> Result<Option<&str>> {
+        let Some(label) = label else {
+            return Ok(None);
+        };
+        self.accounts
+            .iter()
+            .find(|account| account.label == label)
+            .map(|account| Some(account.user.as_str()))
+            .ok_or_else(|| {
+                let known = self
+                    .accounts
+                    .iter()
+                    .map(|account| account.label.as_str())
+                    .collect::<Vec<_>>();
+                AppError::Other(if known.is_empty() {
+                    format!(
+                        "copilot: no account {label:?} — [copilot] has no accounts array; \
+                         add [[copilot.accounts]] with label and user"
+                    )
+                } else {
+                    format!(
+                        "copilot: no account {label:?}; known labels: {}",
+                        known.join(", ")
+                    )
+                })
+            })
+    }
+
+    pub fn resolve_token(&self, label: Option<&str>) -> Result<String> {
         self.resolve_token_with(
             |name| std::env::var_os(name),
             &crate::copilot::credentials::SystemGhAuthTokenRunner,
+            label,
         )
     }
 
@@ -980,7 +1124,9 @@ impl CopilotConfig {
         &self,
         environment: impl Fn(&str) -> Option<std::ffi::OsString>,
         runner: &impl crate::copilot::credentials::GhAuthTokenRunner,
+        label: Option<&str>,
     ) -> Result<String> {
+        let user = self.resolve_user(label)?;
         if let Some(value) = environment("GITHUB_COPILOT_TOKEN") {
             let token = value.into_string().map_err(|_| {
                 AppError::Credentials(
@@ -988,17 +1134,42 @@ impl CopilotConfig {
                 )
             })?;
             if !token.is_empty() {
+                // The override names no account, so pairing it with
+                // `--account` would report one account's quota under another
+                // one's label. Refuse instead of guessing which was meant.
+                if let Some(label) = label {
+                    return Err(AppError::Credentials(format!(
+                        "GitHub Copilot: GITHUB_COPILOT_TOKEN is set, so it is unclear whether \
+                         --account {label:?} should use that token or {user:?}'s `gh` login. \
+                         Unset the variable to use named accounts."
+                    )));
+                }
                 return Ok(token);
             }
         }
-        crate::copilot::credentials::resolve_with(runner, self.gh_binary.as_deref())
+        crate::copilot::credentials::resolve_with(runner, self.gh_binary.as_deref(), user)
     }
 }
 
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct NousConfig {
     pub enabled: bool,
+    /// Which number goes on the bar: the consumed percentage of the monthly
+    /// allocation (`percent`, the default) or the credits still usable
+    /// (`amount`). See [`DisplayPrefs`].
+    pub headline: Headline,
+}
+
+impl Default for NousConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            // A plan-usage vendor keeps its percentage; only [nous] can now
+            // ask for the credits balance instead.
+            headline: Headline::Percent,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -1007,6 +1178,35 @@ pub struct OpenCodeGoConfig {
     pub enabled: bool,
     pub api_key_env: String,
     pub api_key: Option<String>,
+    /// Override the search list for the official OpenCode CLI's `auth.json`
+    /// (`$XDG_DATA_HOME/opencode` or `~/.local/share/opencode`), for a
+    /// non-standard install. The key is read read-only, never copied.
+    pub auth_paths: Option<Vec<PathBuf>>,
+}
+
+/// Cline reads the OAuth credential the Cline CLI maintains in
+/// `~/.cline/data/settings/providers.json`, so it needs no API key of its own;
+/// `api_key`/`api_key_env` exist for a machine without the CLI, where a key
+/// from app.cline.bot stands in. `auth_paths` overrides the search list for a
+/// non-standard install.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default)]
+pub struct ClineConfig {
+    pub enabled: bool,
+    pub auth_paths: Option<Vec<PathBuf>>,
+    pub api_key_env: String,
+    pub api_key: Option<String>,
+}
+
+impl Default for ClineConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            auth_paths: None,
+            api_key_env: crate::cline::creds::API_KEY_ENV.to_string(),
+            api_key: None,
+        }
+    }
 }
 
 /// Command Code reads the OAuth credential from the official CLI or pi, so it
@@ -1020,7 +1220,7 @@ pub struct CommandCodeConfig {
     pub auth_paths: Option<Vec<PathBuf>>,
 }
 
-/// Ollama Cloud (`ollama.com/api/usage`). Disabled by default: the local
+/// Ollama Cloud (`ollama.com/api/balance`). Disabled by default: the local
 /// `ollama` daemon is the product most users reach for, and it has no quota
 /// route to query. Cloud quota is opt-in, with the key taken from
 /// `OLLAMA_API_KEY` (or `api_key` as a fallback for `chmod 600` configs).
@@ -1092,12 +1292,33 @@ pub struct ModelStudioConfig {
     pub config_dir: Option<PathBuf>,
 }
 
+/// Muse Code subscription quota from the CLI's existing file-based login.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct MuseConfig {
+    pub enabled: bool,
+    pub credentials_path: Option<PathBuf>,
+}
+
+/// Devin CLI quota — reuses its existing credentials file read-only. The
+/// provider is opt-in and stores only a path override in ai-usagebar config.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct DevinConfig {
+    pub enabled: bool,
+    /// Override the CLI credential path; the default is the CLI's documented
+    /// `%APPDATA%\devin\credentials.toml` on Windows and
+    /// `${XDG_DATA_HOME:-~/.local/share}/devin/credentials.toml` elsewhere.
+    pub credentials_path: Option<PathBuf>,
+}
+
 impl Default for OpenCodeGoConfig {
     fn default() -> Self {
         Self {
             enabled: false,
             api_key_env: "OPENCODE_GO_API_KEY".to_string(),
             api_key: None,
+            auth_paths: None,
         }
     }
 }
@@ -1148,6 +1369,11 @@ pub struct OpenRouterConfig {
     pub show_default_account: bool,
     pub api_key_env: String,
     pub api_key: Option<String>,
+    /// Env var name for the optional OpenRouter *management* key. Only the
+    /// `GET /api/v1/activity` call (recent models) uses it; when it resolves
+    /// to nothing, that request is skipped instead of fired at a 401. The
+    /// regular inference key is never sent to `/activity`.
+    pub management_api_key_env: String,
     /// Which number goes on the bar. OpenRouter states its own denominator —
     /// credits purchased — so it is a quota vendor and defaults to `percent`.
     /// See [`DisplayPrefs`].
@@ -1170,6 +1396,7 @@ impl Default for OpenRouterConfig {
             show_default_account: true,
             api_key_env: "OPENROUTER_API_KEY".to_string(),
             api_key: None,
+            management_api_key_env: "OPENROUTER_MANAGEMENT_API_KEY".to_string(),
             headline: Headline::Percent,
         }
     }
@@ -1189,6 +1416,11 @@ pub struct ApiKeyAccount {
     /// Inline fallback when the account environment variable is unset.
     #[serde(default)]
     pub api_key: Option<String>,
+    /// Optional environment variable containing this account's OpenRouter
+    /// management key (unlocks the recent-models activity). Only OpenRouter
+    /// consults it.
+    #[serde(default)]
+    pub management_api_key_env: Option<String>,
 }
 
 /// The `[[<slug>.accounts]]` lookup behind every API-key vendor: find a named
@@ -1370,7 +1602,7 @@ pub struct NovitaConfig {
 
 impl Default for NovitaConfig {
     fn default() -> Self {
-        // Opt-in like DeepSeek/Kilo: needs an explicit API key.
+        // Opt-in like DeepSeek/Kilo/Novita: needs an explicit API key.
         Self {
             enabled: false,
             accounts: Vec::new(),
@@ -1379,6 +1611,27 @@ impl Default for NovitaConfig {
             api_key: None,
             display_limit: None,
             headline: Headline::Amount,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default)]
+pub struct LyceumConfig {
+    pub enabled: bool,
+    pub accounts: Vec<ApiKeyAccount>,
+    pub show_default_account: bool,
+    pub api_key_env: String,
+    pub api_key: Option<String>,
+}
+impl Default for LyceumConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            accounts: Vec::new(),
+            show_default_account: true,
+            api_key_env: "LYCEUM_API_KEY".into(),
+            api_key: None,
         }
     }
 }
@@ -1563,7 +1816,7 @@ fn default_grok_binary() -> PathBuf {
 /// OAuth client id and secret, which are not shipped in source: set them here
 /// (they are public installed-app credentials) or the fallback only lasts as
 /// long as the saved access token does.
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct AntigravityConfig {
     pub enabled: bool,
@@ -1573,6 +1826,22 @@ pub struct AntigravityConfig {
     /// installed-app secret is not confidential by Google's definition, but
     /// it is still treated as an inline credential for file-permission purposes.
     pub oauth_client_secret: Option<String>,
+    /// Probe the Antigravity IDE's own language server as a quota source
+    /// (default true). Set false when the IDE is installed but its sign-in is
+    /// managed separately: a signed-out IDE language server answers 401/403,
+    /// which outranks and masks a working `agy` session (#405).
+    pub ide_language_server: bool,
+}
+
+impl Default for AntigravityConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            oauth_client_id: None,
+            oauth_client_secret: None,
+            ide_language_server: true,
+        }
+    }
 }
 
 /// Cursor reads its quota through a session token the Cursor IDE already
@@ -1845,10 +2114,12 @@ impl CustomProviderConfig {
             return Err(bad("url has no host".into()));
         }
         if !self.api_key_env.is_empty() && !is_valid_env_var_name(&self.api_key_env) {
-            return Err(bad(format!(
-                "api_key_env {:?} is not a valid environment variable name",
-                self.api_key_env
-            )));
+            // The value is not repeated: one that is not a variable name is
+            // most likely a key pasted into the wrong field, and a config
+            // error reaches every frontend.
+            return Err(bad(
+                "api_key_env is not a valid environment variable name".into()
+            ));
         }
         validate_header_name(&section, "auth_header", &self.auth_header)?;
         if reqwest::header::HeaderValue::from_str(&format!("{} k", self.auth_scheme)).is_err() {
@@ -2046,7 +2317,14 @@ impl Config {
     pub fn load_from(path: &std::path::Path) -> Result<Self> {
         match std::fs::read_to_string(path) {
             Ok(s) => {
-                let mut config: Self = toml::from_str(&s)?;
+                let mut config: Self = toml::from_str(&s).map_err(|mut e| {
+                    let span = e.span();
+                    // Without its input the error's `Display` drops the quoted
+                    // line but keeps the key path, `in deepseek.headline`.
+                    e.set_input(None);
+                    let summary = toml_error_summary(&s, span, &e.to_string());
+                    AppError::Other(format!("config.toml: {summary}"))
+                })?;
                 // `~` is shell syntax, not path syntax: `PathBuf` keeps it
                 // literally, so a documented `credentials_path = "~/..."`
                 // silently pointed at a directory named `~`.
@@ -2056,8 +2334,9 @@ impl Config {
                 config.protect_inline_secrets(path)?;
                 // A custom provider's token variable is as secret as any
                 // built-in one; subprocesses (`gh`, `grok`, `claude`) must
-                // not inherit it.
+                // not inherit it. Nor a named account's, or a renamed one.
                 crate::vendor::register_secret_env_vars(&config.custom_secret_env_vars());
+                crate::vendor::register_secret_env_vars(&config.provider_secret_env_vars());
                 Ok(config)
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
@@ -2070,6 +2349,7 @@ impl Config {
         expand_tilde_opt(&mut self.anthropic.credentials_path);
         expand_tilde_opt(&mut self.anthropic.accounts_dir);
         expand_tilde_opt(&mut self.anthropic.desktop_profiles_dir);
+        expand_tilde_opt(&mut self.anthropic.desktop_prepare_binary);
         expand_tilde_opt(&mut self.openai.codex_auth_path);
         expand_tilde_opt(&mut self.cursor.db_path);
         expand_tilde_opt(&mut self.cursor.agent_auth_path);
@@ -2077,14 +2357,27 @@ impl Config {
         expand_tilde_opt(&mut self.kimi.credentials_path);
         expand_tilde_opt(&mut self.grokbot.secrets_path);
         expand_tilde_opt(&mut self.modelstudio.config_dir);
+        expand_tilde_opt(&mut self.devin.credentials_path);
+        expand_tilde_opt(&mut self.muse.credentials_path);
         self.supergrok.grok_binary = expand_tilde(&self.supergrok.grok_binary);
         expand_tilde_opt(&mut self.supergrok.auth_path);
         expand_tilde_opt(&mut self.supergrok.config_path);
+        expand_tilde_opt(&mut self.copilot.gh_binary);
+        if let Some(paths) = &mut self.cline.auth_paths {
+            for path in paths {
+                *path = expand_tilde(path);
+            }
+        }
         for account in &mut self.anthropic.accounts {
             account.credentials_path = expand_tilde(&account.credentials_path);
         }
         for account in &mut self.openai.accounts {
             account.codex_auth_path = expand_tilde(&account.codex_auth_path);
+        }
+        if let Some(paths) = &mut self.commandcode.auth_paths {
+            for path in paths {
+                *path = expand_tilde(path);
+            }
         }
     }
 
@@ -2106,8 +2399,11 @@ impl Config {
             self.grok.api_key.as_deref(),
             self.anthropic_api.api_key.as_deref(),
             self.opencode_go.api_key.as_deref(),
+            self.ollama.api_key.as_deref(),
             self.orcarouter.api_key.as_deref(),
+            self.lyceum.api_key.as_deref(),
             self.antigravity.oauth_client_secret.as_deref(),
+            self.cline.api_key.as_deref(),
         ]
         .into_iter()
         .chain(
@@ -2125,6 +2421,26 @@ impl Config {
             .iter()
             .filter(|c| !c.api_key_env.is_empty())
             .map(|c| c.api_key_env.clone())
+            .collect()
+    }
+
+    /// The variables built-in providers read keys from under names that
+    /// `VENDOR_SECRET_ENV_VARS` cannot list: a renamed `api_key_env` or
+    /// OpenRouter `management_api_key_env`, and each named account's
+    /// (`DEEPSEEK_WORK_API_KEY`). Default names come back too and are skipped
+    /// by the registration, as are empty ones.
+    fn provider_secret_env_vars(&self) -> Vec<String> {
+        let renamed = VendorId::all().iter().map(|&id| self.api_key_env_for(id));
+        let management = std::iter::once(self.openrouter.management_api_key_env.as_str());
+        let accounts = Self::API_KEY_ACCOUNT_VENDORS
+            .into_iter()
+            .flat_map(|id| self.api_key_accounts(id).unwrap_or(&[]))
+            .flat_map(|account| [&account.api_key_env, &account.management_api_key_env])
+            .filter_map(|name| name.as_deref());
+        renamed
+            .chain(management)
+            .chain(accounts)
+            .map(str::to_string)
             .collect()
     }
 
@@ -2183,11 +2499,15 @@ impl Config {
             VendorId::Minimax => self.minimax.enabled,
             VendorId::Kiro => self.kiro.enabled,
             VendorId::NousResearch => self.nous.enabled,
+            VendorId::Cline => self.cline.enabled,
             VendorId::OpenCodeGo => self.opencode_go.enabled,
             VendorId::CommandCode => self.commandcode.enabled,
             VendorId::Ollama => self.ollama.enabled,
             VendorId::OrcaRouter => self.orcarouter.enabled,
             VendorId::ModelStudio => self.modelstudio.enabled,
+            VendorId::Lyceum => self.lyceum.enabled,
+            VendorId::Devin => self.devin.enabled,
+            VendorId::MuseCode => self.muse.enabled,
         }
     }
 
@@ -2213,6 +2533,7 @@ impl Config {
             VendorId::OpenCodeGo => &self.opencode_go.api_key_env,
             VendorId::Ollama => &self.ollama.api_key_env,
             VendorId::OrcaRouter => &self.orcarouter.api_key_env,
+            VendorId::Lyceum => &self.lyceum.api_key_env,
             // Fixed names: OAuth-first providers whose environment override is
             // not user-renameable, and the providers with no key at all.
             VendorId::Anthropic
@@ -2225,7 +2546,10 @@ impl Config {
             | VendorId::Kiro
             | VendorId::NousResearch
             | VendorId::CommandCode
-            | VendorId::ModelStudio => id.api_key_env(),
+            | VendorId::Cline
+            | VendorId::ModelStudio
+            | VendorId::Devin
+            | VendorId::MuseCode => id.api_key_env(),
         }
     }
 
@@ -2248,6 +2572,8 @@ impl Config {
             VendorId::OpenCodeGo => self.opencode_go.api_key.as_deref(),
             VendorId::Ollama => self.ollama.api_key.as_deref(),
             VendorId::OrcaRouter => self.orcarouter.api_key.as_deref(),
+            VendorId::Lyceum => self.lyceum.api_key.as_deref(),
+            VendorId::Cline => self.cline.api_key.as_deref(),
             VendorId::Anthropic
             | VendorId::Openai
             | VendorId::Copilot
@@ -2258,7 +2584,9 @@ impl Config {
             | VendorId::Kiro
             | VendorId::NousResearch
             | VendorId::CommandCode
-            | VendorId::ModelStudio => None,
+            | VendorId::ModelStudio
+            | VendorId::Devin
+            | VendorId::MuseCode => None,
         };
         raw.filter(|key| !key.is_empty())
     }
@@ -2266,7 +2594,7 @@ impl Config {
     /// The API-key vendors that take a `[[<vendor>.accounts]]` array —
     /// OpenRouter's (#221), generalized. Kimi is left out on purpose: its
     /// fallback is the Kimi Code CLI's single OAuth login, not a key.
-    pub const API_KEY_ACCOUNT_VENDORS: [VendorId; 10] = [
+    pub const API_KEY_ACCOUNT_VENDORS: [VendorId; 11] = [
         VendorId::Zai,
         VendorId::Openrouter,
         VendorId::Deepseek,
@@ -2277,6 +2605,7 @@ impl Config {
         VendorId::Grok,
         VendorId::Minimax,
         VendorId::OrcaRouter,
+        VendorId::Lyceum,
     ];
 
     /// The named `[[<vendor>.accounts]]` array, or `None` for a vendor that
@@ -2293,6 +2622,7 @@ impl Config {
             VendorId::Grok => Some(&self.grok.accounts),
             VendorId::Minimax => Some(&self.minimax.accounts),
             VendorId::OrcaRouter => Some(&self.orcarouter.accounts),
+            VendorId::Lyceum => Some(&self.lyceum.accounts),
             _ => None,
         }
     }
@@ -2311,6 +2641,7 @@ impl Config {
             VendorId::Grok => self.grok.show_default_account,
             VendorId::Minimax => self.minimax.show_default_account,
             VendorId::OrcaRouter => self.orcarouter.show_default_account,
+            VendorId::Lyceum => self.lyceum.show_default_account,
             _ => true,
         }
     }
@@ -2341,6 +2672,23 @@ impl Config {
         )
     }
 
+    /// The optional OpenRouter *management* key for the default or a named
+    /// account. `None` means none is configured, in which case the caller
+    /// skips the `/api/v1/activity` request rather than firing a doomed 401 —
+    /// the regular inference key is never sent there. A named account only
+    /// resolves a management key when it names its own
+    /// `management_api_key_env`; it never inherits the default account's.
+    pub fn openrouter_management_key(&self, label: Option<&str>) -> Option<String> {
+        let env_name = match label {
+            Some(label) => api_key_account("openrouter", &self.openrouter.accounts, label)
+                .ok()?
+                .management_api_key_env
+                .as_deref()?,
+            None => self.openrouter.management_api_key_env.as_str(),
+        };
+        optional_api_key(env_name, None)
+    }
+
     /// Bar-number settings for one vendor.
     ///
     /// Only the prepaid-balance vendors declare these; everything else keeps
@@ -2364,6 +2712,9 @@ impl Config {
             // No tank: OpenRouter reports its own credits. See
             // [`OpenRouterConfig::headline`].
             VendorId::Openrouter => DisplayPrefs::balance(None, self.openrouter.headline),
+            // No user tank: the percentage's own denominator is the plan's
+            // monthly allocation, so only the headline choice applies.
+            VendorId::NousResearch => DisplayPrefs::balance(None, self.nous.headline),
             _ => DisplayPrefs::default(),
         }
     }
@@ -2864,6 +3215,7 @@ mod tests {
             VendorId::CommandCode,
             VendorId::OrcaRouter,
             VendorId::ModelStudio,
+            VendorId::Devin,
         ] {
             assert!(!c.is_enabled(opt_in), "{opt_in:?}");
         }
@@ -2929,6 +3281,28 @@ enabled = true
         assert!(bare.antigravity.oauth_client_secret.is_none());
     }
 
+    /// #405: the IDE language-server opt-out parses, and the default keeps
+    /// probing it so discovery is unchanged for everyone else.
+    #[test]
+    fn antigravity_ide_language_server_defaults_to_probing() {
+        assert!(Config::default().antigravity.ide_language_server);
+        let bare: Config = toml::from_str(
+            "[antigravity]
+enabled = true
+",
+        )
+        .unwrap();
+        assert!(bare.antigravity.ide_language_server);
+        let opted_out: Config = toml::from_str(
+            "[antigravity]
+enabled = true
+ide_language_server = false
+",
+        )
+        .unwrap();
+        assert!(!opted_out.antigravity.ide_language_server);
+    }
+
     #[cfg(unix)]
     #[test]
     fn antigravity_inline_oauth_secret_receives_config_file_protection() {
@@ -2947,6 +3321,7 @@ enabled = true
             label: "work".into(),
             api_key_env: None,
             api_key: Some("<redacted>".into()),
+            management_api_key_env: None,
         });
         assert!(config.has_inline_secrets());
     }
@@ -2961,6 +3336,22 @@ enabled = true
             ))
             .unwrap();
             assert!(config.has_inline_secrets(), "{vendor:?}");
+        }
+    }
+
+    /// `has_inline_secrets` lists the fields by hand, and Ollama's was missed
+    /// once. Walk every vendor instead: whatever `inline_api_key` resolves as
+    /// a key must also put the config file under 0600 protection.
+    #[cfg(unix)]
+    #[test]
+    fn every_inline_api_key_receives_config_file_protection() {
+        for &vendor in VendorId::all() {
+            let section = vendor.config_section();
+            let config: Config =
+                toml::from_str(&format!("[{section}]\napi_key = \"<redacted>\"\n")).unwrap();
+            if config.inline_api_key(vendor).is_some() {
+                assert!(config.has_inline_secrets(), "{vendor:?}");
+            }
         }
     }
 
@@ -3316,16 +3707,83 @@ enabled = false
     }
 
     #[test]
+    fn devin_is_opt_in_and_takes_no_api_key() {
+        let defaults = DevinConfig::default();
+        assert!(!defaults.enabled);
+        assert_eq!(defaults.credentials_path, None);
+
+        let config = Config::default();
+        assert_eq!(config.api_key_env_for(VendorId::Devin), "");
+        assert_eq!(config.inline_api_key(VendorId::Devin), None);
+
+        let file = write_toml("[devin]\nenabled = true\n");
+        let config = Config::load_from(file.path()).unwrap();
+        assert!(config.is_enabled(VendorId::Devin));
+        assert!(config.enabled_vendors().contains(&VendorId::Devin));
+    }
+
+    #[test]
+    fn devin_credentials_path_expands_a_tilde() {
+        let file = write_toml("[devin]\ncredentials_path = \"~/devin/credentials.toml\"\n");
+        let path = Config::load_from(file.path())
+            .unwrap()
+            .devin
+            .credentials_path
+            .unwrap();
+        assert!(!path.starts_with("~"), "{}", path.display());
+        assert!(
+            path.ends_with("devin/credentials.toml"),
+            "{}",
+            path.display()
+        );
+    }
+
+    #[test]
+    fn lyceum_is_opt_in_and_uses_shared_api_key_account_resolution() {
+        let defaults = LyceumConfig::default();
+        assert!(!defaults.enabled);
+        assert_eq!(defaults.api_key_env, "LYCEUM_API_KEY");
+        let override_file = write_toml("[lyceum]\napi_key_env = \"LYCEUM_CUSTOM_TEST_KEY\"\n");
+        let override_config = Config::load_from(override_file.path()).unwrap();
+        assert_eq!(
+            override_config.api_key_env_for(VendorId::Lyceum),
+            "LYCEUM_CUSTOM_TEST_KEY"
+        );
+        let file = write_toml(
+            r#"[lyceum]
+enabled = true
+api_key_env = ""
+api_key = "synthetic-inline"
+[[lyceum.accounts]]
+label = "work"
+api_key = "synthetic-account"
+"#,
+        );
+        let config = Config::load_from(file.path()).unwrap();
+        assert!(config.is_enabled(VendorId::Lyceum));
+        assert_eq!(config.api_key_env_for(VendorId::Lyceum), "");
+        assert_eq!(
+            config
+                .resolve_account_api_key_for(VendorId::Lyceum, None)
+                .unwrap(),
+            "synthetic-inline"
+        );
+        assert_eq!(
+            config
+                .resolve_account_api_key_for(VendorId::Lyceum, Some("work"))
+                .unwrap(),
+            "synthetic-account"
+        );
+    }
+
+    #[test]
     fn optional_api_key_reports_absence_instead_of_failing() {
         assert_eq!(
-            optional_api_key("KIMI_API_KEY_DEFINITELY_UNSET", Some("inline")),
+            optional_api_key("9INVALID", Some("inline")),
             Some("inline".to_string())
         );
-        assert_eq!(
-            optional_api_key("KIMI_API_KEY_DEFINITELY_UNSET", None),
-            None
-        );
-        assert_eq!(optional_api_key("KIMI_API_KEY_UNSET", Some("")), None);
+        assert_eq!(optional_api_key("9INVALID", None), None);
+        assert_eq!(optional_api_key("9INVALID", Some("")), None);
         // An unusable `api_key_env` still lets an inline key through, exactly
         // as `resolve_api_key` does.
         assert_eq!(
@@ -3465,9 +3923,81 @@ enabled = false
             .resolve_token_with(
                 |name| (name == "GITHUB_COPILOT_TOKEN").then(|| "from-environment".into()),
                 &NeverRun,
+                None,
             )
             .unwrap();
         assert_eq!(token, "from-environment");
+    }
+
+    /// `--account` names a `gh` login; `GITHUB_COPILOT_TOKEN` names nothing.
+    /// Honoring both would label one account's quota with another's name, so
+    /// the combination is refused rather than silently resolved either way.
+    #[test]
+    fn copilot_rejects_an_environment_override_combined_with_a_named_account() {
+        struct NeverRun;
+        impl crate::copilot::credentials::GhAuthTokenRunner for NeverRun {
+            fn run(
+                &self,
+                _: &crate::copilot::credentials::GhAuthTokenCommand,
+            ) -> std::io::Result<crate::copilot::credentials::GhAuthTokenOutput> {
+                panic!("the conflict must be refused before gh runs")
+            }
+        }
+        let config = CopilotConfig {
+            accounts: vec![CopilotAccount {
+                label: "work".into(),
+                user: "octocat".into(),
+            }],
+            ..CopilotConfig::default()
+        };
+        let error = config
+            .resolve_token_with(
+                |name| (name == "GITHUB_COPILOT_TOKEN").then(|| "from-environment".into()),
+                &NeverRun,
+                Some("work"),
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("GITHUB_COPILOT_TOKEN is set"), "{error}");
+        assert!(error.contains("work"), "{error}");
+    }
+
+    /// An unknown label must not fall back to the active `gh` account: that
+    /// would report some other account's quota under the requested name.
+    #[test]
+    fn copilot_unknown_account_label_errors_listing_the_known_ones() {
+        let config = CopilotConfig {
+            accounts: vec![CopilotAccount {
+                label: "work".into(),
+                user: "octocat".into(),
+            }],
+            ..CopilotConfig::default()
+        };
+        assert_eq!(config.resolve_user(None).unwrap(), None);
+        assert_eq!(config.resolve_user(Some("work")).unwrap(), Some("octocat"));
+        let error = config
+            .resolve_user(Some("personal"))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("personal"), "{error}");
+        assert!(error.contains("work"), "{error}");
+
+        // With no accounts array at all, say so instead of listing nothing.
+        let error = CopilotConfig::default()
+            .resolve_user(Some("work"))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("no accounts array"), "{error}");
+    }
+
+    /// Back-compat: an existing single-account config keeps the default tab
+    /// and resolves exactly as before.
+    #[test]
+    fn copilot_defaults_keep_the_unnamed_account_visible() {
+        let config = CopilotConfig::default();
+        assert!(config.show_default_account);
+        assert!(config.accounts.is_empty());
+        assert!(!config.enabled, "Copilot stays opt-in");
     }
 
     #[test]
@@ -3485,7 +4015,7 @@ enabled = false
             }
         }
         let error = CopilotConfig::default()
-            .resolve_token_with(|_| None, &FailedGh)
+            .resolve_token_with(|_| None, &FailedGh, None)
             .unwrap_err()
             .to_string();
         assert!(error.contains("gh auth login --web"));
@@ -3803,6 +4333,7 @@ enabled = false
             label: "work".into(),
             api_key_env: None,
             api_key: Some("work-secret".into()),
+            management_api_key_env: None,
         });
         let message = config
             .resolve_account_api_key_for(VendorId::Openrouter, Some("missing"))
@@ -3820,6 +4351,7 @@ enabled = false
             label: "work".into(),
             api_key_env: Some("sk_pasted_secret".into()),
             api_key: None,
+            management_api_key_env: None,
         });
         let _g = env_guard();
         unsafe { std::env::remove_var("sk_pasted_secret") };
@@ -3829,6 +4361,57 @@ enabled = false
             .to_string();
         assert!(message.contains("[[openrouter.accounts]]"));
         assert!(!message.contains("sk_pasted_secret"));
+    }
+
+    #[test]
+    fn openrouter_management_key_resolves_per_account_and_never_inherits() {
+        let mut config = Config::default();
+        config.openrouter.accounts = vec![
+            ApiKeyAccount {
+                label: "work".into(),
+                api_key_env: None,
+                api_key: Some("work-key".into()),
+                management_api_key_env: Some("AI_USAGEBAR_TEST_OR_MGMT_WORK".into()),
+            },
+            ApiKeyAccount {
+                label: "plain".into(),
+                api_key_env: None,
+                api_key: Some("plain-key".into()),
+                management_api_key_env: None,
+            },
+        ];
+        let _g = env_guard();
+        unsafe { std::env::remove_var("OPENROUTER_MANAGEMENT_API_KEY") };
+        unsafe { std::env::set_var("AI_USAGEBAR_TEST_OR_MGMT_WORK", "mgmt-work") };
+
+        // The default account reads OPENROUTER_MANAGEMENT_API_KEY — unset here.
+        assert_eq!(config.openrouter_management_key(None), None);
+        // A named account with its own var resolves it.
+        assert_eq!(
+            config.openrouter_management_key(Some("work")).as_deref(),
+            Some("mgmt-work")
+        );
+        // A named account without one resolves nothing, even when the default
+        // account's var is set — accounts never inherit across identities.
+        unsafe { std::env::set_var("OPENROUTER_MANAGEMENT_API_KEY", "mgmt-default") };
+        assert_eq!(
+            config.openrouter_management_key(None).as_deref(),
+            Some("mgmt-default")
+        );
+        assert_eq!(config.openrouter_management_key(Some("plain")), None);
+        // An unknown label resolves nothing rather than the default's key.
+        assert_eq!(config.openrouter_management_key(Some("typo")), None);
+
+        // The [openrouter] override renames the default account's var.
+        config.openrouter.management_api_key_env = "AI_USAGEBAR_TEST_OR_MGMT_DEFAULT".into();
+        unsafe { std::env::set_var("AI_USAGEBAR_TEST_OR_MGMT_DEFAULT", "mgmt-renamed") };
+        assert_eq!(
+            config.openrouter_management_key(None).as_deref(),
+            Some("mgmt-renamed")
+        );
+        unsafe { std::env::remove_var("OPENROUTER_MANAGEMENT_API_KEY") };
+        unsafe { std::env::remove_var("AI_USAGEBAR_TEST_OR_MGMT_WORK") };
+        unsafe { std::env::remove_var("AI_USAGEBAR_TEST_OR_MGMT_DEFAULT") };
     }
 
     #[test]
@@ -3890,6 +4473,7 @@ enabled = false
             label: "work".into(),
             api_key_env: Some("AI_USAGEBAR_TEST_DEEPSEEK_WORK".into()),
             api_key: Some("work-inline".into()),
+            management_api_key_env: None,
         });
         let _g = env_guard();
         unsafe { std::env::set_var("AI_USAGEBAR_TEST_DEEPSEEK_WORK", "work-env") };
@@ -4060,6 +4644,38 @@ enabled = false
     fn invalid_toml_is_an_error_not_silent_defaults() {
         let f = write_toml("[zai\nenabled = true\n");
         assert!(Config::load_from(f.path()).is_err());
+    }
+
+    /// A missing quote is the commonest way to break the file, and the line
+    /// it breaks can be an inline key: the error must point at that line
+    /// without repeating it.
+    #[test]
+    fn a_parse_error_names_the_line_without_quoting_it() {
+        let f = write_toml("[openrouter]\nenabled = true\napi_key = sk-or-v1-unquoted\n");
+        let err = Config::load_from(f.path()).unwrap_err().to_string();
+        assert!(err.contains("line 3,"), "{err}");
+        assert!(!err.contains("sk-or-v1-unquoted"), "{err}");
+    }
+
+    /// The writers read the same file through `toml_edit`, whose errors quote
+    /// the line too.
+    #[test]
+    fn a_writer_parse_error_names_the_line_without_quoting_it() {
+        let (_dir, path) =
+            crate::cache::closed_temp_file("config.toml", Some("[zai]\napi_key = zk-unquoted\n"));
+        let err = read_config_document(&path).unwrap_err().to_string();
+        assert!(err.contains("line 2,"), "{err}");
+        assert!(!err.contains("zk-unquoted"), "{err}");
+    }
+
+    #[test]
+    fn toml_error_summary_keeps_the_position_and_the_message() {
+        let input = "a = 1\nkey = sk-secret\n";
+        assert_eq!(
+            toml_error_summary(input, Some(12..21), "string values must be quoted\n"),
+            "line 2, column 7: string values must be quoted"
+        );
+        assert_eq!(toml_error_summary(input, None, "bad"), "bad");
     }
 
     #[test]
@@ -4372,6 +4988,24 @@ enabled = false
     }
 
     #[test]
+    fn the_default_entry_reads_config_credentials_path_strictly() {
+        let cfg = AnthropicConfig {
+            credentials_path: Some("/tmp/claude-home/.credentials.json".into()),
+            ..Default::default()
+        };
+
+        assert!(
+            matches!(&cfg.default_creds_target(), CredsTarget::Explicit(path)
+                if path == Path::new("/tmp/claude-home/.credentials.json")),
+        );
+        // Without one, the platform default — the only target with a Keychain fallback.
+        assert!(matches!(
+            AnthropicConfig::default().default_creds_target(),
+            CredsTarget::Default(_)
+        ));
+    }
+
+    #[test]
     fn the_live_cli_accounts_own_file_is_probed_on_disk() {
         // `account_target_probing` proves the decision; only the entry point
         // proves that the shipping caller probes at all. Fails on main, where
@@ -4548,6 +5182,31 @@ enabled = false
             config.supergrok.config_path,
             Some(home.join(".grok/config.toml"))
         );
+    }
+
+    /// `config.example.toml` documents `auth_paths = ["~/.commandcode/auth.json"]`;
+    /// `gh_binary` is the Copilot counterpart of `grok_binary` above.
+    #[test]
+    fn commandcode_and_copilot_paths_are_tilde_expanded() {
+        let file = write_toml(
+            r#"
+            [commandcode]
+            auth_paths = ["~/.commandcode/auth.json", "/etc/commandcode/auth.json"]
+
+            [copilot]
+            gh_binary = "~/bin/gh"
+            "#,
+        );
+        let config = Config::load_from(file.path()).unwrap();
+        let home = crate::cache::home_dir().unwrap();
+        assert_eq!(
+            config.commandcode.auth_paths,
+            Some(vec![
+                home.join(".commandcode/auth.json"),
+                PathBuf::from("/etc/commandcode/auth.json"),
+            ])
+        );
+        assert_eq!(config.copilot.gh_binary, Some(home.join("bin/gh")));
     }
 
     #[test]
@@ -4956,6 +5615,19 @@ value = "/tier"
         );
     }
 
+    /// A value that is not a variable name is most likely a key pasted into
+    /// the wrong field, and this error fails the whole config load: it names
+    /// the field and never repeats the value.
+    #[test]
+    fn custom_invalid_api_key_env_is_not_repeated() {
+        let msg = custom_error(&custom_with(
+            r#"api_key_env = "MYTOOL_API_KEY""#,
+            r#"api_key_env = "sk-live-pasted-secret""#,
+        ));
+        assert!(msg.contains("api_key_env"), "{msg}");
+        assert!(!msg.contains("sk-live-pasted-secret"), "{msg}");
+    }
+
     #[test]
     fn custom_rejects_an_invalid_auth_header_name() {
         assert_custom_rejected(
@@ -5164,6 +5836,44 @@ url = "https://example.test/u"
         );
     }
 
+    #[test]
+    fn loading_a_config_registers_account_and_renamed_env_vars_for_scrubbing() {
+        let account = "AI_USAGEBAR_ACCOUNT_SCRUB_TEST_4C2E";
+        let renamed = "AI_USAGEBAR_RENAMED_SCRUB_TEST_7A3F";
+        let before = crate::vendor::vendor_secret_env_vars_to_remove(&[]);
+        assert!(!before.contains(&account));
+        assert!(!before.contains(&renamed));
+        let file = write_toml(&format!(
+            "[zai]\napi_key_env = \"{renamed}\"\n\
+             [[deepseek.accounts]]\nlabel = \"work\"\napi_key_env = \"{account}\"\n"
+        ));
+        Config::load_from(file.path()).unwrap();
+        let after = crate::vendor::vendor_secret_env_vars_to_remove(&[]);
+        assert!(after.contains(&account), "a named account's key variable");
+        assert!(after.contains(&renamed), "a renamed api_key_env");
+    }
+
+    #[test]
+    fn loading_a_config_registers_openrouter_management_env_vars_for_scrubbing() {
+        let renamed = "AI_USAGEBAR_MGMT_RENAMED_SCRUB_TEST_5D1B";
+        let account = "AI_USAGEBAR_MGMT_ACCOUNT_SCRUB_TEST_8E6C";
+        let before = crate::vendor::vendor_secret_env_vars_to_remove(&[]);
+        assert!(!before.contains(&renamed));
+        assert!(!before.contains(&account));
+        let file = write_toml(&format!(
+            "[openrouter]\nmanagement_api_key_env = \"{renamed}\"\n\
+             [[openrouter.accounts]]\nlabel = \"work\"\napi_key_env = \"OR_WORK_KEY\"\n\
+             management_api_key_env = \"{account}\"\n"
+        ));
+        Config::load_from(file.path()).unwrap();
+        let after = crate::vendor::vendor_secret_env_vars_to_remove(&[]);
+        assert!(after.contains(&renamed), "a renamed management_api_key_env");
+        assert!(
+            after.contains(&account),
+            "an account's management_api_key_env"
+        );
+    }
+
     /// `VendorId::config_section` is what every by-name config writer uses;
     /// this proves each section name is one the parser actually recognizes
     /// (the `deny_unknown_fields` on `Config` makes a misspelling fail loudly)
@@ -5361,6 +6071,19 @@ enabled = true
 
     fn config_enabled(path: &std::path::Path, vendor: VendorId) -> bool {
         Config::load_from(path).unwrap().is_enabled(vendor)
+    }
+
+    #[test]
+    fn menu_bar_short_name_defaults_on_and_persists_as_a_bool() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "[tray]\n").unwrap();
+        assert!(Config::load_from(&path).unwrap().tray.menu_bar_short_name());
+
+        set_tray_value(&path, "menu_bar_short_name", Some(false.into())).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(text, "[tray]\nmenu_bar_short_name = false\n");
+        assert!(!Config::load_from(&path).unwrap().tray.menu_bar_short_name());
     }
 
     #[test]

@@ -5,8 +5,14 @@ Claude, Codex, Z.AI, and OpenRouter are enabled by default; other providers are
 opt-in. The commented example shows the defaults and provider-specific
 settings.
 
+Muse Code subscription quotas use the official CLI's existing file-based
+OAuth login. Enable `[muse-code] enabled = true`, optionally with a
+`credentials_path`. It remains opt-in during detection. See
+[Muse Code setup](muse-code.md) for paths, the five-minute request bound,
+and Meta's idle-window missing-data limitation.
+
 Both binaries accept `--config <PATH>` to use an alternate file instead of the
-default location (`%APPDATA%\ai-usagebar\config.toml` on Windows). The file
+default location (`%APPDATA%\ai-usagebar\config\config.toml` on Windows). The file
 must already exist; loads and the Settings overlay then read and write that
 file for the whole process, so a test config never touches the real one:
 
@@ -20,11 +26,18 @@ ai-usagebar-tui --config ./config.test.toml
 # Which vendor the widget shows when --vendor is omitted, AND which tab
 # is selected when the TUI opens. Defaults to anthropic when not set.
 # Only a vendor that is enabled can be primary.
-# primary = "anthropic"   # anthropic | anthropic_api | openai | copilot | ollama
+# primary = "anthropic"   # any vendor slug, e.g. anthropic | openai | copilot | ollama | cline
 #                         # | zai | openrouter | deepseek | deepinfra | kimi | kilo | novita
 #                         # | moonshot | grok | supergrok | grokbot | antigravity | cursor
 #                         # | minimax | kiro | nous | opencode-go | commandcode
-#                         # | orcarouter | modelstudio
+#                         # | orcarouter | modelstudio | lyceum | devin | cline | muse-code
+# Which vendors the Overview lists, in this order. The TUI tab bar leads with
+# the same list; enabled vendors left off it follow in the canonical order.
+# Omit for every enabled vendor. A repeated slug keeps its first occurrence;
+# an empty list is set, and is not the same as omitting the key.
+# `usage --json` includes `overview_vendors` only when this is set, so a
+# frontend can order cards without reading this file.
+# overview_vendors = ["anthropic", "openai", "supergrok"]
 
 [context]
 enabled = false           # opt in, then press c in ai-usagebar-tui
@@ -35,7 +48,10 @@ enabled = false           # opt in, then press c in ai-usagebar-tui
 # While enabled, `usage` (and the tray/Omarchy panels built on it) also shows
 # the most recent Claude Code sessions on the Claude entry as a "Sessions"
 # group: one row per session with its context health on the same severity
-# colors as quota meters, plus the model and last-active time.
+# colors as quota meters, plus the model and last-active time. Each Claude
+# account whose sessions are working or waiting on you also gets an "Activity"
+# row ("2 working · 1 waiting") and an `activity` field, read from the
+# `sessions/` directory in that account's config directory.
 
 # Quota-threshold desktop notifications. On by default at 97%: a window that
 # crosses the threshold raises one notification per crossing (Linux uses
@@ -63,6 +79,10 @@ enabled = true
 [copilot]
 enabled = false           # opt in after `gh auth login --web`
 # Uses `gh auth token`; GITHUB_COPILOT_TOKEN is an optional explicit override.
+# [[copilot.accounts]]     # one entry per GitHub login, each with its own plan
+# label = "work"           # --account work, and the cache subdir
+# user = "my-work-login"   # the login from `gh auth status`, not an email
+# show_default_account = true   # false hides the active-gh entry once named
 
 [zai]
 enabled = true
@@ -133,6 +153,15 @@ api_key_env = "NOVITA_API_KEY"
 # api_key = "..."          # used if NOVITA_API_KEY is unset; chmod 600 the file!
 # display_limit = 200      # tank size in USD; see "Balance tanks" below
 # headline = "amount"      # "amount" | "percent"
+
+[lyceum]
+enabled = true              # disabled by default; enable once you add an API key
+api_key_env = "LYCEUM_API_KEY"
+# api_key = "..."           # inline fallback; chmod 600 the file if used
+# [[lyceum.accounts]]       # optional named API-key accounts
+# label = "work"
+# api_key_env = "LYCEUM_WORK_API_KEY"
+# api_key = "..."
 
 [orcarouter]
 enabled = true             # disabled by default; enable once you add an API key
@@ -205,6 +234,12 @@ enabled = false            # opt in after signing in with Antigravity
 #
 # Set ANTIGRAVITY_LS_ADDRESS=host:port only when automatic loopback discovery
 # fails; discovered ports are still tried after this address.
+#
+# ide_language_server = false leaves the Antigravity IDE's language server out
+# of discovery (default: true). Use it when the IDE is installed but its
+# sign-in is managed separately — a signed-out IDE answers 401/403, which
+# outranks and masks a working `agy` session (#405). No effect on Windows,
+# where the IDE's server cannot be told apart from the 2.0 app's on disk.
 
 [cursor]
 enabled = true             # disabled by default; enable once you've signed in to Cursor
@@ -221,6 +256,15 @@ enabled = true             # disabled by default; enable once you've run `kiro-c
 # data.sqlite3 after you logged in there.
 # db_path = "/home/you/.local/share/kiro-cli/data.sqlite3"
 
+[opencode-go]
+enabled = true             # disabled by default; enable once signed in or configured
+# Reads the API key the official OpenCode CLI already wrote to its own
+# auth.json (default $XDG_DATA_HOME/opencode or ~/.local/share/opencode),
+# read-only, so a signed-in CLI shows up on its own. An explicit key still
+# wins: OPENCODE_GO_API_KEY (or `api_key`) is resolved before the file.
+# api_key = "..."                          # or export OPENCODE_GO_API_KEY
+# auth_paths = ["/custom/opencode/auth.json"]  # non-standard install
+
 [modelstudio]
 enabled = false            # disabled by default; enable after `bl auth login --console`
 # Alibaba Cloud Model Studio (Bailian) Token Plan. No API key: the credential
@@ -228,12 +272,34 @@ enabled = false            # disabled by default; enable after `bl auth login --
 # read-only. The region×site pair recorded there picks the console gateway
 # (cn-beijing/ap-southeast-1 × domestic/international).
 # config_dir = "/home/you/.bailian"   # or set BAILIAN_CONFIG_DIR at runtime
+
+[devin]
+enabled = false            # disabled by default; enable after signing in with Devin CLI
+# Reuses the official Devin CLI credential file read-only. Defaults to
+# %APPDATA%/devin/credentials.toml on Windows, or
+# ${XDG_DATA_HOME:-~/.local/share}/devin/credentials.toml on Linux and macOS
+# (the CLI's documented paths; macOS is untested here).
+# An explicit credentials_path needs no home directory to resolve.
+# credentials_path = "/home/you/.local/share/devin/credentials.toml"
 ```
+
+Devin remains opt-in when its CLI login is present. First-run detection and
+`detect --all` do not enable it; set `enabled = true` explicitly to activate
+the provider.
+
+Devin reports daily and weekly remaining percentages, which ai-usagebar
+converts to consumed percentages for consistent meters. A window whose reset
+time arrives without a remaining percentage (the encoding omits zero values) is
+shown as fully used. Its optional
+`overageBalanceMicros` value is displayed as USD to six decimal places based on
+the tested account; that currency interpretation is not a verified universal
+contract. The existing CLI token is read only for the status request and cache
+identity. ai-usagebar does not sign in, refresh, or rewrite Devin credentials.
 
 For more than one OpenRouter key, see the
 [OpenRouter account guide](openrouter-accounts.md). The existing singular
 `[openrouter]` key remains the default account and needs no migration. Z.AI,
-DeepSeek, DeepInfra, Kilo, Novita, Moonshot, Grok, MiniMax, and OrcaRouter take the same
+DeepSeek, DeepInfra, Kilo, Novita, Moonshot, Grok, MiniMax, OrcaRouter, and Lyceum take the same
 `[[<vendor>.accounts]]` array and `show_default_account` switch — see the
 [API-key account guide](api-key-accounts.md).
 
@@ -319,6 +385,12 @@ denominator of its own, defaults to `"percent"`. Setting `display_limit` does
 not switch the headline by itself, and choosing `"percent"` with no limit from
 either source leaves the amount on the bar rather than inventing a percentage.
 
+`[nous]` takes `headline` as well, and needs no `display_limit`: its plan's
+monthly credits are already the percentage's denominator. `"amount"` puts the
+credits still usable on the bar — the Portal's total usable credits, falling
+back to top-up credits and then to subscription credits — and leaves the
+consumed percentage in the meter, the severity colour and the detail line.
+
 The Omarchy panel, the KDE plasmoid and the tray popover (Windows and macOS)
 read the metric's own `headline` field out of `usage --json` rather than
 guessing from the row's label. In the popover, `"amount"` puts the money figure
@@ -352,6 +424,32 @@ Create the second login with `CODEX_HOME=~/.codex-work codex login` and point
 `codex_auth_path` at the file it writes. Select it with `--account work`; each
 account caches separately under `~/.cache/ai-usagebar/openai/<label>`. The
 singular `codex_auth_path` remains the default account and needs no migration.
+
+For more than one GitHub Copilot plan — a personal and a work account, say —
+add `[[copilot.accounts]]`. ai-usagebar stores no token of its own here: `gh`
+already keeps several logins per host, so an entry only needs that login's
+name, as printed by `gh auth status`:
+
+```toml
+[[copilot.accounts]]
+label = "work"
+user = "my-work-login"
+```
+
+Each account resolves through `gh auth token --user <user>`, so signing in
+stays entirely `gh`'s job (`gh auth login`, once per account). Select one with
+`--account work`; each caches separately under
+`~/.cache/ai-usagebar/copilot/<label>`. With no `accounts` array the behavior
+is unchanged: whichever account `gh` has active. `show_default_account = false`
+hides that unnamed entry once every account is named, and is ignored while the
+array is empty.
+
+Two deliberate limits. `GITHUB_COPILOT_TOKEN` names no account, so combining it
+with `--account` is an error rather than a silent choice between the two — the
+alternative is reporting one account's quota under another's label. And there
+is no `hostname` field: `gh` can hold a GitHub Enterprise login, but the quota
+endpoint (`api.github.com/copilot_internal/user`) is github.com-only, so the
+field would promise support the fetch cannot deliver.
 
 `ai-usagebar account add <label> --codex` writes that entry and runs the login
 for you; `ai-usagebar account switch <label> --codex` makes a named login the

@@ -50,6 +50,11 @@ test:
 	$(MAKE) desktop-test
 	$(MAKE) plugin-test
 	$(MAKE) mint-test
+	$(MAKE) macos-package-test
+
+.PHONY: macos-package-test
+macos-package-test:
+	python3 -m unittest discover -s macos -p 'test_package_app.py'
 
 changelog-check:
 	./scripts/check-changelog-immutable.sh
@@ -58,6 +63,7 @@ desktop-test:
 	node gnome-extension/marker-logic.test.mjs
 	node gnome-extension/layout.test.mjs
 	node gnome-extension/report-model.test.mjs
+	node gnome-extension/prefs.test.mjs
 	node kde-plasmoid/plasmoid-logic.test.mjs
 	node windows/popover/popover.test.mjs
 
@@ -111,7 +117,9 @@ QMLTESTRUNNER ?= $(firstword $(foreach d,$(QT6_TOOL_DIRS),$(wildcard $(d)/qmltes
 #
 # Offscreen so it needs no display, but it still needs Qt and Kirigami, which is
 # why it stays out of desktop-test and out of CI (ubuntu-latest is 24.04 and
-# ships Plasma 5, with no Plasma 6 QML modules at all).
+# ships Plasma 5, with no Plasma 6 QML modules at all). tst_configgeneral.qml
+# additionally needs kcmutils and org.kde.plasma.plasma5support, so on a
+# Kirigami-only machine expect its Loader case to fail while the rest passes.
 qml-test:
 	@test -x "$(QMLTESTRUNNER)" || { echo "Qt 6 qmltestrunner not found" >&2; exit 1; }
 	QT_QPA_PLATFORM=offscreen "$(QMLTESTRUNNER)" -input kde-plasmoid/qmltests

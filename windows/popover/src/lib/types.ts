@@ -7,8 +7,9 @@ export interface RowPrefs {
 }
 
 export type TimeFormat = "12" | "24" | "auto";
-export type Language = "en" | "pt-BR";
+export type Language = "en" | "pt-BR" | "ko" | "es";
 export type PopoverStyle = "classic" | "native";
+export type MenuBarLook = "chart" | "logos" | "quattro";
 
 export interface Layout {
   alwaysShowPace: boolean;
@@ -37,6 +38,9 @@ export interface MetricRow {
   detail: string;
   /** Which number the headline shows: the percentage, or `value`. */
   headline: "percent" | "value";
+  /** The row sits under a group heading (SuperGrok's product slices, Claude's
+   * CLI sessions) rather than being one of the provider's quota windows. */
+  grouped?: boolean;
   key?: string;
   kind: "metric";
   label: string;
@@ -209,12 +213,19 @@ export interface AccountSwitchInfo {
   switching: boolean;
   /** Why that switch failed, or "". */
   error: string;
+  prepareEnabled?: boolean;
+  prepareTarget?: string;
+  preparing?: boolean;
+  prepareError?: string;
+  preparedReset?: string;
 }
 
 /** The switch control on one account's card. */
 export interface CardAccount {
   vendor: string;
   label: string;
+  /** A Claude Desktop login: switching quits and reopens the app, so it asks twice. */
+  desktop: boolean;
   active: boolean;
   /** A switch to this account is running. */
   switching: boolean;
@@ -222,6 +233,10 @@ export interface CardAccount {
   busy: boolean;
   /** Why the last switch to this account failed, or "". */
   error: string;
+  prepareEnabled?: boolean;
+  preparing?: boolean;
+  prepareError?: string;
+  preparedReset?: string;
 }
 
 /** What an update affordance does on click: a host command, or open `url`. */
@@ -238,13 +253,16 @@ export interface Accent {
 }
 
 export interface Payload {
-  /** Switchable logins keyed by vendor slug ("anthropic", "openai"); empty off macOS. */
+  /** Switchable logins keyed by vendor slug ("anthropic", "openai", "claude-desktop"); empty off macOS. */
   accounts: Record<string, AccountSwitchInfo>;
   accent: Accent | null;
   entries: Entry[];
   generatedAt: number;
   hostError: string;
-  menuBarChart: boolean;
+  /** macOS menu-bar look the host draws. */
+  menuBarLook: MenuBarLook;
+  /** Whether the Quattro look draws the short name beside the logo. */
+  menuBarShortName: boolean;
   notificationsEnabled: boolean;
   notificationsThreshold: number;
   /** Host OS: macos, windows, or linux. */
