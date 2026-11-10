@@ -1,5 +1,10 @@
 ## [Unreleased]
 
+### Fixed
+
+- **Claude Code: recognize the plan from its profile when OAuth credentials omit it.**
+  This prevents a verified Ultra account from showing a fabricated empty session.
+
 ## [1.50.0] — 2026-11-09
 
 ### Added

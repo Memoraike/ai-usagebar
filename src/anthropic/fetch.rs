@@ -83,7 +83,7 @@ pub async fn fetch_snapshot(
     // the creds actually came from (file vs macOS Keychain) so the refresh
     // write-back follows the same source instead of forking a stale copy.
     let (mut creds, creds_source) = creds::resolve(creds_target)?;
-    let plan_label = creds.claude_ai_oauth.plan_label();
+    let plan_label = plan_for_target(creds_target, &creds.claude_ai_oauth);
 
     // Corrupt fresh cache falls through to a live fetch rather than returning
     // an all-zero snapshot labelled "Unknown".
@@ -247,6 +247,26 @@ pub async fn fetch_snapshot(
     }
 }
 
+fn plan_for_target(target: &creds::CredsTarget, oauth: &creds::OauthCreds) -> String {
+    plan_for_target_with_profile(target, oauth, || {
+        super::cli_account::home_claude_json()
+            .ok()
+            .and_then(|path| super::cli_account::plan_in(&path))
+    })
+}
+
+fn plan_for_target_with_profile(
+    target: &creds::CredsTarget,
+    oauth: &creds::OauthCreds,
+    profile_plan: impl FnOnce() -> Option<String>,
+) -> String {
+    let plan = oauth.plan_label();
+    if plan == "Unknown" && matches!(target, creds::CredsTarget::Default(_)) {
+        return profile_plan().unwrap_or(plan);
+    }
+    plan
+}
+
 async fn acquire_credential_lock(
     target: &creds::CredsTarget,
     timeout: Duration,
@@ -362,6 +382,33 @@ mod tests {
     use super::*;
     use std::io::Write;
     use tempfile::{NamedTempFile, TempDir};
+
+    #[test]
+    fn default_profile_fills_missing_plan_without_crossing_accounts() {
+        let oauth: creds::OauthCreds =
+            serde_json::from_str(r#"{"accessToken":"a","refreshToken":"r","expiresAt":0}"#)
+                .unwrap();
+        let path = std::path::PathBuf::from("credentials.json");
+        let default = creds::CredsTarget::Default(path.clone());
+        let explicit = creds::CredsTarget::Explicit(path);
+        let profile = || Some("Ultra".to_string());
+        let plan = plan_for_target_with_profile(&default, &oauth, profile);
+        let snapshot = parse_payload(
+            br#"{"five_hour":null,"seven_day":{"utilization":42}}"#,
+            plan,
+        )
+        .unwrap();
+        assert_eq!(snapshot.plan, "Ultra");
+        assert!(snapshot.session.is_none());
+        assert_eq!(
+            plan_for_target_with_profile(&explicit, &oauth, profile),
+            "Unknown"
+        );
+        assert_eq!(
+            plan_for_target_with_profile(&default, &oauth, || None),
+            "Unknown"
+        );
+    }
 
     fn future_creds() -> NamedTempFile {
         let mut f = NamedTempFile::new().unwrap();

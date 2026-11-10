@@ -81,6 +81,16 @@ pub fn account_email_in(claude_json: &Path) -> Option<String> {
         .map(str::to_string)
 }
 
+/// Claude Code's profile can carry the plan when its OAuth credentials do not.
+pub fn plan_in(claude_json: &Path) -> Option<String> {
+    let account = oauth_account_in(claude_json)?;
+    let plan = account.get("planDisplayName")?.as_str()?.trim();
+    ["Ultra", "Max", "Pro", "Free"]
+        .into_iter()
+        .find(|known| plan.eq_ignore_ascii_case(known))
+        .map(str::to_owned)
+}
+
 /// Which managed label the live CLI login belongs to.
 ///
 /// `None` when the CLI is signed into something we do not manage — a plain
@@ -500,6 +510,16 @@ mod tests {
     use std::cell::RefCell;
     use std::collections::BTreeMap;
     use std::path::PathBuf;
+
+    #[test]
+    fn reads_known_plan_from_cli_profile() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".claude.json");
+        std::fs::write(&path, r#"{"oauthAccount":{"planDisplayName":"Ultra"}}"#).unwrap();
+        assert_eq!(plan_in(&path).as_deref(), Some("Ultra"));
+        std::fs::write(&path, r#"{"oauthAccount":{"planDisplayName":"Other"}}"#).unwrap();
+        assert_eq!(plan_in(&path), None);
+    }
 
     #[derive(Default)]
     struct FakeStore {
