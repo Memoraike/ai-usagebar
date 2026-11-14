@@ -85,6 +85,14 @@ pub struct Config {
     pub cline: ClineConfig,
     pub deeprelay: DeepRelayConfig,
     pub mistral: MistralConfig,
+    /// Generic macOS Keychain source for vendor API keys: vendor slug (or
+    /// `"vendor.label"` for a named `[[vendor.accounts]]` entry) → the
+    /// *service name* of a login-Keychain generic-password item the user
+    /// created. Consulted only after the env var and the inline `api_key`
+    /// missed, so it never masks either. Off macOS the entries are validated,
+    /// but they are never read and do not count as a configured credential.
+    #[serde(default)]
+    pub keychain: std::collections::BTreeMap<String, String>,
 }
 
 /// UI / dispatch preferences. Currently just `primary` — which vendor the
@@ -358,6 +366,50 @@ impl AnthropicAccount {
             .parent()
             .map_or_else(|| self.credentials_path.clone(), Path::to_path_buf)
     }
+
+    /// Whether this account's own slot still holds a credential: its
+    /// credentials file, or on macOS its `CLAUDE_CONFIG_DIR`-scoped Keychain
+    /// item — where `claude` actually keeps a login there, never writing the
+    /// file. `account switch` empties exactly this slot when it moves the
+    /// account into the CLI's default one. The file is asked first because it
+    /// costs no subprocess. An unreadable Keychain is an `Err`, not "empty".
+    pub fn holds_own_credential(&self) -> Result<bool> {
+        self.holds_own_credential_with(crate::anthropic::creds::keychain_has_claude_for)
+    }
+
+    /// [`holds_own_credential`](AnthropicAccount::holds_own_credential) with the
+    /// Keychain lookup injected, so the file-then-Keychain order is testable
+    /// without a real Keychain.
+    pub(crate) fn holds_own_credential_with(
+        &self,
+        keychain_has_claude_for: impl Fn(&Path) -> Result<bool>,
+    ) -> Result<bool> {
+        if self.credentials_path.exists() {
+            return Ok(true);
+        }
+        keychain_has_claude_for(&self.config_dir())
+    }
+}
+
+/// The two ambient lookups that decide a named account's credential target:
+/// the CLI's default credential path and "does this account's own slot still
+/// hold a credential". Injected so target selection is testable without a
+/// real `$HOME` or Keychain; production uses [`CredentialProbes::system`].
+pub(crate) struct CredentialProbes<'a> {
+    pub(crate) default_path: &'a dyn Fn() -> Result<PathBuf>,
+    pub(crate) holds_own_credential: &'a dyn Fn(&AnthropicAccount) -> Result<bool>,
+}
+
+impl CredentialProbes<'static> {
+    /// The real lookups: `~/.claude/.credentials.json` and
+    /// [`AnthropicAccount::holds_own_credential`] (which asks the macOS
+    /// Keychain).
+    pub(crate) fn system() -> Self {
+        Self {
+            default_path: &crate::anthropic::creds::default_path,
+            holds_own_credential: &AnthropicAccount::holds_own_credential,
+        }
+    }
 }
 
 impl AnthropicConfig {
@@ -435,21 +487,70 @@ impl AnthropicConfig {
 
     /// The pure half of [`account_target`](AnthropicConfig::account_target),
     /// with "which account the `claude` CLI is signed into" injected — the same
-    /// shape as `Cli::resolve_vendor_with`. Probes the account's own credential
-    /// file with [`Path::exists`]; [`account_target_probing`] takes that probe
-    /// as an argument.
-    ///
-    /// [`account_target_probing`]: AnthropicConfig::account_target_probing
+    /// shape as `Cli::resolve_vendor_with`. The cache depends on the label
+    /// alone, so it cannot move when the credential target does: the tab keeps
+    /// its identity and its cached usage across a switch.
     pub fn account_target_with(
         &self,
         label: &str,
         cli_active: Option<&str>,
     ) -> Result<(CredsTarget, Cache)> {
-        self.account_target_probing(label, cli_active, |path| path.exists())
+        let target = self.account_creds_target(label, cli_active, &CredentialProbes::system())?;
+        let cache = Cache::for_vendor_account("anthropic", label)?;
+        Ok((target, cache))
     }
 
-    /// The pure core: `exists` answers whether the account's own credential
-    /// file is there.
+    /// The pre-#607 entry point, kept for library callers. It decides with
+    /// `exists` alone (is the account's credentials file there?), exactly as it
+    /// did before, so on macOS it misses a `CLAUDE_CONFIG_DIR` login that lives
+    /// only in the scoped Keychain item.
+    #[deprecated(
+        note = "probes only the credentials file and misses a macOS Keychain-only login; use `account_target_with`"
+    )]
+    pub fn account_target_probing(
+        &self,
+        label: &str,
+        cli_active: Option<&str>,
+        exists: impl Fn(&Path) -> bool,
+    ) -> Result<(CredsTarget, Cache)> {
+        self.account_target_probing_in(
+            label,
+            cli_active,
+            exists,
+            &crate::anthropic::creds::default_path,
+            || Cache::for_vendor_account("anthropic", label),
+        )
+    }
+
+    /// Main's `account_target_probing` body, with the two ambient lookups
+    /// injected: `default_path` stands in for `creds::default_path()` and
+    /// `make_cache` for `Cache::for_vendor_account`, so tests resolve neither
+    /// from the real `$HOME`/`$XDG` environment. The account is looked up once,
+    /// then the cache is built, then the probe and the default path, in main's
+    /// order.
+    fn account_target_probing_in(
+        &self,
+        label: &str,
+        cli_active: Option<&str>,
+        exists: impl Fn(&Path) -> bool,
+        default_path: &dyn Fn() -> Result<PathBuf>,
+        make_cache: impl FnOnce() -> Result<Cache>,
+    ) -> Result<(CredsTarget, Cache)> {
+        let account = self.account(label)?;
+        let cache = make_cache()?;
+        if cli_active == Some(label) && !exists(&account.credentials_path) {
+            return Ok((CredsTarget::Default(default_path()?), cache));
+        }
+        Ok((
+            CredsTarget::Named {
+                config_dir: account.config_dir(),
+                path: account.credentials_path,
+            },
+            cache,
+        ))
+    }
+
+    /// The pure core: which credential target a named account reads.
     ///
     /// When `label` *is* the live CLI login, `account switch` has moved its
     /// credential into the default slot **and removed it from the named
@@ -463,31 +564,28 @@ impl AnthropicConfig {
     /// fetch for that label to `~/.claude/.credentials.json` — a slot the user
     /// never logs into, whose refresh token had expired, so a working account
     /// reported "run `claude` to re-auth" while its own file sat live and
-    /// unread next to it.
+    /// unread next to it. On macOS that directory's login lives only in the
+    /// scoped Keychain item, so the probe asks the Keychain too: probing the
+    /// file alone read the default Keychain item instead, and when that held
+    /// another account the tab showed that account's plan and quota. For the
+    /// same reason a probe error propagates rather than counting as "empty".
     ///
-    /// The cache directory is unchanged either way, so the tab keeps its
-    /// identity and its cached usage across a switch.
-    pub fn account_target_probing(
+    /// Only the live account is probed; every other account reads its own
+    /// slot without a Keychain round trip.
+    pub(crate) fn account_creds_target(
         &self,
         label: &str,
         cli_active: Option<&str>,
-        exists: impl Fn(&Path) -> bool,
-    ) -> Result<(CredsTarget, Cache)> {
+        probes: &CredentialProbes<'_>,
+    ) -> Result<CredsTarget> {
         let account = self.account(label)?;
-        let cache = Cache::for_vendor_account("anthropic", label)?;
-        if cli_active == Some(label) && !exists(&account.credentials_path) {
-            return Ok((
-                CredsTarget::Default(crate::anthropic::creds::default_path()?),
-                cache,
-            ));
+        if cli_active == Some(label) && !(probes.holds_own_credential)(&account)? {
+            return Ok(CredsTarget::Default((probes.default_path)()?));
         }
-        Ok((
-            CredsTarget::Named {
-                config_dir: account.config_dir(),
-                path: account.credentials_path,
-            },
-            cache,
-        ))
+        Ok(CredsTarget::Named {
+            config_dir: account.config_dir(),
+            path: account.credentials_path,
+        })
     }
 }
 
@@ -2115,9 +2213,9 @@ pub struct CursorConfig {
     pub agent_auth_path: Option<PathBuf>,
 }
 
-/// Kiro CLI reads its quota through the AWS SSO OIDC session kiro-cli already
-/// wrote to its own local `data.sqlite3` — no API key, but (like Cursor) a
-/// real on-disk path that can need overriding.
+/// Kiro CLI reads its quota through the AWS SSO OIDC or social-login session
+/// kiro-cli already wrote to its own local `data.sqlite3` — no API key, but
+/// (like Cursor) a real on-disk path that can need overriding.
 ///
 /// Opt-in like Cursor/DeepSeek/Kilo/etc (`enabled` defaults to `false`):
 /// calls a reverse-engineered CodeWhisperer endpoint via a session token
@@ -2927,6 +3025,28 @@ impl Config {
         VendorId::Lyceum,
     ];
 
+    /// Every vendor whose key resolution goes through
+    /// [`Config::resolve_account_api_key_for`] — the shared chain the
+    /// `[keychain]` table serves: the account-array vendors plus the three
+    /// single-key vendors the widget and TUI route the same way.
+    pub const KEYCHAIN_VENDORS: [VendorId; 15] = [
+        VendorId::AnthropicApi,
+        VendorId::Zai,
+        VendorId::Openrouter,
+        VendorId::Deepseek,
+        VendorId::Deepinfra,
+        VendorId::Kilo,
+        VendorId::Novita,
+        VendorId::Moonshot,
+        VendorId::Grok,
+        VendorId::Minimax,
+        VendorId::OrcaRouter,
+        VendorId::Lyceum,
+        VendorId::Synthetic,
+        VendorId::DeepRelay,
+        VendorId::Mistral,
+    ];
+
     /// The named `[[<vendor>.accounts]]` array, or `None` for a vendor that
     /// has no such array (see [`Self::API_KEY_ACCOUNT_VENDORS`]).
     pub fn api_key_accounts(&self, id: VendorId) -> Option<&[ApiKeyAccount]> {
@@ -2973,6 +3093,25 @@ impl Config {
     /// label for a vendor without the array fails loudly rather than falling
     /// back to the default key, which would show the wrong account's usage.
     pub fn resolve_account_api_key_for(&self, id: VendorId, label: Option<&str>) -> Result<String> {
+        // Off macOS there is no Keychain to ask, so a `[keychain]` entry
+        // changes nothing and the usual missing-key error is returned.
+        let lookup: Option<&KeychainLookup> = if crate::keychain::SUPPORTED {
+            Some(&crate::keychain::read_generic_password)
+        } else {
+            None
+        };
+        self.resolve_account_api_key_for_with(id, label, lookup)
+    }
+
+    /// [`Self::resolve_account_api_key_for`] with the Keychain lookup
+    /// injected, so the `[keychain]` tier is unit-testable without a real
+    /// Keychain (the hermeticity invariant).
+    pub(crate) fn resolve_account_api_key_for_with(
+        &self,
+        id: VendorId,
+        label: Option<&str>,
+        keychain: Option<&KeychainLookup>,
+    ) -> Result<String> {
         // The missing-key error predates `display_name()`; Z.AI's always said
         // "Zai", and its section is derived from this spelling.
         let name = match id {
@@ -2982,7 +3121,10 @@ impl Config {
             other => other.display_name(),
         };
         let Some(label) = label else {
-            return resolve_api_key(name, self.api_key_env_for(id), self.inline_api_key(id));
+            return resolve_api_key(name, self.api_key_env_for(id), self.inline_api_key(id))
+                // Env and inline both missed: the `[keychain]` table's entry
+                // for this vendor's default account is the last source.
+                .or_else(|error| self.keychain_api_key(id.config_section(), keychain, error));
         };
         let slug = id.config_section();
         let account = api_key_account(slug, self.api_key_accounts(id).unwrap_or(&[]), label)?;
@@ -2993,6 +3135,56 @@ impl Config {
             account.api_key_env.as_deref().unwrap_or(""),
             account.api_key.as_deref(),
         )
+        .or_else(|error| {
+            // Same last-resort tier for the named account, keyed
+            // `"vendor.label"` so it can never resolve another account's —
+            // or the default's — key (the issues #14/#15 rule).
+            self.keychain_api_key(&format!("{slug}.{label}"), keychain, error)
+        })
+    }
+
+    /// The `[keychain]` service-name entry for a vendor's default account
+    /// (`label = None`, keyed `<section>`) or a named account (keyed
+    /// `<section>.<label>`), if configured. This only looks at the config
+    /// and reads no Keychain item, so the catalog can count a configured
+    /// entry without spawning `security` at frontend start.
+    pub fn keychain_entry(&self, id: VendorId, label: Option<&str>) -> Option<&str> {
+        let section = id.config_section();
+        match label {
+            Some(label) => self.keychain.get(&format!("{section}.{label}")),
+            None => self.keychain.get(section),
+        }
+        .map(String::as_str)
+    }
+
+    /// The `[keychain]` tier for `key` (`<slug>` or `<slug>.<label>`).
+    ///
+    /// When no entry is declared, or this platform has no Keychain (`lookup`
+    /// is `None`), the caller's `missing` error is returned unchanged, so
+    /// users who did not opt in see what they always saw. A declared entry
+    /// gets a Keychain error in every failing case, because `missing` says
+    /// "export ZAI_API_KEY" and never mentions the table the user
+    /// configured. If the item is absent, the error names the service and
+    /// the command that creates it. A locked Keychain or a denied ACL
+    /// returns the lookup's error as is.
+    fn keychain_api_key(
+        &self,
+        key: &str,
+        lookup: Option<&KeychainLookup>,
+        missing: AppError,
+    ) -> Result<String> {
+        let (Some(service), Some(lookup)) = (self.keychain.get(key), lookup) else {
+            return Err(missing);
+        };
+        match lookup(service)? {
+            Some(value) if !value.is_empty() => Ok(value),
+            _ => Err(AppError::Credentials(format!(
+                "[keychain] {key} names the Keychain item {service:?}, but the login \
+                 Keychain has no generic-password item with that service for account \
+                 $USER. Create it with `security add-generic-password -a \"$USER\" -s \
+                 <service> -w`, or correct the name in config.toml."
+            ))),
+        }
     }
 
     /// The optional OpenRouter *management* key for the default or a named
@@ -3070,6 +3262,40 @@ impl Config {
     /// labels are both CLI selectors and TUI tab identities, so duplicates
     /// would make either destination ambiguous.
     pub fn validate(&self) -> Result<()> {
+        for (key, service) in &self.keychain {
+            if let Err(reason) = crate::keychain::validate_service_name(service) {
+                return Err(AppError::Other(format!(
+                    "[keychain] {key:?}: the Keychain service name {reason}"
+                )));
+            }
+            let (section, label) = match key.split_once('.') {
+                Some((section, label)) => (section, Some(label)),
+                None => (key.as_str(), None),
+            };
+            let Some(id) = Self::KEYCHAIN_VENDORS
+                .into_iter()
+                .find(|id| id.config_section() == section)
+            else {
+                let served: Vec<&str> = Self::KEYCHAIN_VENDORS
+                    .iter()
+                    .map(|id| id.config_section())
+                    .collect();
+                return Err(AppError::Other(format!(
+                    "[keychain] {key:?}: {section:?} is not a vendor section this table \
+                     serves, so the entry would never be read (it serves: {})",
+                    served.join(", ")
+                )));
+            };
+            if let Some(label) = label
+                && !self
+                    .api_key_accounts(id)
+                    .is_some_and(|accounts| accounts.iter().any(|a| a.label == label))
+            {
+                return Err(AppError::Other(format!(
+                    "[keychain] {key:?}: no [[{section}.accounts]] entry labeled {label:?}"
+                )));
+            }
+        }
         if let Some(minutes) = self.tray.refresh_minutes
             && !TRAY_REFRESH_MINUTES.contains(&minutes)
         {
@@ -3269,6 +3495,12 @@ impl Config {
         Ok(())
     }
 }
+
+/// The `[keychain]` reader, passed in so tests never touch a real Keychain.
+/// It takes a service name and returns the item's value, `Ok(None)` when no
+/// such item exists, or `Err` when the Keychain could not answer.
+/// Production uses [`crate::keychain::read_generic_password`].
+pub(crate) type KeychainLookup = dyn Fn(&str) -> Result<Option<String>>;
 
 #[cfg(unix)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -5602,6 +5834,22 @@ api_key = "sk-ant-admin01-side"
         );
     }
 
+    const FAKE_DEFAULT_CREDS: &str = "/nonexistent-home/.claude/.credentials.json";
+
+    fn fake_default_path() -> Result<PathBuf> {
+        Ok(PathBuf::from(FAKE_DEFAULT_CREDS))
+    }
+
+    /// Target selection with no real `$HOME`, cache dir or Keychain.
+    fn probes<'a>(
+        holds_own_credential: &'a dyn Fn(&AnthropicAccount) -> Result<bool>,
+    ) -> CredentialProbes<'a> {
+        CredentialProbes {
+            default_path: &fake_default_path,
+            holds_own_credential,
+        }
+    }
+
     #[test]
     fn the_live_cli_account_is_read_from_the_default_credential_slot() {
         let cfg = AnthropicConfig {
@@ -5617,29 +5865,41 @@ api_key = "sk-ant-admin01-side"
             ],
             ..Default::default()
         };
+        let not_probed =
+            |_: &AnthropicAccount| -> Result<bool> { panic!("only the live account is probed") };
 
-        let (idle, idle_cache) = cfg.account_target_with("work", Some("personal")).unwrap();
+        let idle = cfg
+            .account_creds_target("work", Some("personal"), &probes(&not_probed))
+            .unwrap();
         assert!(
             matches!(&idle, CredsTarget::Named { config_dir, .. }
-                if config_dir == std::path::Path::new("/tmp/accounts/work")),
+                if config_dir == Path::new("/tmp/accounts/work")),
             "{idle:?}"
         );
 
-        // Same label, but it is the login `claude` itself is using: one lineage.
-        let (live, live_cache) = cfg.account_target_with("work", Some("work")).unwrap();
-        assert!(matches!(live, CredsTarget::Default(_)), "{live:?}");
-
-        // The cache must not move, or a switch would silently orphan the tab's
-        // usage history and show "Loading…" until the next fetch.
-        assert_eq!(idle_cache.dir(), live_cache.dir());
+        // Same label, but it is the login `claude` itself is using, and
+        // `account switch` emptied its own slot: one lineage.
+        let live = cfg
+            .account_creds_target("work", Some("work"), &probes(&|_| Ok(false)))
+            .unwrap();
+        assert!(
+            matches!(&live, CredsTarget::Default(path) if path == Path::new(FAKE_DEFAULT_CREDS)),
+            "{live:?}"
+        );
+        // The cache no longer passes through target selection at all:
+        // `account_target_with` builds it from the label alone, so a switch
+        // cannot orphan the tab's usage history.
     }
 
     #[test]
-    fn the_live_cli_account_keeps_its_own_slot_while_that_file_is_there() {
+    fn the_live_cli_account_keeps_its_own_slot_while_that_slot_holds_a_credential() {
         // Two CLAUDE_CONFIG_DIRs can hold the same account, and each keeps its
         // own live credential — `resolve_active_label` matches the account, not
         // the lineage. Reading the default slot then hands back a credential
-        // the user never logs into.
+        // the user never logs into. On macOS that own slot is the scoped
+        // Keychain item `claude` writes instead of the file; probing only the
+        // file sent the account to the default item, which can hold a
+        // different account.
         let cfg = AnthropicConfig {
             accounts: vec![AnthropicAccount {
                 label: "personal".into(),
@@ -5648,20 +5908,95 @@ api_key = "sk-ant-admin01-side"
             ..Default::default()
         };
 
-        let (present, _) = cfg
-            .account_target_probing("personal", Some("personal"), |_| true)
+        let present = cfg
+            .account_creds_target(
+                "personal",
+                Some("personal"),
+                &probes(&|account| {
+                    assert_eq!(account.label, "personal");
+                    Ok(true)
+                }),
+            )
             .unwrap();
         assert!(
-            matches!(&present, CredsTarget::Named { path, .. }
-                if path == Path::new("/tmp/accounts/personal/.credentials.json")),
+            matches!(&present, CredsTarget::Named { path, config_dir }
+                if path == Path::new("/tmp/accounts/personal/.credentials.json")
+                    && config_dir == Path::new("/tmp/accounts/personal")),
             "{present:?}"
         );
 
         // Emptied by `account switch`: the credential really did move.
-        let (moved, _) = cfg
-            .account_target_probing("personal", Some("personal"), |_| false)
+        let moved = cfg
+            .account_creds_target("personal", Some("personal"), &probes(&|_| Ok(false)))
             .unwrap();
-        assert!(matches!(moved, CredsTarget::Default(_)), "{moved:?}");
+        assert!(
+            matches!(&moved, CredsTarget::Default(path) if path == Path::new(FAKE_DEFAULT_CREDS)),
+            "{moved:?}"
+        );
+    }
+
+    #[test]
+    fn an_unreadable_slot_is_reported_not_read_from_the_default() {
+        // A locked or access-denied Keychain is not an empty slot: falling back
+        // would read the default item, which can belong to another account.
+        let cfg = AnthropicConfig {
+            accounts: vec![AnthropicAccount {
+                label: "personal".into(),
+                credentials_path: "/tmp/accounts/personal/.credentials.json".into(),
+            }],
+            ..Default::default()
+        };
+
+        let error = cfg
+            .account_creds_target(
+                "personal",
+                Some("personal"),
+                &probes(&|_| Err(AppError::Credentials("keychain locked".into()))),
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("keychain locked"), "{error}");
+    }
+
+    #[test]
+    fn a_live_account_whose_login_is_only_in_its_keychain_item_reads_its_own_slot() {
+        // The reported bug. `CLAUDE_CONFIG_DIR=<dir> claude` on macOS writes the
+        // scoped `Claude Code-credentials-<hash>` item and no credentials file.
+        let home = tempfile::TempDir::new().unwrap();
+        let config_dir = home.path().join("personal");
+        let creds = config_dir.join(".credentials.json");
+        let cfg = AnthropicConfig {
+            accounts: vec![AnthropicAccount {
+                label: "personal".into(),
+                credentials_path: creds.clone(),
+            }],
+            ..Default::default()
+        };
+        assert!(!creds.exists(), "the file must be absent for this case");
+
+        let scoped_item = |asked: &Path| -> Result<bool> { Ok(asked == config_dir) };
+        let holds = |account: &AnthropicAccount| account.holds_own_credential_with(scoped_item);
+        let target = cfg
+            .account_creds_target("personal", Some("personal"), &probes(&holds))
+            .unwrap();
+        assert!(
+            matches!(&target, CredsTarget::Named { path, config_dir: dir }
+                if path == &creds && dir == &config_dir),
+            "read {target:?} instead of the account's own Keychain item"
+        );
+
+        // Main's decision for the same input, kept verbatim in the private seam
+        // behind the deprecated file-only entry point: no file, so it read the
+        // default slot, which on the reporter's Mac held a different account.
+        let (before, _) = cfg
+            .account_target_probing_in(
+                "personal",
+                Some("personal"),
+                Path::exists,
+                &fake_default_path,
+                || Ok(Cache::at(PathBuf::from("/nonexistent/cache"))),
+            )
+            .unwrap();
+        assert!(matches!(before, CredsTarget::Default(_)), "{before:?}");
     }
 
     #[test]
@@ -5684,9 +6019,10 @@ api_key = "sk-ant-admin01-side"
 
     #[test]
     fn the_live_cli_accounts_own_file_is_probed_on_disk() {
-        // `account_target_probing` proves the decision; only the entry point
-        // proves that the shipping caller probes at all. Fails on main, where
-        // the live label is routed to the default slot unconditionally.
+        // `account_creds_target` proves the decision; only the entry point
+        // proves that the shipping probes look at the file at all. Passes on
+        // main too. Here it also pins the order: an existing file wins before
+        // any Keychain lookup, so this test never spawns `security(1)`.
         let creds = NamedTempFile::new().unwrap();
         let cfg = AnthropicConfig {
             accounts: vec![AnthropicAccount {
@@ -5715,6 +6051,54 @@ api_key = "sk-ant-admin01-side"
         };
         let (target, _) = cfg.account_target_with("work", None).unwrap();
         assert!(matches!(target, CredsTarget::Named { .. }), "{target:?}");
+    }
+
+    #[test]
+    fn the_probing_seam_behind_the_deprecated_entry_point_keeps_its_file_only_decision() {
+        let cfg = AnthropicConfig {
+            accounts: vec![AnthropicAccount {
+                label: "personal".into(),
+                credentials_path: "/tmp/accounts/personal/.credentials.json".into(),
+            }],
+            ..Default::default()
+        };
+
+        let (present, _) = cfg
+            .account_target_probing_in(
+                "personal",
+                Some("personal"),
+                |path| {
+                    assert_eq!(path, Path::new("/tmp/accounts/personal/.credentials.json"));
+                    true
+                },
+                &fake_default_path,
+                || Ok(Cache::at(PathBuf::from("/nonexistent/cache"))),
+            )
+            .unwrap();
+        assert!(matches!(present, CredsTarget::Named { .. }), "{present:?}");
+
+        let (moved, _) = cfg
+            .account_target_probing_in(
+                "personal",
+                Some("personal"),
+                |_| false,
+                &fake_default_path,
+                || Ok(Cache::at(PathBuf::from("/nonexistent/cache"))),
+            )
+            .unwrap();
+        assert!(matches!(moved, CredsTarget::Default(_)), "{moved:?}");
+
+        // Not the live login: the probe is never consulted.
+        let (idle, _) = cfg
+            .account_target_probing_in(
+                "personal",
+                None,
+                |_| panic!("only the live account is probed"),
+                &fake_default_path,
+                || Ok(Cache::at(PathBuf::from("/nonexistent/cache"))),
+            )
+            .unwrap();
+        assert!(matches!(idle, CredsTarget::Named { .. }), "{idle:?}");
     }
 
     /// The shipped example, which `make install` puts in
@@ -7239,5 +7623,175 @@ enabled = true
             before,
             "an unchanged document must not be rewritten"
         );
+    }
+    /// The `[keychain]` tier: last after env and inline, injected lookup —
+    /// never a real Keychain (the hermeticity invariant).
+    #[test]
+    fn keychain_tier_is_used_only_after_env_and_inline() {
+        let _g = env_guard();
+        let var = "AI_USAGEBAR_TEST_KEYCHAIN_ZAI";
+        unsafe { std::env::remove_var(var) };
+        let mut cfg = Config::default();
+        cfg.zai.api_key_env = var.to_string();
+        cfg.keychain.insert("zai".into(), "MyZaiKey".into());
+
+        let lookup = |service: &str| Ok((service == "MyZaiKey").then(|| "kc-key".to_string()));
+
+        // Neither env nor inline: the Keychain entry resolves.
+        assert_eq!(
+            cfg.resolve_account_api_key_for_with(VendorId::Zai, None, Some(&lookup))
+                .unwrap(),
+            "kc-key"
+        );
+
+        // Inline wins, and the Keychain is not read at all in that case.
+        let unreachable = |_: &str| -> Result<Option<String>> {
+            panic!("the Keychain must not be read when env or inline resolved")
+        };
+        cfg.zai.api_key = Some("inline-key".into());
+        assert_eq!(
+            cfg.resolve_account_api_key_for_with(VendorId::Zai, None, Some(&unreachable))
+                .unwrap(),
+            "inline-key"
+        );
+
+        // Env beats both.
+        unsafe { std::env::set_var(var, "env-key") };
+        assert_eq!(
+            cfg.resolve_account_api_key_for_with(VendorId::Zai, None, Some(&unreachable))
+                .unwrap(),
+            "env-key"
+        );
+        unsafe { std::env::remove_var(var) };
+    }
+
+    /// With no entry, or on a platform without a Keychain, the error text is
+    /// identical to what it was before the `[keychain]` table existed.
+    #[test]
+    fn keychain_tier_is_inert_without_an_entry_or_a_keychain() {
+        let _g = env_guard();
+        let var = "AI_USAGEBAR_TEST_KEYCHAIN_INERT";
+        unsafe { std::env::remove_var(var) };
+        let mut cfg = Config::default();
+        cfg.zai.api_key_env = var.to_string();
+        let expected = resolve_api_key("Zai", var, None).unwrap_err().to_string();
+        let unreachable = |_: &str| -> Result<Option<String>> {
+            panic!("no entry is declared, so nothing may be read")
+        };
+
+        let err = cfg
+            .resolve_account_api_key_for_with(VendorId::Zai, None, Some(&unreachable))
+            .unwrap_err();
+        assert_eq!(err.to_string(), expected);
+
+        // Declared, but off macOS (no lookup): still the historical error.
+        cfg.keychain.insert("zai".into(), "MyZaiKey".into());
+        let err = cfg
+            .resolve_account_api_key_for_with(VendorId::Zai, None, None)
+            .unwrap_err();
+        assert_eq!(err.to_string(), expected);
+    }
+
+    /// A declared entry never falls back to "export ZAI_API_KEY". A missing
+    /// item names the service and the command that creates it, and a locked
+    /// or denied Keychain returns the lookup's error.
+    #[test]
+    fn keychain_tier_failures_name_the_keychain_not_the_env_var() {
+        let _g = env_guard();
+        let var = "AI_USAGEBAR_TEST_KEYCHAIN_MISSING";
+        unsafe { std::env::remove_var(var) };
+        let mut cfg = Config::default();
+        cfg.zai.api_key_env = var.to_string();
+        cfg.keychain.insert("zai".into(), "MyZaiKey".into());
+
+        let err = cfg
+            .resolve_account_api_key_for_with(VendorId::Zai, None, Some(&|_| Ok(None)))
+            .unwrap_err();
+        assert!(matches!(err, AppError::Credentials(_)), "{err}");
+        let text = err.to_string();
+        assert!(text.contains("\"MyZaiKey\""), "{text}");
+        assert!(text.contains("security add-generic-password"), "{text}");
+        assert!(!text.contains(var), "{text}");
+
+        let err = cfg
+            .resolve_account_api_key_for_with(
+                VendorId::Zai,
+                None,
+                Some(&|_| Err(AppError::Credentials("Keychain is locked".into()))),
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("Keychain is locked"), "{err}");
+    }
+
+    #[test]
+    fn keychain_named_account_gets_only_its_own_entry() {
+        let _g = env_guard();
+        let mut cfg = Config::default();
+        cfg.zai.accounts = vec![ApiKeyAccount {
+            label: "work".into(),
+            api_key_env: None,
+            api_key: None,
+            management_api_key_env: None,
+            monthly_limit: None,
+        }];
+        cfg.keychain.insert("zai".into(), "DefaultZaiKey".into());
+        cfg.keychain.insert("zai.work".into(), "WorkZaiKey".into());
+
+        // Its own entry, never the default account's (issues #14/#15 rule).
+        assert_eq!(
+            cfg.resolve_account_api_key_for_with(
+                VendorId::Zai,
+                Some("work"),
+                Some(&|s| Ok((s == "WorkZaiKey").then(|| "work-key".to_string())))
+            )
+            .unwrap(),
+            "work-key"
+        );
+
+        // Without its own entry, a named account errors — it must not fall
+        // through to the default account's Keychain key.
+        cfg.keychain.remove("zai.work");
+        let err = cfg
+            .resolve_account_api_key_for_with(
+                VendorId::Zai,
+                Some("work"),
+                Some(&|_| Ok(Some("default-key".to_string()))),
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("account \"work\""), "{}", err);
+    }
+
+    #[test]
+    fn keychain_table_rejects_unknown_sections_and_labels() {
+        let mut cfg = Config::default();
+        cfg.keychain.insert("cursor".into(), "Svc".into());
+        let err = cfg.validate().unwrap_err();
+        assert!(err.to_string().contains("would never be read"), "{}", err);
+
+        let mut cfg = Config::default();
+        cfg.keychain.insert("zai.ghost".into(), "Svc".into());
+        let err = cfg.validate().unwrap_err();
+        assert!(err.to_string().contains("labeled \"ghost\""), "{}", err);
+
+        // These are the names the Add Key dialog refuses too.
+        for bad in ["  ", " Svc", "Svc\n", "S\u{1b}vc"] {
+            let mut cfg = Config::default();
+            cfg.keychain.insert("zai".into(), bad.into());
+            let err = cfg.validate().unwrap_err();
+            assert!(err.to_string().contains("service name"), "{}", err);
+        }
+
+        // A valid default entry and a valid named one both pass.
+        let mut cfg = Config::default();
+        cfg.zai.accounts = vec![ApiKeyAccount {
+            label: "work".into(),
+            api_key_env: Some("AI_USAGEBAR_TEST_KEYCHAIN_WORK".into()),
+            api_key: None,
+            management_api_key_env: None,
+            monthly_limit: None,
+        }];
+        cfg.keychain.insert("zai".into(), "Svc".into());
+        cfg.keychain.insert("zai.work".into(), "SvcWork".into());
+        cfg.validate().unwrap();
     }
 }
